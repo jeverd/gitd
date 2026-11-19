@@ -26,7 +26,7 @@ Status: early, not usable yet.
 
 ## Build
 
-Needs Zig 0.17 and libgit2 (`brew install libgit2`).
+Needs Zig 0.17.1 and libgit2 (`brew install libgit2`).
 
 ```sh
 zig build

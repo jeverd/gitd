@@ -12,7 +12,7 @@ A git server for AI agents. Platforms create repos over an HTTP API, hand each a
 
 ## Toolchain
 
-- Zig 0.17 (`build.zig.zon` sets the minimum). Check `zig version` first.
+- Zig 0.17.1 (`build.zig.zon` sets the minimum). Check `zig version` first.
 - libgit2 and SQLite, linked from Homebrew for now.
 - The real `git` binary, for `git http-backend` and end-to-end tests.
 
