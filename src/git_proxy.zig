@@ -16,6 +16,7 @@ const std = @import("std");
 const Io = std.Io;
 const git_http = @import("git_http.zig");
 const store_mod = @import("store.zig");
+const http_util = @import("http_util.zig");
 
 /// Largest request body accepted, which bounds a single push.
 pub const max_body_bytes: u64 = 2 * 1024 * 1024 * 1024;
@@ -131,7 +132,11 @@ fn relay(io: Io, request: *std.http.Server.Request, stdout: Io.File) ProxyError!
 
     var send_buf: [16 * 1024]u8 = undefined;
     var body = request.respondStreaming(&send_buf, .{
-        .respond_options = .{ .status = head.status, .extra_headers = head.forwarded() },
+        .respond_options = .{
+            .status = head.status,
+            .keep_alive = http_util.keepAlive(request),
+            .extra_headers = head.forwarded(),
+        },
     }) catch return error.ResponseBroken;
     // `head` borrows the reader's buffer; it is not used after this point.
     r.toss(head.body_start);

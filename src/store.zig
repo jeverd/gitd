@@ -25,6 +25,12 @@ pub const DataDir = struct {
     pub fn prepare(io: Io, arena: std.mem.Allocator, data_dir: []const u8) !DataDir {
         const cwd = Io.Dir.cwd();
         try cwd.createDirPath(io, data_dir);
+        // Repos, the database, and the signing secret are for gitd only.
+        {
+            var dir = try cwd.openDir(io, data_dir, .{});
+            defer dir.close(io);
+            try dir.setPermissions(io, .fromMode(0o700));
+        }
         const root = try cwd.realPathFileAlloc(io, data_dir, arena);
         const d: DataDir = .{
             .root = root,
@@ -145,6 +151,13 @@ const forced_config = [_][2][]const u8{
     .{ "http.getanyfile", "false" },
     // A repo's config must not name a program for git to run (R2.4).
     .{ "core.fsmonitor", "false" },
+    .{ "gpg.program", "/usr/bin/false" },
+    .{ "gpg.ssh.program", "/usr/bin/false" },
+    // No automatic gc: it detaches from the request's process group (so the
+    // request cannot stop it) and could run during a delete.
+    .{ "gc.auto", "0" },
+    .{ "gc.autoDetach", "false" },
+    .{ "maintenance.auto", "false" },
 };
 
 /// A minimal environment for running `git`: our `PATH`, no system or

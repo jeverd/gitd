@@ -42,7 +42,7 @@ start_server() {
   local skip
   skip=$(($(wc -l <"$LOG" 2>/dev/null || echo 0) + 1))
   PORT=""
-  GITD_IDLE_TIMEOUT_SECONDS=2 "$BIN" serve --data "$DATA" --listen 127.0.0.1:0 >>"$LOG" 2>&1 &
+  GITD_IDLE_TIMEOUT_SECONDS=2 GITD_HEAD_TIMEOUT_SECONDS=3 "$BIN" serve --data "$DATA" --listen 127.0.0.1:0 >>"$LOG" 2>&1 &
   SERVER_PID=$!
   for _ in $(seq 1 100); do
     PORT="$(tail -n +"$skip" "$LOG" | sed -n 's/.*listening on 127\.0\.0\.1:\([0-9]*\),.*/\1/p' | tail -1)"
@@ -191,6 +191,74 @@ if grep -q "100 Continue" "$WORK/curl-v"; then fail "server sent 100 Continue be
 grep -qi "connection: close" "$WORK/curl-v" || fail "rejected upload did not close the connection"
 pass "rejected upload gets no 100 Continue and the connection closes"
 
+# A head trickled in one byte a second (under the idle timeout) is still cut
+# off by the head timeout (3s here).
+python3 - "$PORT" <<'PY' || fail "slow head was not cut off"
+import socket, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+start = time.time()
+try:
+    for b in b"GET /healthz HTTP/1.1\r\nHost: x\r\nX-Pad: " + b"a" * 30:
+        s.sendall(bytes([b]))
+        time.sleep(1)
+        if time.time() - start > 8:
+            sys.exit(1)
+except (BrokenPipeError, ConnectionResetError):
+    pass
+sys.exit(0 if time.time() - start < 6 else 1)
+PY
+pass "slow request head cut off by the head timeout"
+# One address gets at most 64 connections; the rest are closed at once.
+python3 - "$PORT" <<'PY' || fail "per-address connection cap"
+import socket, sys, time
+port = int(sys.argv[1])
+socks = [socket.create_connection(("127.0.0.1", port)) for _ in range(70)]
+time.sleep(0.5)
+closed = 0
+for s in socks:
+    s.setblocking(False)
+    try:
+        if s.recv(1) == b"":
+            closed += 1
+    except BlockingIOError:
+        pass
+    except ConnectionResetError:
+        closed += 1
+for s in socks:
+    s.close()
+print("closed", closed)
+sys.exit(0 if closed == 6 else 1)
+PY
+pass "65th connection from one address is refused"
+sleep 0.5
+expect_eq "server serves after the connection-cap test" 200 "$(status "$BASE/healthz")"
+# A body on info/refs is refused before git runs, even when cut off, and
+# does not take the server down.
+python3 - "$PORT" "$RO" <<'PY'
+import base64, socket, sys, time
+port, token = int(sys.argv[1]), sys.argv[2]
+auth = base64.b64encode(f"t:{token}".encode()).decode()
+s = socket.create_connection(("127.0.0.1", port))
+s.sendall((f"GET /acme/web.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: x\r\n"
+           f"Authorization: Basic {auth}\r\nContent-Length: 1000\r\n\r\n").encode() + b"0123456789")
+time.sleep(0.3)
+s.close()
+PY
+sleep 0.3
+expect_eq "server survives a cut-off body on info/refs" 200 "$(status "$BASE/healthz")"
+expect_eq "info/refs with a body" 400 "$(status -u "t:$RO" -X GET --data-binary 'x' "$BASE/acme/web.git/info/refs?service=git-upload-pack")"
+# A JSON body cut short of its Content-Length creates nothing.
+python3 - "$PORT" "$KEY" <<'PY'
+import socket, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+body = b'{"name":"acme/cut"}'
+s.sendall(f"POST /v1/repos HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {sys.argv[2]}\r\nContent-Length: 500\r\n\r\n".encode() + body)
+s.shutdown(socket.SHUT_WR)
+time.sleep(0.3)
+s.close()
+PY
+expect_eq "truncated JSON body creates no repo" 404 "$(admin "$BASE/v1/repos/acme/cut")"
+
 echo "== aborted requests clean up"
 # Uploads cut off midway never reach git and leave nothing in data/tmp:
 # mid-chunk, between chunks, and short of Content-Length.
@@ -220,12 +288,35 @@ GOT="$(curl -s -o /dev/null -w '%{size_download}' --limit-rate 200k --max-time 1
   "$BASE/acme/web.git/git-upload-pack" || true)"
 [[ "$GOT" -gt 10000 && "$GOT" -lt 4000000 ]] || fail "clone was not cut off midway (downloaded $GOT bytes)"
 pass "clone cut off after $GOT bytes"
-# git processes a gitd request starts. Anchored to the start of the command
-# line, so this script's own command text never matches.
-leftover() { ps -eo args= | grep -E "^git(-| )(http-backend|upload-pack|pack-objects)" || true; }
+# git processes a gitd request starts: command lines that begin with a git
+# binary, possibly by full path (Xcode's git runs as .../usr/bin/git), then
+# http-backend, upload-pack, or pack-objects. Anchoring at the start keeps
+# shells and scripts that merely mention these names from matching.
+leftover() { ps -eo args= | grep -E "^([^ ]*/)?git[ -](http-backend|upload-pack|pack-objects)" || true; }
 for _ in $(seq 1 40); do [[ -z "$(leftover)" ]] && break; sleep 0.1; done
 [[ -z "$(leftover)" ]] || fail "git processes left after an interrupted clone: $(leftover)"
 pass "interrupted clone leaves no git processes"
+# A client that asks for a clone and never reads is dropped once writes
+# stall past the idle timeout (2s here), and its git processes go with it.
+python3 - "$PORT" "$RO" "$TIP" <<'PY' &
+import base64, socket, sys, time
+port, token, tip = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+auth = base64.b64encode(f"t:{token}".encode()).decode()
+body = f"0032want {tip}\n00000009done\n".encode()
+s = socket.create_connection(("127.0.0.1", port))
+s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+s.sendall((f"POST /acme/web.git/git-upload-pack HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {auth}\r\n"
+           f"Content-Type: application/x-git-upload-pack-request\r\nContent-Length: {len(body)}\r\n\r\n").encode() + body)
+time.sleep(9)
+s.close()
+PY
+STALLED=$!
+sleep 1
+[[ -n "$(leftover)" ]] || fail "stalled-reader test: clone never started"
+for _ in $(seq 1 60); do [[ -z "$(leftover)" ]] && break; sleep 0.1; done
+[[ -z "$(leftover)" ]] || fail "git processes kept alive by a client that stopped reading: $(leftover)"
+pass "client that stops reading is dropped and its git processes killed"
+wait "$STALLED" || true
 expect_eq "server still serves after interrupted clone" 200 "$(status "$BASE/healthz")"
 
 echo "== hooks never run (R2.4)"

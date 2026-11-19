@@ -19,7 +19,9 @@ const git_http = @import("git_http.zig");
 const git_proxy = @import("git_proxy.zig");
 const Db = @import("db.zig").Db;
 const Store = @import("store.zig").Store;
-const TimedReader = @import("timed_reader.zig").TimedReader;
+const timed = @import("timed_stream.zig");
+const http_util = @import("http_util.zig");
+const keepAlive = http_util.keepAlive;
 
 pub const App = struct {
     io: Io,
@@ -29,6 +31,9 @@ pub const App = struct {
     secret: *const auth.Secret,
     /// A connection with no traffic for this long is dropped.
     idle_timeout_seconds: u32 = default_idle_timeout_seconds,
+    /// The whole request head must arrive within this long, however slowly
+    /// it trickles in.
+    head_timeout_seconds: u32 = default_head_timeout_seconds,
     /// Serializes repo create and delete, so the database row and the
     /// directory on disk change together (R1.3). gitd runs one server.
     repo_lock: Io.Mutex = .init,
@@ -36,10 +41,13 @@ pub const App = struct {
     /// descriptors. When all are taken, new clients wait in the kernel's
     /// accept queue.
     connection_slots: Io.Semaphore = .{ .permits = max_connections },
+    peers: http_util.PeerLimit = .{ .max_per_peer = max_connections_per_peer },
 };
 
 pub const default_idle_timeout_seconds = 60;
 pub const max_connections = 512;
+pub const max_connections_per_peer = 64;
+pub const default_head_timeout_seconds = 10;
 const max_json_body = 64 * 1024;
 const head_buffer_len = 16 * 1024;
 
@@ -64,8 +72,15 @@ pub fn run(app: *App, listener: *Io.net.Server) Io.Cancelable!void {
                 },
             }
         };
+        if (!app.peers.acquire(io, app.gpa, stream.socket.address)) {
+            std.log.info("dropping connection: too many from one address", .{});
+            stream.close(io);
+            app.connection_slots.post(io);
+            continue;
+        }
         group.concurrent(io, serveConnection, .{ app, stream }) catch |err| {
             std.log.err("starting connection task: {t}", .{err});
+            app.peers.release(io, stream.socket.address);
             stream.close(io);
             app.connection_slots.post(io);
         };
@@ -75,16 +90,22 @@ pub fn run(app: *App, listener: *Io.net.Server) Io.Cancelable!void {
 fn serveConnection(app: *App, stream: Io.net.Stream) Io.Cancelable!void {
     const io = app.io;
     defer app.connection_slots.post(io);
+    defer app.peers.release(io, stream.socket.address);
     defer stream.close(io);
     var in_buf: [head_buffer_len]u8 = undefined;
     var out_buf: [16 * 1024]u8 = undefined;
-    // Every read times out, so an idle or stalled client frees its slot.
-    var net_reader: TimedReader = .init(stream, io, &in_buf, .fromSeconds(app.idle_timeout_seconds));
-    var net_writer = stream.writer(io, &out_buf);
+    // Every read and write times out, so a client that stalls or stops
+    // reading frees its slot and its git processes (R3.4).
+    const idle: Io.Duration = .fromSeconds(app.idle_timeout_seconds);
+    var net_reader: timed.TimedReader = .init(stream, io, &in_buf, idle);
+    var net_writer: timed.TimedWriter = .init(stream, io, &out_buf, idle);
     var server: http.Server = .init(&net_reader.interface, &net_writer.interface);
 
     while (server.reader.state == .ready) {
-        var request = server.receiveHead() catch |err| switch (err) {
+        net_reader.deadline = .fromNow(io, .{ .raw = .fromSeconds(app.head_timeout_seconds), .clock = .awake });
+        const head = server.receiveHead();
+        net_reader.deadline = null;
+        var request = head catch |err| switch (err) {
             error.HttpConnectionClosing => return,
             else => {
                 std.log.debug("bad request head: {t}", .{err});
@@ -324,6 +345,12 @@ fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route,
     };
     if (!allowed) return respondError(request, .forbidden, "forbidden", "this token lacks the scope for this operation");
 
+    // The ref advertisement is a GET; a body there is never read, and std
+    // would otherwise try to drain it after the response (R3.4).
+    if (git_route.kind == .info_refs and http_util.hasBody(request)) {
+        return respondError(request, .bad_request, "bad_git_request", "info/refs takes no request body");
+    }
+
     // Copy what the CGI needs before the body is read. Oversize values are
     // rejected rather than cut, so git never sees a changed header (R2.3).
     var ct_buf: [128]u8 = undefined;
@@ -383,6 +410,9 @@ fn readJson(comptime T: type, app: *App, request: *http.Server.Request) BodyErro
         error.ReadFailed => error.ReadFailed,
     };
     defer app.gpa.free(bytes);
+    // A connection closed mid-body also ends the read; only a body read to
+    // its declared end counts.
+    if (request.server.reader.state != .ready) return error.ReadFailed;
     return std.json.parseFromSlice(T, app.gpa, bytes, .{ .allocate = .alloc_always }) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.InvalidJson,
@@ -418,20 +448,6 @@ fn respondError(request: *http.Server.Request, status: http.Status, code: []cons
 
 fn internal(request: *http.Server.Request) HandleError!http.Status {
     return respondError(request, .internal_server_error, "internal", "internal error; see server logs");
-}
-
-/// Whether the connection can serve another request after this response.
-///
-/// When a request has a body that was never read (an auth failure, say),
-/// std would read and discard all of it, with no size limit, to reuse the
-/// connection. Instead gitd closes the connection, and drops any
-/// `Expect: 100-continue` so the client is not invited to send the body.
-fn keepAlive(request: *http.Server.Request) bool {
-    if (request.server.reader.state != .received_head) return true;
-    const has_body = request.head.transfer_encoding != .none or (request.head.content_length orelse 0) > 0;
-    if (!has_body) return true;
-    request.head.expect = null;
-    return false;
 }
 
 fn findHeader(request: *http.Server.Request, name: []const u8) ?[]const u8 {

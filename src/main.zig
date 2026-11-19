@@ -16,6 +16,7 @@ const usage =
     \\  --listen  address to listen on (env GITD_LISTEN, default 127.0.0.1:8080)
     \\
     \\  env GITD_IDLE_TIMEOUT_SECONDS: drop a connection idle this long (default 60)
+    \\  env GITD_HEAD_TIMEOUT_SECONDS: time allowed to send a request head (default 10)
     \\
 ;
 
@@ -66,6 +67,18 @@ fn usageError() u8 {
     return 2;
 }
 
+/// Reads a timeout from the environment, or returns `default`. Returns
+/// null, after logging, when the value is not 1-3600.
+fn secondsFromEnv(init: std.process.Init, name: []const u8, default: u32) ?u32 {
+    const text = init.environ_map.get(name) orelse return default;
+    const seconds = std.fmt.parseInt(u32, text, 10) catch 0;
+    if (seconds == 0 or seconds > 3600) {
+        std.log.err("{s} must be between 1 and 3600", .{name});
+        return null;
+    }
+    return seconds;
+}
+
 fn createKey(init: std.process.Init, opts: Options) !u8 {
     const io = init.io;
     const data = try store.DataDir.prepare(io, init.arena.allocator(), opts.data_dir);
@@ -110,13 +123,8 @@ fn serve(init: std.process.Init, opts: Options) !u8 {
         return 2;
     };
 
-    const idle_timeout = if (init.environ_map.get("GITD_IDLE_TIMEOUT_SECONDS")) |text|
-        std.fmt.parseInt(u32, text, 10) catch {
-            std.log.err("GITD_IDLE_TIMEOUT_SECONDS must be a whole number of seconds", .{});
-            return 2;
-        }
-    else
-        server.default_idle_timeout_seconds;
+    const idle_timeout = secondsFromEnv(init, "GITD_IDLE_TIMEOUT_SECONDS", server.default_idle_timeout_seconds) orelse return 2;
+    const head_timeout = secondsFromEnv(init, "GITD_HEAD_TIMEOUT_SECONDS", server.default_head_timeout_seconds) orelse return 2;
 
     const data = try store.DataDir.prepare(io, arena, opts.data_dir);
     try data.clearTmp(io);
@@ -136,6 +144,7 @@ fn serve(init: std.process.Init, opts: Options) !u8 {
         .store = &repo_store,
         .secret = &secret,
         .idle_timeout_seconds = idle_timeout,
+        .head_timeout_seconds = head_timeout,
     };
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
@@ -148,6 +157,7 @@ fn serve(init: std.process.Init, opts: Options) !u8 {
         std.log.err("sigwait failed", .{});
     }
     std.log.info("stopping (signal {d})", .{signal});
+    defer app.peers.deinit(init.gpa);
     // The loop only ends by cancellation, so its result is always
     // error.Canceled and carries nothing to report.
     accept_loop.cancel(io) catch {};
@@ -162,5 +172,6 @@ test {
     _ = @import("store.zig");
     _ = @import("git_proxy.zig");
     _ = @import("server.zig");
-    _ = @import("timed_reader.zig");
+    _ = @import("timed_stream.zig");
+    _ = @import("http_util.zig");
 }

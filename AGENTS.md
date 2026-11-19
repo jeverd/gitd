@@ -40,7 +40,8 @@ src/
   repo_name.zig     repo name validation
   db.zig            SQLite metadata (hand-declared sqlite3 functions)
   store.zig         data directory, repo storage on disk, safe `git` environment
-  timed_reader.zig  socket reader with a per-read timeout
+  timed_stream.zig  socket reader and writer with per-operation timeouts
+  http_util.zig     keep-alive rules and the per-address connection cap
 tests/e2e/run.sh    end-to-end test
 scripts/verify.sh   verification gate
 ```
