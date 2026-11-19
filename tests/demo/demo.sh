@@ -5,6 +5,7 @@
 #   tests/demo/demo.sh repo NAME             create a repo
 #   tests/demo/demo.sh seed REPO             push a small app to main
 #   tests/demo/demo.sh agent N REPO [BRANCH] clone, change a file, push (default branch agent/N/work)
+#                                            with a token limited to refs/heads/agent/N/*
 #   tests/demo/demo.sh stop
 #
 # State (admin key, port) lives in $DEMO_DIR (default /tmp/gitd-demo).
@@ -58,7 +59,8 @@ case "$cmd" in
     ;;
   agent)
     n="$1"; repo="$2"; branch="${3:-agent/$n/work}"
-    tok="${AGENT_TOKEN:-$(token "$repo" '["git:read","git:write"]')}"
+    # Each agent may only write under refs/heads/agent/N/.
+    tok="${AGENT_TOKEN:-$(token "$repo" '["git:read","git:write"]' "\"refs\":[\"refs/heads/agent/$n/*\"]")}"
     dir="$DEMO_DIR/agent$n"
     rm -rf "$dir"; git clone -q "$(url "$tok" "$repo")" "$dir"
     printf 'body.dark { background: black; color: white; } /* agent %s */\n' "$n" >>"$dir/style.css"

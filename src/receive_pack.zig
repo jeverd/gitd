@@ -32,7 +32,9 @@ pub const ParseError = error{ InvalidPush, TooManyCommands };
 
 /// Parses commands from `bytes`, which holds the start of the body (up to
 /// `max_commands_bytes`). Writes them into `out` and returns the used part.
-pub fn parse(bytes: []const u8, out: *[max_commands]Command) ParseError![]Command {
+/// `caps` receives the client's capability list (borrowing `bytes`).
+pub fn parse(bytes: []const u8, out: *[max_commands]Command, caps: *[]const u8) ParseError![]Command {
+    caps.* = "";
     var pos: usize = 0;
     var count: usize = 0;
     var saw_shallow_done = false;
@@ -58,7 +60,10 @@ pub fn parse(bytes: []const u8, out: *[max_commands]Command) ParseError![]Comman
         if (std.mem.startsWith(u8, line, "push-cert")) return error.InvalidPush;
         if (count == 0) {
             // Capabilities follow a NUL on the first command only.
-            if (std.mem.findScalar(u8, line, 0)) |nul| line = line[0..nul];
+            if (std.mem.findScalar(u8, line, 0)) |nul| {
+                caps.* = line[nul + 1 ..];
+                line = line[0..nul];
+            }
         } else if (std.mem.findScalar(u8, line, 0) != null) return error.InvalidPush;
 
         if (count == max_commands) return error.TooManyCommands;
@@ -77,6 +82,51 @@ fn parseCommand(line: []const u8) ParseError!Command {
     if (!isOid(old) or !isOid(new) or old.len != new.len) return error.InvalidPush;
     ref_name.validate(ref) catch return error.InvalidPush;
     return .{ .old = old, .new = new, .ref = ref };
+}
+
+pub fn hasCapability(caps: []const u8, name: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, caps, " \n");
+    while (it.next()) |cap| if (std.mem.eql(u8, cap, name)) return true;
+    return false;
+}
+
+/// Writes git's answer to a push that gitd refuses before git runs: every
+/// command marked `ng` with `reason`, so the client prints
+/// `! [remote rejected] <ref> (<reason>)`. `message` is also sent as
+/// progress, which git prints as `remote: <message>`. Uses side-band
+/// framing when the client asked for it.
+pub fn writeRejection(w: *std.Io.Writer, caps: []const u8, commands: []const Command, reasons: []const []const u8, message: []const u8) std.Io.Writer.Error!void {
+    var report_buf: [64 * 1024]u8 = undefined;
+    var report: std.Io.Writer = .fixed(&report_buf);
+    writePkt(&report, "unpack ok\n") catch {};
+    for (commands, reasons) |cmd, reason| {
+        var line_buf: [1024]u8 = undefined;
+        const line = std.mem.print(&line_buf, "ng {s} {s}\n", .{ cmd.ref, reason }) catch continue;
+        writePkt(&report, line) catch break;
+    }
+    report.writeAll("0000") catch {};
+    const body = report.buffered();
+
+    const band_max: usize = if (hasCapability(caps, "side-band-64k")) 65515 else if (hasCapability(caps, "side-band")) 995 else 0;
+    if (band_max == 0) return w.writeAll(body);
+    var msg_buf: [1024]u8 = undefined;
+    const progress = std.mem.print(&msg_buf, "\x02{s}\n", .{message}) catch "";
+    if (progress.len > 0 and progress.len + 4 <= band_max) try writePkt(w, progress);
+    var rest = body;
+    while (rest.len > 0) {
+        const n = @min(rest.len, band_max - 1);
+        var chunk_buf: [65520]u8 = undefined;
+        chunk_buf[0] = 1;
+        @memcpy(chunk_buf[1..][0..n], rest[0..n]);
+        try writePkt(w, chunk_buf[0 .. n + 1]);
+        rest = rest[n..];
+    }
+    try w.writeAll("0000");
+}
+
+fn writePkt(w: *std.Io.Writer, payload: []const u8) std.Io.Writer.Error!void {
+    try w.print("{x:0>4}", .{payload.len + 4});
+    try w.writeAll(payload);
 }
 
 pub fn isOid(text: []const u8) bool {
@@ -105,7 +155,9 @@ test "parses commands, capabilities, and shallow lines" {
         pkt(zero ++ " " ++ a ++ " refs/heads/agent/1\x00report-status side-band-64k\n") ++
         pkt(a ++ " " ++ zero ++ " refs/heads/old") ++
         "0000PACK...";
-    const cmds = try parse(body, &out);
+    var caps: []const u8 = undefined;
+    const cmds = try parse(body, &out, &caps);
+    try testing.expectEqualStrings("report-status side-band-64k", caps);
     try testing.expectEqual(@as(usize, 2), cmds.len);
     try testing.expectEqualStrings("refs/heads/agent/1", cmds[0].ref);
     try testing.expect(cmds[0].isCreate());
@@ -114,7 +166,8 @@ test "parses commands, capabilities, and shallow lines" {
 
 test "an empty probe push has no commands" {
     var out: [max_commands]Command = undefined;
-    try testing.expectEqual(@as(usize, 0), (try parse("0000", &out)).len);
+    var caps: []const u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), (try parse("0000", &out, &caps)).len);
 }
 
 test "rejects malformed pushes" {
@@ -133,7 +186,25 @@ test "rejects malformed pushes" {
         pkt(a ++ " " ++ b ++ " refs/heads/x") ++ pkt("shallow " ++ a) ++ "0000",
         "00ff" ++ a,
     };
-    for (bad) |body| try testing.expectError(error.InvalidPush, parse(body, &out));
+    var caps: []const u8 = undefined;
+    for (bad) |body| try testing.expectError(error.InvalidPush, parse(body, &out, &caps));
+}
+
+test "rejection report, plain and side-band" {
+    var out: [max_commands]Command = undefined;
+    var caps: []const u8 = undefined;
+    const cmds = try parse(pkt(a ++ " " ++ b ++ " refs/heads/main\x00report-status") ++ "0000", &out, &caps);
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeRejection(&w, caps, cmds, &.{"not allowed"}, "gitd: no");
+    try testing.expectEqualStrings("000eunpack ok\n0023ng refs/heads/main not allowed\n0000", w.buffered());
+
+    var w2: std.Io.Writer = .fixed(&buf);
+    try writeRejection(&w2, "report-status side-band-64k", cmds, &.{"not allowed"}, "gitd: no");
+    const got = w2.buffered();
+    try testing.expectEqualStrings("000e\x02gitd: no\n", got[0..14]);
+    try testing.expectEqualStrings("003a\x01000eunpack ok\n0023ng refs/heads/main not allowed\n0000", got[14 .. got.len - 4]);
+    try testing.expectEqualStrings("0000", got[got.len - 4 ..]);
 }
 
 test "fuzz parse commands" {
@@ -144,7 +215,8 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) anyerror!void {
     var buf: [2048]u8 = undefined;
     const input = buf[0..smith.slice(&buf)];
     var out: [max_commands]Command = undefined;
-    const cmds = parse(input, &out) catch return;
+    var caps: []const u8 = undefined;
+    const cmds = parse(input, &out, &caps) catch return;
     for (cmds) |c| {
         try ref_name.validate(c.ref);
         try testing.expect(isOid(c.old) and isOid(c.new));

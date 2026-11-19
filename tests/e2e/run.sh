@@ -76,6 +76,9 @@ mint() { # repo scopes-json [ttl]
   json '["token"]'
 }
 url() { echo "http://t:$1@127.0.0.1:$PORT/$2.git"; }
+events() { curl -s "$BASE/ui/api/events?after=0" >"$WORK/body"; }
+count_events() { events; python3 -c "import json,sys; print(sum(1 for e in json.load(open('$WORK/body'))['events'] if all(e[k]==v for k,v in (a.split('=',1) for a in sys.argv[1:]))))" "$@"; }
+
 
 echo "== setup"
 KEY="$("$BIN" admin create-key --data "$DATA")"
@@ -162,6 +165,57 @@ if git clone -q "$(url "$OTHER" acme/web)" "$WORK/nope" 2>/dev/null; then fail "
 pass "git refuses another repo's token"
 sleep 2
 expect_eq "expired token" 401 "$(status -u "t:$SHORT" "$BASE/acme/web.git/info/refs?service=git-upload-pack")"
+
+echo "== branch limits (R2.2)"
+
+expect_eq "mint limited token" 201 "$(admin -X POST "$BASE/v1/tokens" -d '{"repo":"acme/other","scopes":["git:read","git:write"],"refs":["refs/heads/agent/7/*"]}')"
+LIM="$(json '["token"]')"
+FULL_OTHER="$(mint acme/other '["git:read","git:write"]')"
+expect_eq "invalid ref pattern" 400 "$(admin -X POST "$BASE/v1/tokens" -d '{"repo":"acme/other","scopes":["git:write"],"refs":["main"]}')"
+expect_eq "too many ref patterns" 400 "$(admin -X POST "$BASE/v1/tokens" -d '{"repo":"acme/other","scopes":["git:write"],"refs":["refs/heads/a","refs/heads/b","refs/heads/c","refs/heads/d","refs/heads/e"]}')"
+LREPO="$WORK/limited"
+git "${GIT_ID[@]}" init -q "$LREPO"
+echo x >"$LREPO/x.txt"; git -C "$LREPO" add x.txt; git "${GIT_ID[@]}" -C "$LREPO" commit -qm x
+git -C "$LREPO" push -q "$(url "$FULL_OTHER" acme/other)" HEAD:refs/heads/main 2>"$WORK/err" || fail "seeding acme/other main: $(cat "$WORK/err")"
+OTHER_MAIN="$(git -C "$LREPO" rev-parse HEAD)"
+echo y >"$LREPO/x.txt"; git "${GIT_ID[@]}" -C "$LREPO" commit -qam y
+git -C "$LREPO" push -q "$(url "$LIM" acme/other)" HEAD:refs/heads/agent/7/a 2>"$WORK/err" || fail "allowed push: $(cat "$WORK/err")"
+pass "limited token pushes inside its pattern"
+REJ_BEFORE="$(count_events kind=push_rejected)"
+if git -C "$LREPO" push "$(url "$LIM" acme/other)" HEAD:refs/heads/main >"$WORK/out" 2>&1; then fail "limited token pushed main"; fi
+grep -q "remote rejected.*token may only push to refs/heads/agent/7/\*" "$WORK/out" || fail "git did not show the rejection reason: $(cat "$WORK/out")"
+pass "git shows the rejection reason"
+expect_eq "main unchanged after rejected push" "$OTHER_MAIN" "$(git ls-remote "$(url "$FULL_OTHER" acme/other)" refs/heads/main | cut -f1)"
+expect_eq "rejection logged" "$((REJ_BEFORE + 1))" "$(count_events kind=push_rejected)"
+if git -C "$LREPO" push -q "$(url "$LIM" acme/other)" HEAD:refs/heads/agent/7/b HEAD:refs/heads/main 2>/dev/null; then fail "mixed push accepted"; fi
+expect_eq "mixed push changes nothing" "" "$(git ls-remote "$(url "$FULL_OTHER" acme/other)" refs/heads/agent/7/b)"
+if git -C "$LREPO" push -q "$(url "$LIM" acme/other)" :refs/heads/main 2>/dev/null; then fail "limited token deleted main"; fi
+expect_eq "main survives a refused delete" "$OTHER_MAIN" "$(git ls-remote "$(url "$FULL_OTHER" acme/other)" refs/heads/main | cut -f1)"
+git -C "$LREPO" push -q "$(url "$LIM" acme/other)" :refs/heads/agent/7/a 2>"$WORK/err" || fail "allowed delete: $(cat "$WORK/err")"
+pass "limited token deletes inside its pattern"
+# A client that asks for no report gets a plain 403; one that asks for
+# report-status without side-band gets bare report lines.
+python3 - "$PORT" "$LIM" "$OTHER_MAIN" >"$WORK/raw" <<'PY'
+import base64, socket, sys
+port, token, old = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+auth = base64.b64encode(f"t:{token}".encode()).decode()
+def push(caps):
+    line = f"{old} {'1'*40} refs/heads/main\0{caps}\n".encode()
+    body = b"%04x" % (len(line) + 4) + line + b"0000"
+    s = socket.create_connection(("127.0.0.1", port))
+    s.sendall((f"POST /acme/other.git/git-receive-pack HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {auth}\r\n"
+               f"Content-Type: application/x-git-receive-pack-request\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body)
+    data = b""
+    while chunk := s.recv(65536):
+        data += chunk
+    s.close()
+    return data
+print("NOREPORT", push("agent=test").split(b"\r\n")[0].decode())
+print("PLAIN", b"ng refs/heads/main token may only push" in push("report-status"))
+PY
+grep -q "NOREPORT HTTP/1.1 403" "$WORK/raw" || fail "push without report-status: $(cat "$WORK/raw")"
+grep -q "PLAIN True" "$WORK/raw" || fail "plain report-status rejection: $(cat "$WORK/raw")"
+pass "rejections without report-status and without side-band"
 
 echo "== protocol hardening"
 expect_eq "dumb protocol HEAD" 400 "$(status -u "t:$RO" "$BASE/acme/web.git/HEAD")"
@@ -357,8 +411,6 @@ RW="$(mint acme/web '["git:read","git:write"]')"
 expect_eq "recreated repo is empty" 0 "$(git ls-remote "$(url "$RW" acme/web)" | wc -l | tr -d ' ')"
 
 echo "== activity log and UI"
-events() { curl -s "$BASE/ui/api/events?after=0" >"$WORK/body"; }
-count_events() { events; python3 -c "import json,sys; print(sum(1 for e in json.load(open('$WORK/body'))['events'] if all(e[k]==v for k,v in (a.split('=',1) for a in sys.argv[1:]))))" "$@"; }
 expect_eq "UI page served" 200 "$(status "$BASE/ui")"
 grep -q "<title>gitd</title>" "$WORK/body" || fail "UI page content"
 expect_eq "UI state" 200 "$(status "$BASE/ui/api/state")"
@@ -366,7 +418,7 @@ expect_eq "UI state lists both repos" 2 "$(json '["repos"].__len__()')"
 expect_eq "repo_created events" 3 "$(count_events kind=repo_created)"
 expect_eq "repo_deleted event" 1 "$(count_events kind=repo_deleted repo=acme/web)"
 expect_eq "first push recorded with its commit" 1 "$(count_events kind=push repo=acme/web ref=refs/heads/main detail=created)"
-AGENT_PUSHES="$(events; python3 -c "import json; print(sum(1 for e in json.load(open('$WORK/body'))['events'] if e['kind']=='push' and e['ref'].startswith('refs/heads/agent/')))")"
+AGENT_PUSHES="$(events; python3 -c "import json; print(sum(1 for e in json.load(open('$WORK/body'))['events'] if e['kind']=='push' and e['repo']=='acme/web' and e['ref'].startswith('refs/heads/agent/')))")"
 expect_eq "agent branch pushes recorded" 8 "$AGENT_PUSHES"
 # A push git refuses (not a fast-forward) is not recorded.
 FRESH="$WORK/fresh"
