@@ -6,6 +6,8 @@
 #   tests/demo/demo.sh seed REPO             push a small app to main
 #   tests/demo/demo.sh agent N REPO [BRANCH] clone, change a file, push (default branch agent/N/work)
 #                                            with a token limited to refs/heads/agent/N/*
+#   tests/demo/demo.sh head REPO BRANCH      print a branch's commit
+#   tests/demo/demo.sh race REPO BRANCH N    N agents commit to BRANCH at once via the API
 #   tests/demo/demo.sh stop
 #
 # State (admin key, port) lives in $DEMO_DIR (default /tmp/gitd-demo).
@@ -71,7 +73,26 @@ case "$cmd" in
       echo "agent $n push to $branch rejected:"; sed 's/^/  /' "$dir.err"; exit 1
     fi
     ;;
+  head)
+    # head REPO BRANCH: print the branch's commit
+    api "$BASE/v1/repos/$1/branches" | python3 -c "import json,sys; print(next(b['commit'] for b in json.load(sys.stdin)['branches'] if b['name']=='$2'))"
+    ;;
+  race)
+    # race REPO BRANCH N: N agents commit to BRANCH at once, all built on its
+    # current head. Each token may only write that branch.
+    repo="$1"; branch="$2"; n="$3"
+    head="$("$0" head "$repo" "$branch")"
+    for i in $(seq 1 "$n"); do
+      tok="$(token "$repo" '["git:read","git:write"]' "\"refs\":[\"refs/heads/$branch\"]")"
+      printf '{"branch":"%s","expected_head":"%s","message":"Agent %s: update plan","author":{"name":"Agent %s","email":"agent%s@example.com"},"changes":[{"path":"PLAN.md","content":"Plan by agent %s\\n"}]}' \
+        "$branch" "$head" "$i" "$i" "$i" "$i" >"$DEMO_DIR/race$i.json"
+      ( code="$(curl -s -o "$DEMO_DIR/race$i.out" -w '%{http_code}' -H "authorization: Bearer $tok" -X POST \
+          "$BASE/v1/repos/$repo/commits" --data-binary @"$DEMO_DIR/race$i.json")"
+        echo "agent $i: HTTP $code $(cat "$DEMO_DIR/race$i.out")" ) &
+    done
+    wait
+    ;;
   *)
-    sed -n '2,12p' "$0"; exit 2
+    sed -n '2,14p' "$0"; exit 2
     ;;
 esac

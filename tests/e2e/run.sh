@@ -263,6 +263,66 @@ expect_eq "read API on missing repo" 404 "$(admin "$BASE/v1/repos/acme/none/file
 expect_eq "UI reads without auth" 200 "$(status "$BASE/ui/api/repos/acme/other/files/x.txt")"
 expect_eq "UI reads are read-only" 405 "$(status -X POST "$BASE/ui/api/repos/acme/other/commits")"
 
+echo "== commit API (R3.2)"
+commit_body() { # branch expected(json) message changes(json)
+  printf '{"branch":"%s","expected_head":%s,"message":"%s","changes":%s}' "$1" "$2" "$3" "$4"
+}
+expect_eq "commit" 201 "$(admin -X POST "$CB/commits" -d "$(commit_body main "\"$OTHER_HEAD\"" "API commit" '[{"path":"notes/a.md","content":"hello\n"},{"path":"x.txt","delete":true}]')")"
+API_HEAD="$(json '["sha"]')"
+expect_eq "commit parent" "$OTHER_HEAD" "$(json '["parent"]')"
+expect_eq "committed file" 200 "$(admin "$CB/files/notes/a.md")"
+expect_eq "committed content" hello "$(cat "$WORK/body")"
+expect_eq "deleted file is gone" 404 "$(admin "$CB/files/x.txt")"
+expect_eq "commit logged" 1 "$(count_events kind=commit new="$API_HEAD")"
+expect_eq "stale expected_head" 409 "$(admin -X POST "$CB/commits" -d "$(commit_body main "\"$OTHER_HEAD\"" late '[{"path":"late.txt","content":"x"}]')")"
+expect_eq "409 says where the branch is" "$API_HEAD" "$(json '["current_head"]')"
+expect_eq "conflict logged" 1 "$(count_events kind=commit_conflict)"
+# Six commits race on the same head: exactly one wins, history stays linear.
+RACE_PIDS=()
+for i in 1 2 3 4 5 6; do
+  printf '{"branch":"main","expected_head":"%s","message":"racer %s","changes":[{"path":"race.txt","content":"%s"}]}' "$API_HEAD" "$i" "$i" >"$WORK/race$i.json"
+  curl -s -o "$WORK/race$i" -w '%{http_code}' -H "authorization: Bearer $KEY" -X POST "$CB/commits" --data-binary @"$WORK/race$i.json" >"$WORK/race$i.code" &
+  RACE_PIDS+=($!)
+done
+for pid in "${RACE_PIDS[@]}"; do wait "$pid"; done
+expect_eq "race: one winner" 1 "$(grep -l '^201$' "$WORK"/race*.code | wc -l | tr -d ' ')"
+expect_eq "race: five 409s" 5 "$(grep -l '^409$' "$WORK"/race*.code | wc -l | tr -d ' ')"
+admin "$CB/log?limit=3" >/dev/null
+expect_eq "race: the winner sits on the old head" "$API_HEAD" "$(json '["commits"][0]["parents"][0]')"
+WINNER="$(json '["commits"][0]["sha"]')"
+expect_eq "race: losers see the winner" 5 "$(grep -l "\"current_head\":\"$WINNER\"" "$WORK"/race? | wc -l | tr -d ' ')"
+expect_eq "new branch from main" 201 "$(admin -X POST "$CB/commits" -d '{"branch":"feature/x","expected_head":null,"from":"main","message":"start","changes":[{"path":"f.txt","content":"f"}]}')"
+expect_eq "new branch parent is main" "$WINNER" "$(json '["parent"]')"
+expect_eq "creating an existing branch" 409 "$(admin -X POST "$CB/commits" -d '{"branch":"feature/x","expected_head":null,"from":"main","message":"again","changes":[{"path":"f.txt","content":"g"}]}')"
+expect_eq "commit with read token" 403 "$(status -H "authorization: Bearer $READ_TOK" -X POST "$CB/commits" -d '{"branch":"agent/7/r","expected_head":null,"message":"m","changes":[{"path":"a","content":"a"}]}')"
+expect_eq "limited token outside its pattern" 403 "$(status -H "authorization: Bearer $LIM" -X POST "$CB/commits" -d "$(commit_body main "\"$WINNER\"" m '[{"path":"a","content":"a"}]')")"
+expect_eq "limited token inside its pattern" 201 "$(status -H "authorization: Bearer $LIM" -X POST "$CB/commits" -d '{"branch":"agent/7/api","expected_head":null,"from":"main","message":"agent work","author":{"name":"Agent 7","email":"a7@example.com"},"changes":[{"path":"a.txt","content":"a"}]}')"
+expect_eq "author recorded" "Agent 7" "$(admin "$CB/commits/$(json '["sha"]')" >/dev/null; json '["author"]["name"]')"
+for bad in '{"branch":"main","expected_head":null,"message":"m","changes":[]}' \
+           '{"branch":"main","expected_head":null,"message":"","changes":[{"path":"a","content":"a"}]}' \
+           '{"branch":"main","expected_head":null,"message":"m","changes":[{"path":"a","content":"a","delete":true}]}' \
+           '{"branch":"main","expected_head":null,"message":"m","changes":[{"path":"../a","content":"a"}]}' \
+           '{"branch":"main","expected_head":null,"message":"m","changes":[{"path":"a","content_base64":"!!!"}]}' \
+           '{"branch":"main","expected_head":"abc","message":"m","changes":[{"path":"a","content":"a"}]}' \
+           '{"branch":"../main","expected_head":null,"message":"m","changes":[{"path":"a","content":"a"}]}' \
+           '{"branch":"main","expected_head":null,"message":"m","author":{"name":"a<b","email":"x"},"changes":[{"path":"a","content":"a"}]}' \
+           '{"branch":"main","message":"m","changes":[{"path":"a","content":"a"}]}'; do
+  expect_eq "invalid commit body rejected" 400 "$(admin -X POST "$CB/commits" -d "$bad")"
+done
+python3 -c 'import sys; sys.stdout.write("{\"branch\":\"big\",\"expected_head\":null,\"message\":\"m\",\"changes\":[{\"path\":\"b\",\"content\":\"" + "a"*(17*1024*1024) + "\"}]}")' >"$WORK/big.json"
+expect_eq "commit body over 16 MiB" 413 "$(admin -X POST "$CB/commits" --data-binary @"$WORK/big.json")"
+expect_eq "create branch" 201 "$(admin -X POST "$CB/branches" -d '{"name":"try/1","from":"main"}')"
+expect_eq "create existing branch" 409 "$(admin -X POST "$CB/branches" -d '{"name":"try/1","from":"main"}')"
+expect_eq "create branch from nothing" 404 "$(admin -X POST "$CB/branches" -d '{"name":"try/2","from":"nope"}')"
+expect_eq "delete with wrong expected" 409 "$(admin -X DELETE "$CB/branches/try/1?expected=$OTHER_MAIN")"
+expect_eq "delete branch" 204 "$(admin -X DELETE "$CB/branches/try/1")"
+expect_eq "delete missing branch" 404 "$(admin -X DELETE "$CB/branches/try/1")"
+expect_eq "limited token cannot delete main" 403 "$(status -H "authorization: Bearer $LIM" -X DELETE "$CB/branches/main")"
+expect_eq "branch events" "1 1" "$(count_events kind=branch_created) $(count_events kind=branch_deleted)"
+expect_eq "no temp index files left" 0 "$(find "$DATA/tmp" -type f | wc -l | tr -d ' ')"
+git -C "$LREPO" fetch -q "$(url "$FULL_OTHER" acme/other)" main 2>"$WORK/err" || fail "fetch after API commits: $(cat "$WORK/err")"
+expect_eq "git sees API commits" "$WINNER" "$(git -C "$LREPO" rev-parse FETCH_HEAD)"
+
 echo "== protocol hardening"
 expect_eq "dumb protocol HEAD" 400 "$(status -u "t:$RO" "$BASE/acme/web.git/HEAD")"
 expect_eq "dumb protocol objects" 400 "$(status -u "t:$RO" "$BASE/acme/web.git/objects/info/packs")"

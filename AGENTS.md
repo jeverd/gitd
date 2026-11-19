@@ -53,6 +53,7 @@ src/
   content.zig       per-repo content API: branches, files, trees, log, commits
 tests/e2e/run.sh    end-to-end test
 tests/demo/demo.sh  drives a UI-enabled gitd for demos and recordings
+tests/tla/          TLA+ models; each folder has a check.sh that verify.sh runs
 scripts/verify.sh   verification gate
 ```
 
@@ -72,6 +73,7 @@ Use `scripts/verify.sh --quick` while iterating; the full run is required at the
 - **A new behavior** gets an end-to-end check that fails without the change. Confirm that by breaking the code on purpose once.
 - **A fuzzer finding** becomes a unit test with the failing input (R5.1).
 - **New parsing of untrusted bytes** gets a fuzz target. Add its name to `FUZZ_TARGETS` in `scripts/verify.sh`.
+- **New concurrency protocols** get a TLA+ model in `tests/tla/<name>/` with a config that plants the bug and must fail. Cite the model and property from the code. Change the model with the code.
 
 If you could not run something, say which step and why.
 

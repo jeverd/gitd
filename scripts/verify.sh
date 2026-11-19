@@ -37,6 +37,9 @@ zig build test || die "unit tests in Debug"
 step "unit tests (ReleaseSafe)"
 zig build test -Doptimize=ReleaseSafe || die "unit tests in ReleaseSafe"
 
+step "TLA+ models"
+for check in tests/tla/*/check.sh; do "$check" || die "TLA+ model $(dirname "$check")"; done
+
 step "end-to-end (Debug: safety checks and leak reports on exit)"
 zig build || die "Debug build"
 tests/e2e/run.sh zig-out/bin/gitd >"$OUT/e2e-debug.log" 2>&1 || { tail -40 "$OUT/e2e-debug.log"; die "end-to-end in Debug"; }
