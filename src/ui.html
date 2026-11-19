@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gitd</title>
+<style>
+  :root { --fg: #000; --bg: #fff; --line: 1px solid #000; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  header { display: flex; justify-content: space-between; align-items: baseline; padding: 12px 20px; border-bottom: var(--line); }
+  header h1 { margin: 0; font-size: 18px; letter-spacing: 0.04em; }
+  header .meta { color: #000; opacity: 0.6; }
+  main { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); min-height: calc(100vh - 49px); }
+  section { padding: 16px 20px; min-width: 0; }
+  section + section { border-left: var(--line); }
+  h2 { margin: 0 0 12px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em; }
+  .repo { border: var(--line); margin-bottom: 16px; }
+  .repo-name { padding: 6px 10px; border-bottom: var(--line); font-weight: 700; display: flex; justify-content: space-between; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 4px 10px; vertical-align: top; white-space: nowrap; }
+  th { font-weight: 400; opacity: 0.6; border-bottom: 1px dashed #000; }
+  td.subject { white-space: normal; word-break: break-word; }
+  tr.fresh td { background: #000; color: #fff; }
+  .empty { padding: 8px 10px; opacity: 0.6; }
+  ol#events { list-style: none; margin: 0; padding: 0; }
+  #events li { border-bottom: 1px dashed #000; padding: 5px 0; display: grid; grid-template-columns: 70px minmax(0, 1fr); gap: 8px; }
+  #events li .when { opacity: 0.6; }
+  #events li .what { word-break: break-word; }
+  #events li.reject { background: #000; color: #fff; padding-left: 6px; }
+  #events li.reject .when { opacity: 0.8; }
+  .kind { font-weight: 700; }
+  .oid { opacity: 0.7; }
+</style>
+</head>
+<body>
+<header>
+  <h1>gitd</h1>
+  <span class="meta" id="status">connecting…</span>
+</header>
+<main>
+  <section>
+    <h2>Repos</h2>
+    <div id="repos"><div class="empty">No repos yet.</div></div>
+  </section>
+  <section>
+    <h2>Activity</h2>
+    <ol id="events"></ol>
+  </section>
+</main>
+<script>
+"use strict";
+// Every value from the server is untrusted (agents write commit messages
+// and branch names), so text is only ever set with textContent.
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+};
+const short = (oid) => (oid && !/^0+$/.test(oid) ? oid.slice(0, 7) : "-");
+const clock = (unix) => new Date(unix * 1000).toLocaleTimeString([], { hour12: false });
+const ago = (unix, now) => {
+  const s = Math.max(0, now - unix);
+  return s < 60 ? s + "s ago" : s < 3600 ? Math.floor(s / 60) + "m ago" : Math.floor(s / 3600) + "h ago";
+};
+const branchName = (ref) => ref.replace(/^refs\/heads\//, "");
+
+let lastEvent = 0;
+let lastHeads = new Map();
+
+function describe(e) {
+  const ref = branchName(e.ref);
+  switch (e.kind) {
+    case "repo_created": return ["repo created", e.repo];
+    case "repo_deleted": return ["repo deleted", e.repo];
+    case "push":
+      if (e.detail === "created") return ["push", `${e.repo} ${ref} created at ${short(e.new)}`];
+      if (e.detail === "deleted") return ["push", `${e.repo} ${ref} deleted`];
+      return ["push", `${e.repo} ${ref} ${short(e.old)} → ${short(e.new)}`];
+    case "push_rejected": return ["push REJECTED", `${e.repo} ${ref}: ${e.detail}`];
+    default: return [e.kind.replace(/_/g, " "), `${e.repo} ${ref} ${e.detail}`.trim()];
+  }
+}
+
+function renderEvents(list) {
+  const ol = $("events");
+  for (const e of list) {
+    const [kind, what] = describe(e);
+    const li = el("li", /rejected|conflict|failed/.test(e.kind) ? "reject" : "");
+    li.dataset.kind = e.kind;
+    li.append(el("span", "when", clock(e.created_at)));
+    const w = el("span", "what");
+    w.append(el("span", "kind", kind), document.createTextNode(" " + what));
+    li.append(w);
+    ol.prepend(li);
+    lastEvent = Math.max(lastEvent, e.id);
+  }
+  while (ol.children.length > 300) ol.lastChild.remove();
+}
+
+function renderRepos(state) {
+  const box = $("repos");
+  box.replaceChildren();
+  if (state.repos.length === 0) { box.append(el("div", "empty", "No repos yet.")); return; }
+  const heads = new Map();
+  for (const repo of state.repos) {
+    const card = el("div", "repo");
+    const title = el("div", "repo-name");
+    title.append(el("span", "", repo.name), el("span", "meta", repo.branches.length + " branches"));
+    card.append(title);
+    if (repo.branches.length === 0) {
+      card.append(el("div", "empty", "empty: no branches"));
+    } else {
+      const table = el("table");
+      const head = el("tr");
+      for (const h of ["branch", "commit", "updated", "message"]) head.append(el("th", "", h));
+      table.append(head);
+      for (const b of repo.branches) {
+        const key = repo.name + " " + b.name;
+        heads.set(key, b.commit);
+        const tr = el("tr", lastHeads.size && lastHeads.get(key) !== b.commit ? "fresh" : "");
+        tr.dataset.branch = b.name;
+        tr.append(el("td", "", b.name), el("td", "oid", short(b.commit)),
+                  el("td", "", ago(b.committed_at, state.now)), el("td", "subject", b.subject));
+        table.append(tr);
+      }
+      card.append(table);
+    }
+    box.append(card);
+  }
+  lastHeads = heads;
+}
+
+async function tick() {
+  try {
+    const [state, events] = await Promise.all([
+      fetch("/ui/api/state").then((r) => r.json()),
+      fetch("/ui/api/events?after=" + lastEvent).then((r) => r.json()),
+    ]);
+    renderRepos(state);
+    renderEvents(events.events);
+    $("status").textContent = "live · " + clock(state.now);
+  } catch (err) {
+    $("status").textContent = "disconnected";
+  }
+  setTimeout(tick, 1000);
+}
+tick();
+</script>
+</body>
+</html>

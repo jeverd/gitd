@@ -20,6 +20,10 @@ const git_proxy = @import("git_proxy.zig");
 const Db = @import("db.zig").Db;
 const Store = @import("store.zig").Store;
 const timed = @import("timed_stream.zig");
+const receive_pack = @import("receive_pack.zig");
+const repo_git = @import("repo_git.zig");
+const events = @import("events.zig");
+const ui = @import("ui.zig");
 const http_util = @import("http_util.zig");
 const keepAlive = http_util.keepAlive;
 
@@ -42,13 +46,14 @@ pub const App = struct {
     /// accept queue.
     connection_slots: Io.Semaphore = .{ .permits = max_connections },
     peers: http_util.PeerLimit = .{ .max_per_peer = max_connections_per_peer },
+    /// Serve the read-only activity page at /ui, to loopback clients only.
+    ui_enabled: bool = false,
 };
 
 pub const default_idle_timeout_seconds = 60;
 pub const max_connections = 512;
 pub const max_connections_per_peer = 64;
 pub const default_head_timeout_seconds = 10;
-const max_json_body = 64 * 1024;
 const head_buffer_len = 16 * 1024;
 
 /// Accepts connections until canceled, serving each one concurrently.
@@ -112,7 +117,7 @@ fn serveConnection(app: *App, stream: Io.net.Stream) Io.Cancelable!void {
                 return;
             },
         };
-        handle(app, &request) catch |err| switch (err) {
+        handle(app, &request, stream.socket.address) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             // The client went away or the response broke midway; nothing
             // more can be sent on this connection.
@@ -121,16 +126,24 @@ fn serveConnection(app: *App, stream: Io.net.Stream) Io.Cancelable!void {
     }
 }
 
-const HandleError = error{ WriteFailed, ResponseBroken, ClientGone, HttpExpectationFailed } || Io.Cancelable;
+const api = @import("api.zig");
+const HandleError = api.HandleError;
+const respondError = api.respondError;
+const internal = api.internal;
+const findHeader = api.findHeader;
+const copyBounded = api.copyBounded;
+const pathOf = api.pathOf;
+const copyTruncated = api.copyTruncated;
+pub const unixNow = api.unixNow;
 
-fn handle(app: *App, request: *http.Server.Request) HandleError!void {
+fn handle(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress) HandleError!void {
     const start = Io.Clock.awake.now(app.io);
     const method = request.head.method;
     var target_buf: [256]u8 = undefined;
     // Copy for the log line; the head's strings die when the body is read.
     const logged_target = copyTruncated(&target_buf, pathOf(request.head.target));
 
-    const status = route(app, request) catch |err| switch (err) {
+    const status = route(app, request, peer) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         // Clients hang up mid-transfer routinely (a canceled clone or
         // push), so these are not errors.
@@ -145,7 +158,7 @@ fn handle(app: *App, request: *http.Server.Request) HandleError!void {
 }
 
 /// Handles one request and returns the status it sent.
-fn route(app: *App, request: *http.Server.Request) HandleError!http.Status {
+fn route(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress) HandleError!http.Status {
     const target = request.head.target;
     const path = pathOf(target);
     const query = if (std.mem.findScalar(u8, target, '?')) |q| target[q + 1 ..] else "";
@@ -167,6 +180,11 @@ fn route(app: *App, request: *http.Server.Request) HandleError!http.Status {
     }
 
     if (std.mem.startsWith(u8, path, "/v1/")) return serveApi(app, request, path);
+    if (std.mem.eql(u8, path, "/ui") or std.mem.startsWith(u8, path, "/ui/")) {
+        if (!app.ui_enabled) return respondError(request, .not_found, "not_found", "start gitd with --ui to serve this page");
+        if (!isLoopback(peer)) return respondError(request, .forbidden, "forbidden", "the UI is only served to this machine");
+        return ui.serve(app, request, path, query);
+    }
     return respondError(request, .not_found, "not_found", "no such route");
 }
 
@@ -218,7 +236,7 @@ fn checkAdmin(app: *App, request: *http.Server.Request) AdminCheck {
 
 fn createRepo(app: *App, request: *http.Server.Request) HandleError!http.Status {
     const Body = struct { name: []const u8 };
-    var parsed = readJson(Body, app, request) catch |err| return respondBodyError(request, err);
+    var parsed = api.readJson(Body, app.gpa, request) catch |err| return api.respondBodyError(request, err);
     defer parsed.deinit();
     const name = repo_name.parse(parsed.value.name) catch
         return respondError(request, .bad_request, "invalid_repo_name", repo_name_help);
@@ -246,7 +264,8 @@ fn createRepo(app: *App, request: *http.Server.Request) HandleError!http.Status 
             else => internal(request),
         };
     };
-    return respondJson(app, request, .created, RepoJson{ .name = name.full, .id = &id, .created_at = now });
+    events.record(app, .{ .repo = name.full, .kind = "repo_created", .created_at = now });
+    return api.respondJson(app.gpa, request, .created, RepoJson{ .name = name.full, .id = &id, .created_at = now });
 }
 
 fn listRepos(app: *App, request: *http.Server.Request) HandleError!http.Status {
@@ -255,14 +274,14 @@ fn listRepos(app: *App, request: *http.Server.Request) HandleError!http.Status {
     const items = app.gpa.alloc(RepoJson, repos.len) catch return internal(request);
     defer app.gpa.free(items);
     for (repos, items) |repo, *item| item.* = .{ .name = repo.name, .id = repo.id, .created_at = repo.created_at };
-    return respondJson(app, request, .ok, .{ .repos = items });
+    return api.respondJson(app.gpa, request, .ok, .{ .repos = items });
 }
 
 fn getRepo(app: *App, request: *http.Server.Request, name: repo_name.Name) HandleError!http.Status {
     const repo = (app.db.getRepo(app.io, app.gpa, name.full) catch return internal(request)) orelse
         return respondError(request, .not_found, "not_found", "no such repo");
     defer repo.deinit(app.gpa);
-    return respondJson(app, request, .ok, RepoJson{ .name = repo.name, .id = repo.id, .created_at = repo.created_at });
+    return api.respondJson(app.gpa, request, .ok, RepoJson{ .name = repo.name, .id = repo.id, .created_at = repo.created_at });
 }
 
 fn deleteRepo(app: *App, request: *http.Server.Request, name: repo_name.Name) HandleError!http.Status {
@@ -277,6 +296,7 @@ fn deleteRepo(app: *App, request: *http.Server.Request, name: repo_name.Name) Ha
         error.Canceled => return error.Canceled,
         else => std.log.err("removing files of deleted repo {s}: {t}", .{ name.full, err }),
     };
+    events.record(app, .{ .repo = name.full, .kind = "repo_deleted", .created_at = unixNow(io) });
     try request.respond("", .{ .status = .no_content, .keep_alive = keepAlive(request) });
     return .no_content;
 }
@@ -287,7 +307,7 @@ fn createToken(app: *App, request: *http.Server.Request) HandleError!http.Status
         scopes: []const []const u8,
         ttl_seconds: i64 = auth.default_ttl_seconds,
     };
-    var parsed = readJson(Body, app, request) catch |err| return respondBodyError(request, err);
+    var parsed = api.readJson(Body, app.gpa, request) catch |err| return api.respondBodyError(request, err);
     defer parsed.deinit();
     const body = parsed.value;
 
@@ -311,7 +331,7 @@ fn createToken(app: *App, request: *http.Server.Request) HandleError!http.Status
     const claims = auth.Claims.init(name.full, repo.id, scopes, expires_at) catch return internal(request);
     var token_buf: [auth.max_token_len]u8 = undefined;
     const token = auth.mint(app.secret, &claims, &token_buf) catch return internal(request);
-    return respondJson(app, request, .created, .{ .token = token, .expires_at = expires_at });
+    return api.respondJson(app.gpa, request, .created, .{ .token = token, .expires_at = expires_at });
 }
 
 const RepoJson = struct {
@@ -375,14 +395,101 @@ fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route,
             return respondError(request, .bad_request, "bad_git_request", too_long),
     };
 
-    return git_proxy.serve(app.io, app.gpa, app.store, request, git_route, input) catch |err| switch (err) {
-        error.Canceled => return error.Canceled,
-        error.ResponseBroken => return error.ResponseBroken,
-        error.ClientGone => return error.ClientGone,
-        error.BodyTooLarge => return respondError(request, .payload_too_large, "too_large", "request body is too large"),
-        error.ProxyFailed, error.OutOfMemory => return respondError(request, .bad_gateway, "git_failed", "git could not handle the request"),
+    // `git_route.repo` borrows the request target, which reading the body
+    // overwrites; events are recorded after that, so keep a copy.
+    var name_buf: [repo_name.max_len]u8 = undefined;
+    const repo_copy = repo_name.parse(copyBounded(&name_buf, git_route.repo.full) orelse unreachable) catch unreachable; // already valid and in bounds
+
+    if (git_route.service == .receive_pack and input.content_encoding.len > 0) {
+        // gitd must read a push's commands to check and record them.
+        return respondError(request, .unsupported_media_type, "unsupported_encoding", "push bodies must not be compressed");
+    }
+
+    var body: ?git_proxy.Body = null;
+    defer if (body) |b| b.close(app.io);
+    if (git_route.kind == .rpc) {
+        body = git_proxy.spool(app.io, app.store, request) catch |err| return proxyError(request, err);
+    }
+
+    // Read what a push will change before git runs (R2.2).
+    var push: ?Push = null;
+    defer if (push) |*p| p.deinit(app.gpa);
+    if (git_route.service == .receive_pack and git_route.kind == .rpc) {
+        push = Push.read(app, body.?) catch |err| switch (err) {
+            error.InvalidPush, error.TooManyCommands => return respondError(request, .bad_request, "bad_git_request", "could not read the push commands"),
+            error.OutOfMemory => return internal(request),
+            else => |e| return proxyError(request, e),
+        };
+    }
+
+    var recorder: Push.Recorder = .{ .app = app, .push = if (push) |*p| p else null, .repo = repo_copy };
+    const after: ?git_proxy.After = if (push != null) .{ .ctx = &recorder, .run = Push.Recorder.run } else null;
+    return git_proxy.serve(app.io, app.gpa, app.store, request, git_route, input, body, after) catch |err|
+        proxyError(request, err);
+}
+
+fn proxyError(request: *http.Server.Request, err: git_proxy.ProxyError) HandleError!http.Status {
+    return switch (err) {
+        error.Canceled => error.Canceled,
+        error.ResponseBroken => error.ResponseBroken,
+        error.ClientGone => error.ClientGone,
+        error.BodyTooLarge => respondError(request, .payload_too_large, "too_large", "request body is too large"),
+        error.ProxyFailed, error.OutOfMemory => respondError(request, .bad_gateway, "git_failed", "git could not handle the request"),
     };
 }
+
+/// The ref updates a push asks for, read from its spooled body.
+const Push = struct {
+    head: []u8,
+    commands_buf: *[receive_pack.max_commands]receive_pack.Command,
+    commands: []receive_pack.Command,
+
+    fn read(app: *App, body: git_proxy.Body) (receive_pack.ParseError || git_proxy.ProxyError)!Push {
+        const buf = try app.gpa.alloc(u8, receive_pack.max_commands_bytes);
+        errdefer app.gpa.free(buf);
+        const head = try body.head(app.io, buf);
+        const commands_buf = try app.gpa.create([receive_pack.max_commands]receive_pack.Command);
+        errdefer app.gpa.destroy(commands_buf);
+        const commands = try receive_pack.parse(head, commands_buf);
+        return .{ .head = buf, .commands_buf = commands_buf, .commands = commands };
+    }
+
+    /// Runs `record` from inside the proxy, after git exits.
+    const Recorder = struct {
+        app: *App,
+        push: ?*Push,
+        repo: repo_name.Name,
+
+        fn run(ctx: *anyopaque) void {
+            const self: *Recorder = @ptrCast(@alignCast(ctx));
+            if (self.push) |p| p.record(self.app, self.repo);
+        }
+    };
+
+    fn deinit(p: *Push, gpa: std.mem.Allocator) void {
+        gpa.destroy(p.commands_buf);
+        gpa.free(p.head);
+    }
+
+    /// Records an event for each ref git actually moved. git can refuse
+    /// some or all commands (a stale old value, fsck), so each ref is
+    /// checked rather than trusting the request.
+    fn record(p: *const Push, app: *App, name: repo_name.Name) void {
+        const repo = repo_git.Repo.open(app.io, app.gpa, app.store, name) catch return;
+        const now = unixNow(app.io);
+        for (p.commands) |cmd| {
+            var buf: [64]u8 = undefined;
+            const current = repo.refValue(cmd.ref, &buf) catch |err| {
+                std.log.err("reading {s} after push: {t}", .{ cmd.ref, err });
+                continue;
+            };
+            const applied = if (cmd.isDelete()) current == null else (current != null and std.mem.eql(u8, current.?, cmd.new));
+            if (!applied) continue;
+            const detail = if (cmd.isCreate()) "created" else if (cmd.isDelete()) "deleted" else "updated";
+            events.record(app, .{ .repo = name.full, .kind = "push", .ref = cmd.ref, .old = cmd.old, .new = cmd.new, .detail = detail, .created_at = now });
+        }
+    }
+};
 
 fn respondGitAuth(request: *http.Server.Request) HandleError!http.Status {
     try request.respond("authentication required\n", .{
@@ -396,85 +503,10 @@ fn respondGitAuth(request: *http.Server.Request) HandleError!http.Status {
     return .unauthorized;
 }
 
-// ---- Helpers ----
-
-const BodyError = error{ BodyTooLarge, InvalidJson, ReadFailed, OutOfMemory };
-
-fn readJson(comptime T: type, app: *App, request: *http.Server.Request) BodyError!std.json.Parsed(T) {
-    if (request.head.transfer_compression != .identity) return error.InvalidJson;
-    var buf: [4096]u8 = undefined;
-    const reader = request.readerExpectContinue(&buf) catch return error.ReadFailed;
-    const bytes = reader.allocRemaining(app.gpa, .limited(max_json_body)) catch |err| return switch (err) {
-        error.StreamTooLong => error.BodyTooLarge,
-        error.OutOfMemory => error.OutOfMemory,
-        error.ReadFailed => error.ReadFailed,
+fn isLoopback(address: Io.net.IpAddress) bool {
+    return switch (address) {
+        .ip4 => |a| a.bytes[0] == 127,
+        .ip6 => |a| std.mem.eql(u8, &a.bytes, &(@as([15]u8, @splat(0)) ++ [_]u8{1})) or
+            (std.mem.eql(u8, a.bytes[0..12], &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff }) and a.bytes[12] == 127),
     };
-    defer app.gpa.free(bytes);
-    // A connection closed mid-body also ends the read; only a body read to
-    // its declared end counts.
-    if (request.server.reader.state != .ready) return error.ReadFailed;
-    return std.json.parseFromSlice(T, app.gpa, bytes, .{ .allocate = .alloc_always }) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.InvalidJson,
-    };
-}
-
-fn respondBodyError(request: *http.Server.Request, err: BodyError) HandleError!http.Status {
-    return switch (err) {
-        error.BodyTooLarge => respondError(request, .payload_too_large, "too_large", "JSON bodies are limited to 64 KiB"),
-        error.InvalidJson => respondError(request, .bad_request, "invalid_json", "the body does not match the expected JSON"),
-        error.ReadFailed => error.WriteFailed,
-        error.OutOfMemory => internal(request),
-    };
-}
-
-fn respondJson(app: *App, request: *http.Server.Request, status: http.Status, value: anytype) HandleError!http.Status {
-    const body = app.gpa.print("{f}\n", .{std.json.fmt(value, .{})}) catch return internal(request);
-    defer app.gpa.free(body);
-    try request.respond(body, .{ .status = status, .keep_alive = keepAlive(request), .extra_headers = &json_headers });
-    return status;
-}
-
-const json_headers = [_]http.Header{.{ .name = "content-type", .value = "application/json" }};
-
-fn respondError(request: *http.Server.Request, status: http.Status, code: []const u8, message: []const u8) HandleError!http.Status {
-    var buf: [512]u8 = undefined;
-    const Err = struct { code: []const u8, message: []const u8 };
-    // Codes and messages are short constants, so this always fits.
-    const body = std.mem.print(&buf, "{f}\n", .{std.json.fmt(.{ .@"error" = Err{ .code = code, .message = message } }, .{})}) catch unreachable;
-    try request.respond(body, .{ .status = status, .keep_alive = keepAlive(request), .extra_headers = &json_headers });
-    return status;
-}
-
-fn internal(request: *http.Server.Request) HandleError!http.Status {
-    return respondError(request, .internal_server_error, "internal", "internal error; see server logs");
-}
-
-fn findHeader(request: *http.Server.Request, name: []const u8) ?[]const u8 {
-    var it = request.iterateHeaders();
-    while (it.next()) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
-    }
-    return null;
-}
-
-fn copyBounded(buf: []u8, text: []const u8) ?[]const u8 {
-    if (text.len > buf.len) return null;
-    @memcpy(buf[0..text.len], text);
-    return buf[0..text.len];
-}
-
-fn pathOf(target: []const u8) []const u8 {
-    return target[0 .. std.mem.findScalar(u8, target, '?') orelse target.len];
-}
-
-fn copyTruncated(buf: []u8, text: []const u8) []const u8 {
-    const n = @min(buf.len, text.len);
-    @memcpy(buf[0..n], text[0..n]);
-    return buf[0..n];
-}
-
-pub fn unixNow(io: Io) i64 {
-    const ns = Io.Clock.real.now(io).nanoseconds;
-    return @intCast(@divFloor(ns, std.time.ns_per_s));
 }

@@ -27,6 +27,7 @@ extern fn sqlite3_finalize(stmt: *sqlite3_stmt) c_int;
 extern fn sqlite3_errmsg(db: *sqlite3) [*:0]const u8;
 extern fn sqlite3_busy_timeout(db: *sqlite3, ms: c_int) c_int;
 extern fn sqlite3_changes(db: *sqlite3) c_int;
+extern fn sqlite3_last_insert_rowid(db: *sqlite3) i64;
 
 const SQLITE_OK = 0;
 const SQLITE_CONSTRAINT = 19;
@@ -47,6 +48,16 @@ const schema =
     \\CREATE TABLE IF NOT EXISTS repos (
     \\  name TEXT PRIMARY KEY,
     \\  id TEXT NOT NULL UNIQUE,
+    \\  created_at INTEGER NOT NULL
+    \\) STRICT;
+    \\CREATE TABLE IF NOT EXISTS events (
+    \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+    \\  repo TEXT NOT NULL,
+    \\  kind TEXT NOT NULL,
+    \\  ref TEXT NOT NULL DEFAULT '',
+    \\  old TEXT NOT NULL DEFAULT '',
+    \\  new TEXT NOT NULL DEFAULT '',
+    \\  detail TEXT NOT NULL DEFAULT '',
     \\  created_at INTEGER NOT NULL
     \\) STRICT;
     \\CREATE TABLE IF NOT EXISTS api_keys (
@@ -197,6 +208,91 @@ pub const Db = struct {
         };
     }
 
+    /// One entry in the activity log: pushes, rejections, merges, and so
+    /// on. The UI shows them and webhooks deliver them.
+    pub const Event = struct {
+        id: i64 = 0,
+        repo: []const u8,
+        kind: []const u8,
+        ref: []const u8 = "",
+        old: []const u8 = "",
+        new: []const u8 = "",
+        detail: []const u8 = "",
+        created_at: i64,
+
+        pub fn deinit(e: Event, gpa: std.mem.Allocator) void {
+            for ([_][]const u8{ e.repo, e.kind, e.ref, e.old, e.new, e.detail }) |text| gpa.free(text);
+        }
+    };
+
+    /// Records `event` (its `id` is ignored) and returns the new id.
+    pub fn insertEvent(db: *Db, io: Io, event: Event) Error!i64 {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare("INSERT INTO events (repo, kind, ref, old, new, detail, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)");
+        defer _ = sqlite3_finalize(stmt);
+        for ([_][]const u8{ event.repo, event.kind, event.ref, event.old, event.new, event.detail }, 1..) |text, i| {
+            try db.bindText(stmt, @intCast(i), text);
+        }
+        try db.check(sqlite3_bind_int64(stmt, 7, event.created_at));
+        if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("insert event");
+        return sqlite3_last_insert_rowid(db.handle);
+    }
+
+    /// Events with an id above `after`, oldest first, at most `limit`.
+    /// An empty `repo` means every repo. Free with `freeEvents`.
+    pub fn listEvents(db: *Db, io: Io, gpa: std.mem.Allocator, repo: []const u8, after: i64, limit: u32) Error![]Event {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare(
+            \\SELECT id, repo, kind, ref, old, new, detail, created_at FROM events
+            \\WHERE id > ?1 AND (?2 = '' OR repo = ?2) ORDER BY id LIMIT ?3
+        );
+        defer _ = sqlite3_finalize(stmt);
+        try db.check(sqlite3_bind_int64(stmt, 1, after));
+        try db.bindText(stmt, 2, repo);
+        try db.check(sqlite3_bind_int64(stmt, 3, limit));
+        var list: std.ArrayList(Event) = .empty;
+        errdefer {
+            for (list.items) |e| e.deinit(gpa);
+            list.deinit(gpa);
+        }
+        while (true) switch (sqlite3_step(stmt)) {
+            SQLITE_ROW => {
+                const event = try readEvent(stmt, gpa);
+                list.append(gpa, event) catch |err| {
+                    event.deinit(gpa);
+                    return err;
+                };
+            },
+            SQLITE_DONE => break,
+            else => return db.fail("list events"),
+        };
+        return list.toOwnedSlice(gpa);
+    }
+
+    pub fn freeEvents(gpa: std.mem.Allocator, events: []const Event) void {
+        for (events) |e| e.deinit(gpa);
+        gpa.free(events);
+    }
+
+    fn readEvent(stmt: *sqlite3_stmt, gpa: std.mem.Allocator) Error!Event {
+        var texts: [6][]const u8 = undefined;
+        var done: usize = 0;
+        errdefer for (texts[0..done]) |t| gpa.free(t);
+        while (done < texts.len) : (done += 1) texts[done] = try columnText(stmt, @intCast(done + 1), gpa);
+        return .{
+            .id = sqlite3_column_int64(stmt, 0),
+            .repo = texts[0],
+            .kind = texts[1],
+            .ref = texts[2],
+            .old = texts[3],
+            .new = texts[4],
+            .detail = texts[5],
+            .created_at = sqlite3_column_int64(stmt, 7),
+        };
+    }
+
     fn readRepo(stmt: *sqlite3_stmt, gpa: std.mem.Allocator) Error!Repo {
         const name = try columnText(stmt, 0, gpa);
         errdefer gpa.free(name);
@@ -275,6 +371,31 @@ test "listRepos frees everything when allocation fails" {
     try db.insertRepo(io, "a/two", "i2", 2);
     try db.insertRepo(io, "a/three", "i3", 3);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, listAndFree, .{ &db, io });
+}
+
+test "events round-trip and filter by repo" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var db: Db = try .open(":memory:");
+    defer db.close();
+    const first = try db.insertEvent(io, .{ .repo = "a/b", .kind = "push", .ref = "refs/heads/main", .new = "abc", .created_at = 5 });
+    _ = try db.insertEvent(io, .{ .repo = "a/c", .kind = "repo_created", .created_at = 6 });
+    const all = try db.listEvents(io, gpa, "", 0, 10);
+    defer Db.freeEvents(gpa, all);
+    try std.testing.expectEqual(@as(usize, 2), all.len);
+    try std.testing.expectEqualStrings("push", all[0].kind);
+    try std.testing.expectEqualStrings("", all[0].old);
+    const later = try db.listEvents(io, gpa, "", first, 10);
+    defer Db.freeEvents(gpa, later);
+    try std.testing.expectEqual(@as(usize, 1), later.len);
+    const only_ab = try db.listEvents(io, gpa, "a/b", 0, 10);
+    defer Db.freeEvents(gpa, only_ab);
+    try std.testing.expectEqual(@as(usize, 1), only_ab.len);
+    try std.testing.checkAllAllocationFailures(gpa, listEventsAndFree, .{ &db, io });
+}
+
+fn listEventsAndFree(gpa: std.mem.Allocator, db: *Db, io: Io) !void {
+    Db.freeEvents(gpa, try db.listEvents(io, gpa, "", 0, 10));
 }
 
 fn listAndFree(gpa: std.mem.Allocator, db: *Db, io: Io) !void {

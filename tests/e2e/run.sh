@@ -42,7 +42,7 @@ start_server() {
   local skip
   skip=$(($(wc -l <"$LOG" 2>/dev/null || echo 0) + 1))
   PORT=""
-  GITD_IDLE_TIMEOUT_SECONDS=2 GITD_HEAD_TIMEOUT_SECONDS=3 "$BIN" serve --data "$DATA" --listen 127.0.0.1:0 >>"$LOG" 2>&1 &
+  GITD_IDLE_TIMEOUT_SECONDS=2 GITD_HEAD_TIMEOUT_SECONDS=3 "$BIN" serve --data "$DATA" --listen 127.0.0.1:0 --ui >>"$LOG" 2>&1 &
   SERVER_PID=$!
   for _ in $(seq 1 100); do
     PORT="$(tail -n +"$skip" "$LOG" | sed -n 's/.*listening on 127\.0\.0\.1:\([0-9]*\),.*/\1/p' | tail -1)"
@@ -356,13 +356,57 @@ expect_eq "token for the deleted repo does not work on the new one" 403 "$(statu
 RW="$(mint acme/web '["git:read","git:write"]')"
 expect_eq "recreated repo is empty" 0 "$(git ls-remote "$(url "$RW" acme/web)" | wc -l | tr -d ' ')"
 
+echo "== activity log and UI"
+events() { curl -s "$BASE/ui/api/events?after=0" >"$WORK/body"; }
+count_events() { events; python3 -c "import json,sys; print(sum(1 for e in json.load(open('$WORK/body'))['events'] if all(e[k]==v for k,v in (a.split('=',1) for a in sys.argv[1:]))))" "$@"; }
+expect_eq "UI page served" 200 "$(status "$BASE/ui")"
+grep -q "<title>gitd</title>" "$WORK/body" || fail "UI page content"
+expect_eq "UI state" 200 "$(status "$BASE/ui/api/state")"
+expect_eq "UI state lists both repos" 2 "$(json '["repos"].__len__()')"
+expect_eq "repo_created events" 3 "$(count_events kind=repo_created)"
+expect_eq "repo_deleted event" 1 "$(count_events kind=repo_deleted repo=acme/web)"
+expect_eq "first push recorded with its commit" 1 "$(count_events kind=push repo=acme/web ref=refs/heads/main detail=created)"
+AGENT_PUSHES="$(events; python3 -c "import json; print(sum(1 for e in json.load(open('$WORK/body'))['events'] if e['kind']=='push' and e['ref'].startswith('refs/heads/agent/')))")"
+expect_eq "agent branch pushes recorded" 8 "$AGENT_PUSHES"
+# A push git refuses (not a fast-forward) is not recorded.
+FRESH="$WORK/fresh"
+git "${GIT_ID[@]}" init -q "$FRESH"
+echo one >"$FRESH/f.txt"; git -C "$FRESH" add f.txt; git "${GIT_ID[@]}" -C "$FRESH" commit -qm one
+git -C "$FRESH" push -q "$(url "$RW" acme/web)" main 2>"$WORK/err" || fail "push to recreated repo: $(cat "$WORK/err")"
+expect_eq "push to recreated repo recorded" 1 "$(count_events kind=push repo=acme/web ref=refs/heads/main new="$(git -C "$FRESH" rev-parse HEAD)")"
+# Only refs git actually moved are recorded. Make the server refuse a push:
+# between the ref check and the upload, a pre-push hook moves main from
+# another clone, so the push arrives with a stale old value.
+OTHER_CLONE="$WORK/other-clone"
+git clone -q "$(url "$RW" acme/web)" "$OTHER_CLONE"
+echo two >"$OTHER_CLONE/f.txt"; git "${GIT_ID[@]}" -C "$OTHER_CLONE" commit -qam two
+echo mine >"$FRESH/f.txt"; git "${GIT_ID[@]}" -C "$FRESH" commit -qam mine
+printf '#!/bin/sh\ngit -C "%s" push -q origin main\n' "$OTHER_CLONE" >"$FRESH/.git/hooks/pre-push"
+chmod +x "$FRESH/.git/hooks/pre-push"
+BEFORE="$(count_events kind=push)"
+if git -C "$FRESH" push -q "$(url "$RW" acme/web)" main 2>/dev/null; then fail "stale push was accepted"; fi
+rm "$FRESH/.git/hooks/pre-push"
+expect_eq "only the push git applied is recorded" "$((BEFORE + 1))" "$(count_events kind=push)"
+expect_eq "the recorded push is the one that won" 1 "$(count_events kind=push repo=acme/web new="$(git -C "$OTHER_CLONE" rev-parse HEAD)")"
+for f in "$WORK/body"; do
+  curl -s "$BASE/ui/api/state" >"$f.state"; curl -s "$BASE/ui" >"$f.page"; events
+  if grep -qF "$KEY" "$f" "$f.state" "$f.page" || grep -qF "$RW" "$f" "$f.state" "$f.page"; then fail "a secret appears in the UI"; fi
+done
+pass "UI responses contain no keys or tokens"
+# Without --ui the page does not exist.
+"$BIN" serve --data "$WORK/noui" --listen 127.0.0.1:0 >"$WORK/noui.log" 2>&1 &
+NOUI=$!
+for _ in $(seq 1 100); do NOUI_PORT="$(sed -n 's/.*listening on 127\.0\.0\.1:\([0-9]*\),.*/\1/p' "$WORK/noui.log")"; [[ -n "$NOUI_PORT" ]] && break; sleep 0.05; done
+expect_eq "no UI without --ui" 404 "$(status "http://127.0.0.1:$NOUI_PORT/ui")"
+kill -TERM "$NOUI"; wait "$NOUI" || true
+
 echo "== restart keeps data and secret"
 # Stop while a slow clone is mid-transfer: gitd must still exit promptly and
 # take its git processes with it.
 head -c 4000000 /dev/urandom >"$SRC/big2.bin"
 git -C "$SRC" add big2.bin
 git "${GIT_ID[@]}" -C "$SRC" commit -qm big2
-git -C "$SRC" push -q "$(url "$RW" acme/web)" main 2>"$WORK/err" || fail "push before shutdown test: $(cat "$WORK/err")"
+git -C "$SRC" push -q "$(url "$RW" acme/web)" HEAD:refs/heads/big 2>"$WORK/err" || fail "push before shutdown test: $(cat "$WORK/err")"
 TIP="$(git -C "$SRC" rev-parse HEAD)"
 printf '0032want %s\n00000009done\n' "$TIP" >"$WORK/want"
 curl -s -o /dev/null --limit-rate 100k --max-time 20 -u "t:$RW" -H 'Content-Type: application/x-git-upload-pack-request' \

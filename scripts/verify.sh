@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 QUICK=0
 [[ "${1:-}" == "--quick" ]] && QUICK=1
 FUZZ_RUNS="${FUZZ_RUNS:-200K}"
-FUZZ_TARGETS=("fuzz parse" "fuzz verify" "fuzz match and parseCgiHead")
+FUZZ_TARGETS=("repo_name.test.fuzz parse" "fuzz verify" "fuzz match and parseCgiHead" "fuzz validate and matches" "fuzz parse commands")
 ZIG_VERSION="$(sed -n 's/.*\.minimum_zig_version = "\(.*\)".*/\1/p' build.zig.zon)"
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
