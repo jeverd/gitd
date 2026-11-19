@@ -25,16 +25,16 @@ pub const Repo = struct {
         return r;
     }
 
-    pub fn path(r: *const Repo) []const u8 {
+    pub fn gitDir(r: *const Repo) []const u8 {
         return r.path_buf[0..r.path_len];
     }
 
     pub fn git(r: *const Repo, args: []const []const u8, options: git_cmd.Options) git_cmd.Error!git_cmd.Result {
-        return git_cmd.run(r.io, r.gpa, r.store, r.path(), args, options);
+        return git_cmd.run(r.io, r.gpa, r.store, r.gitDir(), args, options);
     }
 
     pub fn gitOutput(r: *const Repo, args: []const []const u8, options: git_cmd.Options) git_cmd.Error![]u8 {
-        return git_cmd.output(r.io, r.gpa, r.store, r.path(), args, options);
+        return git_cmd.output(r.io, r.gpa, r.store, r.gitDir(), args, options);
     }
 
     pub const Branch = struct {
@@ -91,5 +91,151 @@ pub const Repo = struct {
         if (oid.len > out.len) return error.GitFailed;
         @memcpy(out[0..oid.len], oid);
         return out[0..oid.len];
+    }
+
+    /// Resolves `rev` (a full ref name or an oid) to a commit oid written
+    /// into `out`, or null if it names no commit.
+    pub fn resolveCommit(r: *const Repo, rev: []const u8, out: *[64]u8) git_cmd.Error!?[]const u8 {
+        var arg_buf: [300]u8 = undefined;
+        const arg = std.mem.print(&arg_buf, "{s}^{{commit}}", .{rev}) catch return null;
+        const result = try r.git(&.{ "rev-parse", "--verify", "--quiet", "--end-of-options", arg }, .{});
+        defer result.deinit(r.gpa);
+        if (result.code != 0) return null;
+        const oid = std.mem.trimEnd(u8, result.stdout, "\n");
+        if (oid.len > out.len) return error.GitFailed;
+        @memcpy(out[0..oid.len], oid);
+        return out[0..oid.len];
+    }
+
+    pub const EntryKind = enum { blob, tree, commit };
+
+    pub const Entry = struct {
+        /// Slices borrow `Entries.raw`.
+        mode: []const u8,
+        kind: EntryKind,
+        oid: []const u8,
+        /// Null for trees and submodules.
+        size: ?u64,
+        path: []const u8,
+    };
+
+    pub const Entries = struct {
+        raw: []u8,
+        items: []Entry,
+
+        pub fn deinit(e: Entries, gpa: std.mem.Allocator) void {
+            gpa.free(e.items);
+            gpa.free(e.raw);
+        }
+    };
+
+    /// Lists `dir` (null for the root) at `commit`, or with `exact`, the
+    /// single entry at `dir` itself.
+    pub fn lsTree(r: *const Repo, commit: []const u8, dir: ?[]const u8, exact: bool) git_cmd.Error!Entries {
+        var path_buf: [4100]u8 = undefined;
+        var args: [6][]const u8 = .{ "ls-tree", "-z", "-l", "--end-of-options", commit, "" };
+        var argc: usize = 5;
+        var with_path: [8][]const u8 = undefined;
+        if (dir) |d| {
+            const p = if (exact) d else (std.mem.print(&path_buf, "{s}/", .{d}) catch return error.GitFailed);
+            @memcpy(with_path[0..argc], args[0..argc]);
+            with_path[argc] = "--";
+            with_path[argc + 1] = p;
+            argc += 2;
+            return r.parseEntries(try r.gitOutput(with_path[0..argc], .{}));
+        }
+        return r.parseEntries(try r.gitOutput(args[0..argc], .{}));
+    }
+
+    fn parseEntries(r: *const Repo, raw: []u8) git_cmd.Error!Entries {
+        errdefer r.gpa.free(raw);
+        var list: std.ArrayList(Entry) = .empty;
+        errdefer list.deinit(r.gpa);
+        var records = std.mem.splitScalar(u8, raw, 0);
+        while (records.next()) |rec| {
+            if (rec.len == 0) continue;
+            const tab = std.mem.findScalar(u8, rec, '\t') orelse continue;
+            var meta = std.mem.tokenizeScalar(u8, rec[0..tab], ' ');
+            const mode = meta.next() orelse continue;
+            const kind_text = meta.next() orelse continue;
+            const oid = meta.next() orelse continue;
+            const size_text = meta.next() orelse "-";
+            const kind = std.meta.stringToEnum(EntryKind, kind_text) orelse continue;
+            try list.append(r.gpa, .{
+                .mode = mode,
+                .kind = kind,
+                .oid = oid,
+                .size = std.fmt.parseInt(u64, size_text, 10) catch null,
+                .path = rec[tab + 1 ..],
+            });
+        }
+        return .{ .raw = raw, .items = try list.toOwnedSlice(r.gpa) };
+    }
+
+    /// The contents of blob `oid`. Fails with error.OutputTooLarge past
+    /// `max` bytes.
+    pub fn readBlob(r: *const Repo, oid: []const u8, max: usize) git_cmd.Error![]u8 {
+        return r.gitOutput(&.{ "cat-file", "blob", oid }, .{ .max_output = max });
+    }
+
+    pub const Commit = struct {
+        /// Slices borrow `Log.raw`.
+        sha: []const u8,
+        parents: []const u8,
+        author_name: []const u8,
+        author_email: []const u8,
+        time: i64,
+        subject: []const u8,
+        body: []const u8,
+    };
+
+    pub const Log = struct {
+        raw: []u8,
+        items: []Commit,
+
+        pub fn deinit(l: Log, gpa: std.mem.Allocator) void {
+            gpa.free(l.items);
+            gpa.free(l.raw);
+        }
+    };
+
+    /// Up to `limit` commits reachable from `commit`, newest first, touching
+    /// `path` if given. With `single`, only `commit` itself.
+    pub fn log(r: *const Repo, commit: []const u8, limit: u32, path: ?[]const u8, single: bool) git_cmd.Error!Log {
+        var n_buf: [24]u8 = undefined;
+        const n = std.mem.print(&n_buf, "-n{d}", .{if (single) 1 else limit}) catch unreachable;
+        const format = "--format=%H%x00%P%x00%an%x00%ae%x00%ct%x00%s%x00%b%x1e";
+        const raw = if (path) |p|
+            try r.gitOutput(&.{ "log", format, n, "--no-walk=unsorted", "--end-of-options", commit, "--", p }, .{})
+        else if (single)
+            try r.gitOutput(&.{ "log", format, n, "--no-walk", "--end-of-options", commit }, .{})
+        else
+            try r.gitOutput(&.{ "log", format, n, "--end-of-options", commit }, .{});
+        errdefer r.gpa.free(raw);
+        var list: std.ArrayList(Commit) = .empty;
+        errdefer list.deinit(r.gpa);
+        var records = std.mem.splitScalar(u8, raw, 0x1e);
+        while (records.next()) |rec_raw| {
+            const rec = std.mem.trimStart(u8, rec_raw, "\n");
+            if (rec.len == 0) continue;
+            var f = std.mem.splitScalar(u8, rec, 0);
+            const sha = f.next() orelse continue;
+            const parents = f.next() orelse continue;
+            const name = f.next() orelse continue;
+            const email = f.next() orelse continue;
+            const when = f.next() orelse continue;
+            const subject = f.next() orelse continue;
+            const body = std.mem.trimEnd(u8, f.rest(), "\n");
+            try list.append(r.gpa, .{
+                .sha = sha,
+                .parents = parents,
+                .author_name = name,
+                .author_email = email,
+                .time = std.fmt.parseInt(i64, when, 10) catch 0,
+                .subject = subject,
+                .body = body,
+            });
+        }
+        return .{ .raw = raw, .items = try list.toOwnedSlice(r.gpa) };
     }
 };

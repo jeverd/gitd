@@ -49,6 +49,8 @@ src/
   repo_git.zig      repo operations built on git plumbing (branches, refs, ...)
   ref_name.zig      ref name and ref pattern validation (pure)
   receive_pack.zig  reads the ref update commands at the start of a push (pure)
+  repo_path.zig     file path validation (pure)
+  content.zig       per-repo content API: branches, files, trees, log, commits
 tests/e2e/run.sh    end-to-end test
 tests/demo/demo.sh  drives a UI-enabled gitd for demos and recordings
 scripts/verify.sh   verification gate

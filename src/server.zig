@@ -24,6 +24,7 @@ const receive_pack = @import("receive_pack.zig");
 const repo_git = @import("repo_git.zig");
 const events = @import("events.zig");
 const ui = @import("ui.zig");
+const content = @import("content.zig");
 const http_util = @import("http_util.zig");
 const keepAlive = http_util.keepAlive;
 
@@ -179,7 +180,7 @@ fn route(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress) Handl
         error.MethodNotAllowed => return respondError(request, .method_not_allowed, "method_not_allowed", "wrong method for this git endpoint"),
     }
 
-    if (std.mem.startsWith(u8, path, "/v1/")) return serveApi(app, request, path);
+    if (std.mem.startsWith(u8, path, "/v1/")) return serveApi(app, request, path, query);
     if (std.mem.eql(u8, path, "/ui") or std.mem.startsWith(u8, path, "/ui/")) {
         if (!app.ui_enabled) return respondError(request, .not_found, "not_found", "start gitd with --ui to serve this page");
         if (!isLoopback(peer)) return respondError(request, .forbidden, "forbidden", "the UI is only served to this machine");
@@ -190,7 +191,11 @@ fn route(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress) Handl
 
 // ---- Admin API ----
 
-fn serveApi(app: *App, request: *http.Server.Request, path: []const u8) HandleError!http.Status {
+fn serveApi(app: *App, request: *http.Server.Request, path: []const u8, query: []const u8) HandleError!http.Status {
+    // Per-repo content routes accept a repo token as well as the admin key.
+    if (std.mem.startsWith(u8, path, "/v1/repos/")) {
+        if (splitRepoPath(path["/v1/repos/".len..])) |parts| return serveContent(app, request, parts.name, parts.rest, query);
+    }
     switch (checkAdmin(app, request)) {
         .ok => {},
         .missing => return respondError(request, .unauthorized, "unauthorized", "send Authorization: Bearer <admin key>"),
@@ -220,6 +225,45 @@ fn serveApi(app: *App, request: *http.Server.Request, path: []const u8) HandleEr
         return createToken(app, request);
     }
     return respondError(request, .not_found, "not_found", "no such route");
+}
+
+pub const RepoPath = struct { name: repo_name.Name, rest: []const u8 };
+
+/// Splits `{ns}/{repo}/{rest}`. Null when there is no non-empty rest or
+/// the name is invalid.
+pub fn splitRepoPath(text: []const u8) ?RepoPath {
+    const first = std.mem.findScalar(u8, text, '/') orelse return null;
+    const second = std.mem.findScalarPos(u8, text, first + 1, '/') orelse return null;
+    if (second + 1 >= text.len) return null;
+    const name = repo_name.parse(text[0..second]) catch return null;
+    return .{ .name = name, .rest = text[second + 1 ..] };
+}
+
+/// Authenticates a per-repo content request: the admin key, or a repo
+/// token for this repo (by name and id) sent as `Authorization: Bearer`.
+fn serveContent(app: *App, request: *http.Server.Request, name: repo_name.Name, rest: []const u8, query: []const u8) HandleError!http.Status {
+    const header = findHeader(request, "authorization") orelse
+        return respondError(request, .unauthorized, "unauthorized", "send Authorization: Bearer <admin key or repo token>");
+    const bearer = auth.bearer(header) orelse
+        return respondError(request, .unauthorized, "unauthorized", "send Authorization: Bearer <admin key or repo token>");
+
+    const repo = (app.db.getRepo(app.io, app.gpa, name.full) catch return internal(request)) orelse
+        return respondError(request, .not_found, "not_found", "no such repo");
+    defer repo.deinit(app.gpa);
+
+    if (std.mem.startsWith(u8, bearer, auth.token_prefix)) {
+        const claims = auth.verify(app.secret, bearer, unixNow(app.io)) catch
+            return respondError(request, .unauthorized, "unauthorized", "invalid or expired token");
+        if (!std.mem.eql(u8, claims.repo(), name.full) or !std.mem.eql(u8, &claims.repo_id, repo.id)) {
+            return respondError(request, .forbidden, "forbidden", "this token is for another repo");
+        }
+        return content.serve(app, request, name, rest, query, .{ .claims = &claims });
+    }
+    switch (checkAdmin(app, request)) {
+        .ok => return content.serve(app, request, name, rest, query, .{ .claims = null }),
+        .missing, .invalid => return respondError(request, .unauthorized, "unauthorized", "unknown admin key or token"),
+        .failed => return internal(request),
+    }
 }
 
 const repo_name_help = "repo names look like ns/repo: lowercase letters, digits, '.', '_', '-'";
@@ -565,4 +609,13 @@ fn isLoopback(address: Io.net.IpAddress) bool {
         .ip6 => |a| std.mem.eql(u8, &a.bytes, &(@as([15]u8, @splat(0)) ++ [_]u8{1})) or
             (std.mem.eql(u8, a.bytes[0..12], &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff }) and a.bytes[12] == 127),
     };
+}
+
+test splitRepoPath {
+    const p = splitRepoPath("acme/web/files/src/a.zig").?;
+    try std.testing.expectEqualStrings("acme/web", p.name.full);
+    try std.testing.expectEqualStrings("files/src/a.zig", p.rest);
+    try std.testing.expectEqual(null, splitRepoPath("acme/web"));
+    try std.testing.expectEqual(null, splitRepoPath("acme/web/"));
+    try std.testing.expectEqual(null, splitRepoPath("acme/../x/log"));
 }

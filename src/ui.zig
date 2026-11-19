@@ -32,6 +32,14 @@ pub fn serve(app: *server.App, request: *http.Server.Request, path: []const u8, 
     }
     if (std.mem.eql(u8, path, "/ui/api/state")) return state(app, request);
     if (std.mem.eql(u8, path, "/ui/api/events")) return eventsSince(app, request, query);
+    if (std.mem.startsWith(u8, path, "/ui/api/repos/")) {
+        const parts = server.splitRepoPath(path["/ui/api/repos/".len..]) orelse
+            return api.respondError(request, .not_found, "not_found", "no such UI route");
+        const repo = (app.db.getRepo(app.io, app.gpa, parts.name.full) catch return api.internal(request)) orelse
+            return api.respondError(request, .not_found, "not_found", "no such repo");
+        repo.deinit(app.gpa);
+        return @import("content.zig").serve(app, request, parts.name, parts.rest, query, .{ .claims = null, .read_only = true });
+    }
     return api.respondError(request, .not_found, "not_found", "no such UI route");
 }
 
