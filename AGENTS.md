@@ -24,22 +24,44 @@ zig build run -- ...  # build and run
 zig build test        # unit tests
 zig build fmt         # format
 zig build fmt-check   # fail if anything is unformatted
+tests/e2e/run.sh      # end-to-end: real server, curl, and the real git client
+scripts/verify.sh     # the full gate: everything below, plus fuzzing
 ```
 
 ## Layout
 
 ```text
 src/
-  main.zig     entry point; wires modules together, no feature logic
+  main.zig          entry point and CLI; wires modules together, no feature logic
+  server.zig        HTTP server: connections, routing, admin auth, repo and token API
+  git_http.zig      git smart HTTP URL matching and CGI response parsing (pure)
+  git_proxy.zig     runs `git http-backend` for one request
+  auth.zig          admin keys, signed repo tokens, the signing secret
+  repo_name.zig     repo name validation
+  db.zig            SQLite metadata (hand-declared sqlite3 functions)
+  store.zig         data directory, repo storage on disk, safe `git` environment
+  timed_stream.zig  socket reader and writer with per-operation timeouts
+  http_util.zig     keep-alive rules and the per-address connection cap
+tests/e2e/run.sh    end-to-end test
+scripts/verify.sh   verification gate
 ```
 
-Add modules under `src/` as features land (for example `http/`, `git/`, `store/`, `auth/`), and list them here with one line each.
+List new modules here with one line each.
 
 ## Before saying work is done
 
-1. `zig build`, `zig build test`, and `zig build fmt-check` pass.
-2. Run `./zig-out/bin/gitd` from this checkout, never a `gitd` on `PATH`, and exercise the change for real. For git features that means a real `git clone` or `git push` against it.
-3. stderr is clean and the behavior matches what you report.
+`scripts/verify.sh` must print `VERIFY PASSED`. It checks, in order:
+
+1. The pinned Zig version, formatting, and no removed or deprecated 0.17 APIs.
+2. Unit tests in Debug and ReleaseSafe.
+3. `tests/e2e/run.sh` against Debug and ReleaseSafe builds. That means a real server, real `git clone` and `git push`, and a server log with no errors, warnings, panics, leaks, or secrets.
+4. 200K fuzz runs per fuzz target. Zig 0.17 exits 0 even when the fuzzer finds a failure, so the script reads the output.
+
+Use `scripts/verify.sh --quick` while iterating; the full run is required at the end.
+
+- **A new behavior** gets an end-to-end check that fails without the change. Confirm that by breaking the code on purpose once.
+- **A fuzzer finding** becomes a unit test with the failing input (R5.1).
+- **New parsing of untrusted bytes** gets a fuzz target. Add its name to `FUZZ_TARGETS` in `scripts/verify.sh`.
 
 If you could not run something, say which step and why.
 
