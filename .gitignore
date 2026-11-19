@@ -1,4 +1,19 @@
+.DS_Store
+
+# Zig build output
 .zig-cache/
 zig-out/
+zig-pkg/
+
+# Local runtime data (repos, SQLite)
 data/
 *.db
+*.db-*
+
+# Local environment
+.env
+.env.*
+*.log
+
+# Python bytecode from skill scripts
+__pycache__/
