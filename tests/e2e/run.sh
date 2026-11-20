@@ -837,6 +837,33 @@ for _ in $(seq 1 100); do NOUI_PORT="$(sed -n 's/.*listening on 127\.0\.0\.1:\([
 expect_eq "no UI without --ui" 404 "$(status "http://127.0.0.1:$NOUI_PORT/ui")"
 kill -TERM "$NOUI"; wait "$NOUI" || true
 
+echo "== upstream sync"
+sync_body() { # direction url branch [token]
+  if [[ -n "${4:-}" ]]; then
+    printf '{"direction":"%s","url":"%s","branch":"%s","token":"%s"}' "$1" "$2" "$3" "$4"
+  else
+    printf '{"direction":"%s","url":"%s","branch":"%s"}' "$1" "$2" "$3"
+  fi
+}
+expect_eq "create mirror repo" 201 "$(admin -X POST "$BASE/v1/repos" -d '{"name":"acme/mirror"}')"
+UP_TOK="$(admin -X POST "$BASE/v1/tokens" -d '{"repo":"acme/other","scopes":["git:read","git:write"],"ttl_seconds":3600}' >/dev/null; json '["token"]')"
+UP_MAIN="$(head_of main)"
+expect_eq "sync fetch from upstream" 200 "$(admin -X POST "$BASE/v1/repos/acme/mirror/sync" -d "$(sync_body fetch "$BASE/acme/other.git" main "$UP_TOK")")"
+expect_eq "sync fetch new_sha matches upstream" "$UP_MAIN" "$(json '["new_sha"]')"
+expect_eq "mirror has upstream file" 200 "$(admin "$BASE/v1/repos/acme/mirror/files/notes/a.md")"
+expect_eq "mirror agent commit on branch" 201 "$(admin -X POST "$BASE/v1/repos/acme/mirror/commits" -d '{"branch":"agent/sync/fix","expected_head":null,"from":"main","message":"sync fix","changes":[{"path":"synced.txt","content":"from mirror\n"}]}')"
+SYNC_SHA="$(json '["sha"]')"
+expect_eq "sync push branch back to upstream" 200 "$(admin -X POST "$BASE/v1/repos/acme/mirror/sync" -d "$(sync_body push "$BASE/acme/other.git" agent/sync/fix "$UP_TOK")")"
+expect_eq "sync push sha" "$SYNC_SHA" "$(json '["sha"]')"
+expect_eq "upstream received pushed file" 200 "$(admin "$CB/files/synced.txt?ref=agent/sync/fix")"
+expect_eq "upstream file content" "from mirror" "$(cat "$WORK/body")"
+expect_eq "sync events logged" "1 1" "$(count_events kind=sync_fetch repo=acme/mirror) $(count_events kind=sync_push repo=acme/mirror)"
+expect_eq "sync requires admin key" 403 "$(status -H "authorization: Bearer $UP_TOK" -X POST "$BASE/v1/repos/acme/mirror/sync" -d "$(sync_body fetch "$BASE/acme/other.git" main)")"
+expect_eq "sync rejects file:// URL" 400 "$(admin -X POST "$BASE/v1/repos/acme/mirror/sync" -d '{"direction":"fetch","url":"file:///etc/passwd","branch":"main"}')"
+expect_eq "sync rejects embedded credentials" 400 "$(admin -X POST "$BASE/v1/repos/acme/mirror/sync" -d '{"direction":"fetch","url":"https://u:p@example.com/r.git","branch":"main"}')"
+expect_eq "sync rejects bad direction" 400 "$(admin -X POST "$BASE/v1/repos/acme/mirror/sync" -d "$(sync_body clone "$BASE/acme/other.git" main)")"
+expect_eq "sync push missing branch" 404 "$(admin -X POST "$BASE/v1/repos/acme/mirror/sync" -d "$(sync_body push "$BASE/acme/other.git" no-such-branch "$UP_TOK")")"
+
 echo "== restart keeps data and secret"
 REPOS_BEFORE="$(admin "$BASE/v1/repos" >/dev/null; json '["repos"].__len__()')"
 expect_eq "branch that expires across a restart" 201 "$(admin -X POST "$BASE/v1/repos/acme/other/branches" -d '{"name":"ttl/restart","from":"main","ttl_seconds":3}')"
@@ -885,6 +912,7 @@ if grep -nE '^(error|warning)|panic|leak|Segmentation' "$LOG"; then fail "server
 pass "no errors, warnings, panics, or leaks in server log"
 grep -q "$KEY" "$LOG" && fail "admin key appears in server log"
 grep -qF "$RW" "$LOG" && fail "token appears in server log"
+grep -qF "$UP_TOK" "$LOG" && fail "sync token appears in server log"
 grep -qF "$HOOK_SECRET" "$LOG" && fail "webhook secret appears in server log"
 grep -qF "127.0.0.1:$HP" "$LOG" && fail "a webhook URL appears in server log"
 pass "no secrets in server log"

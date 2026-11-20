@@ -54,6 +54,7 @@ src/
   content.zig       per-repo content API: branches, files, trees, log, commits, merges
   expiry.zig        the reaper that deletes expired branches
   webhooks.zig      webhook API and the delivery worker (signed, retried, concurrent)
+  sync.zig          upstream git fetch/push sync API (per-request credentials, admin only)
 tests/e2e/run.sh    end-to-end test
 tests/demo/demo.sh  drives a UI-enabled gitd for demos and recordings
 tests/demo/agents.sh  the full MVP scenario with checks (e2e runs it)
