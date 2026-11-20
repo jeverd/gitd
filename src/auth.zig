@@ -230,6 +230,17 @@ pub fn formatKey(random_bytes: *const [32]u8) [key_len]u8 {
     return out;
 }
 
+/// Whether `text` has the shape of an admin key: the prefix, then 64
+/// lowercase hex digits (what `formatKey` makes).
+pub fn isKey(text: []const u8) bool {
+    if (text.len != key_len or !std.mem.startsWith(u8, text, key_prefix)) return false;
+    for (text[key_prefix.len..]) |c| switch (c) {
+        '0'...'9', 'a'...'f' => {},
+        else => return false,
+    };
+    return true;
+}
+
 /// The value stored in the database for an admin key.
 pub fn hashKey(key: []const u8) [Sha256.digest_length * 2]u8 {
     var digest: [Sha256.digest_length]u8 = undefined;
@@ -393,6 +404,12 @@ test "admin keys hash stably and differ from the key" {
     const random_bytes: [32]u8 = @splat(1);
     const key = formatKey(&random_bytes);
     try std.testing.expect(std.mem.startsWith(u8, &key, key_prefix));
+    try std.testing.expect(isKey(&key));
+    try std.testing.expect(!isKey(key[0 .. key.len - 1]));
+    var upper = key;
+    upper[key_prefix.len] = 'A';
+    try std.testing.expect(!isKey(&upper));
+    try std.testing.expect(!isKey("gitd_t_" ++ key[key_prefix.len..]));
     const h1 = hashKey(&key);
     const h2 = hashKey(&key);
     try std.testing.expectEqualStrings(&h1, &h2);

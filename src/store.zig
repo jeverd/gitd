@@ -27,7 +27,9 @@ pub const DataDir = struct {
         try cwd.createDirPath(io, data_dir);
         // Repos, the database, and the signing secret are for gitd only.
         {
-            var dir = try cwd.openDir(io, data_dir, .{});
+            // Not an O_PATH handle (what Linux opens without `iterate`): fchmod
+            // on one fails with EBADF.
+            var dir = try cwd.openDir(io, data_dir, .{ .iterate = true });
             defer dir.close(io);
             try dir.setPermissions(io, .fromMode(0o700));
         }

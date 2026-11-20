@@ -86,6 +86,16 @@ echo "== setup"
 KEY="$("$BIN" admin create-key --data "$DATA")"
 [[ "$KEY" == gitd_k_* ]] || fail "admin create-key printed '$KEY'"
 pass "admin create-key"
+# A key chosen up front (a container's environment) is added from stdin.
+CHOSEN_KEY="gitd_k_$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+printf '%s\n' "$CHOSEN_KEY" | "$BIN" admin add-key --data "$DATA" 2>/dev/null || fail "admin add-key"
+pass "admin add-key"
+printf '%s' "$CHOSEN_KEY" | "$BIN" admin add-key --data "$DATA" 2>/dev/null || fail "admin add-key again"
+pass "admin add-key of a present key is a no-op"
+for bad in "nope" "${CHOSEN_KEY}0" "gitd_k_$(printf %s "${CHOSEN_KEY#gitd_k_}" | tr a-f A-F)" ""; do
+  rc=0; printf '%s' "$bad" | "$BIN" admin add-key --data "$DATA" 2>/dev/null || rc=$?
+  expect_eq "admin add-key refuses '${bad:0:12}...'" 2 "$rc"
+done
 start_server
 
 echo "== health and admin auth"
@@ -93,6 +103,7 @@ expect_eq "healthz" 200 "$(status "$BASE/healthz")"
 expect_eq "no admin key" 401 "$(status "$BASE/v1/repos")"
 expect_eq "wrong admin key" 401 "$(status -H 'authorization: Bearer gitd_k_nope' "$BASE/v1/repos")"
 expect_eq "unknown route" 404 "$(admin "$BASE/v1/nothing")"
+expect_eq "added admin key works" 200 "$(status -H "authorization: Bearer $CHOSEN_KEY" "$BASE/v1/repos")"
 
 echo "== repos API"
 expect_eq "create repo" 201 "$(admin -X POST "$BASE/v1/repos" -d '{"name":"acme/web"}')"
