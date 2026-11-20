@@ -49,11 +49,17 @@ All `/v1` routes need `Authorization: Bearer <admin key>`. Per-repo routes (`/v1
 | `DELETE /v1/repos/{ns}/{repo}/branches/{name}?expected=` | Delete a branch, optionally only if it is at `expected` |
 | `GET /v1/repos/{ns}/{repo}/compare/{base}...{head}` | Ahead/behind, changed files, and the patch (up to 1 MiB) |
 | `POST /v1/repos/{ns}/{repo}/merges` `{"base","head","strategy"}` | Merge `head` into `base`: fast-forward when possible, else a merge commit (`merge`) or one squashed commit (`squash`). Conflicts give 409 with the paths |
+| `POST /v1/repos/{ns}/{repo}/webhooks` `{"url"}` | Add a webhook (admin key only). The response has the signing `secret`, shown once |
+| `GET /v1/repos/{ns}/{repo}/webhooks` | List webhooks (no secrets) |
+| `DELETE /v1/repos/{ns}/{repo}/webhooks/{id}` | Remove a webhook and its queued deliveries |
+| `GET /v1/repos/{ns}/{repo}/webhooks/deliveries` | Recent deliveries: status, attempts, last error |
 | `GET /healthz` | Liveness, no auth |
 | `GET /ui` | Live activity page: repos, branches, and every push. Only with `gitd serve --ui`, only from this machine |
 | `/{ns}/{repo}.git/...` | git smart HTTP. The token goes in the password: `http://t:<token>@host/...` |
 
 Repo names are `ns/repo`: lowercase letters, digits, `.`, `_`, `-`, up to 64 characters per part.
+
+Webhook deliveries are `POST`s of `{"delivery": id, "event": {...}}` with `x-gitd-event`, `x-gitd-delivery`, and `x-gitd-signature: sha256=<hex HMAC-SHA256 of the body>`. A 2xx answer counts; anything else is retried after 1, 2, 4, and 8 seconds, then marked failed.
 
 ## MVP
 
@@ -66,7 +72,7 @@ Repo names are `ns/repo`: lowercase letters, digits, `.`, `_`, `-`, up to 64 cha
   5. ✅ Commit through the API, with a 409 when two agents race (TLA+ model in `tests/tla/commit_cas`)
   6. ✅ Diff and merge branches
   7. ✅ Branches that delete themselves after a set time
-  8. Webhooks on push
+  8. ✅ Webhooks on every event (signed, retried, survive restarts)
 - **Done when:** 5 fake agents work on separate branches at once, one is blocked from pushing to `main`, the winner is merged, and the rest expire.
 
 ## After the MVP

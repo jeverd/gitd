@@ -43,13 +43,13 @@ for check in tests/tla/*/check.sh; do "$check" || die "TLA+ model $(dirname "$ch
 step "end-to-end (Debug: safety checks and leak reports on exit)"
 zig build || die "Debug build"
 tests/e2e/run.sh zig-out/bin/gitd >"$OUT/e2e-debug.log" 2>&1 || { tail -40 "$OUT/e2e-debug.log"; die "end-to-end in Debug"; }
-tail -1 "$OUT/e2e-debug.log"
+grep "^PASS:" "$OUT/e2e-debug.log"
 
 if [[ "$QUICK" == 0 ]]; then
   step "end-to-end (ReleaseSafe)"
   zig build -Doptimize=ReleaseSafe --prefix "$OUT/safe" || die "ReleaseSafe build"
   tests/e2e/run.sh "$OUT/safe/bin/gitd" >"$OUT/e2e-safe.log" 2>&1 || { tail -40 "$OUT/e2e-safe.log"; die "end-to-end in ReleaseSafe"; }
-  tail -1 "$OUT/e2e-safe.log"
+  grep "^PASS:" "$OUT/e2e-safe.log"
 
   step "fuzz ($FUZZ_RUNS runs per target)"
   for target in "${FUZZ_TARGETS[@]}"; do

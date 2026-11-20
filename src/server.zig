@@ -26,6 +26,7 @@ const events = @import("events.zig");
 const ui = @import("ui.zig");
 const content = @import("content.zig");
 const expiry = @import("expiry.zig");
+const webhooks = @import("webhooks.zig");
 const http_util = @import("http_util.zig");
 const keepAlive = http_util.keepAlive;
 
@@ -52,6 +53,10 @@ pub const App = struct {
     ui_enabled: bool = false,
     /// How often the reaper looks for expired branches.
     reaper_interval_ms: i64 = 1000,
+    /// Webhook retries wait 1, 2, 4, 8 times this.
+    webhook_backoff_ms: i64 = 1000,
+    /// A webhook delivery that takes longer than this counts as failed.
+    webhook_timeout_ms: i64 = 10_000,
 };
 
 pub const default_idle_timeout_seconds = 60;
@@ -67,6 +72,9 @@ pub fn run(app: *App, listener: *Io.net.Server) Io.Cancelable!void {
     defer group.cancel(io);
     group.concurrent(io, expiry.run, .{app}) catch |err| {
         std.log.err("starting the branch reaper: {t}", .{err});
+    };
+    group.concurrent(io, webhooks.run, .{app}) catch |err| {
+        std.log.err("starting the webhook worker: {t}", .{err});
     };
     while (true) {
         try app.connection_slots.wait(io);
@@ -343,6 +351,7 @@ fn deleteRepo(app: *App, request: *http.Server.Request, name: repo_name.Name) Ha
     const deleted = app.db.deleteRepo(io, name.full) catch return internal(request);
     if (!deleted) return respondError(request, .not_found, "not_found", "no such repo");
     app.db.clearBranchTtl(io, name.full, "") catch |err| std.log.err("clearing expiries of {s}: {t}", .{ name.full, err });
+    _ = app.db.deleteWebhooks(io, name.full, 0) catch |err| std.log.err("deleting webhooks of {s}: {t}", .{ name.full, err });
     app.store.delete(io, name) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => std.log.err("removing files of deleted repo {s}: {t}", .{ name.full, err }),

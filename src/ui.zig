@@ -6,6 +6,7 @@
 //!   GET /ui                      the page
 //!   GET /ui/api/state            repos and their branches
 //!   GET /ui/api/events?after=N   events with id > N
+//!   GET /ui/api/deliveries       the newest webhook deliveries (no secrets)
 
 const std = @import("std");
 const http = std.http;
@@ -33,6 +34,7 @@ pub fn serve(app: *server.App, request: *http.Server.Request, path: []const u8, 
     }
     if (std.mem.eql(u8, path, "/ui/api/state")) return state(app, request);
     if (std.mem.eql(u8, path, "/ui/api/events")) return eventsSince(app, request, query);
+    if (std.mem.eql(u8, path, "/ui/api/deliveries")) return @import("webhooks.zig").recent(app, request, "", 20);
     if (std.mem.startsWith(u8, path, "/ui/api/repos/")) {
         const parts = server.splitRepoPath(path["/ui/api/repos/".len..]) orelse
             return api.respondError(request, .not_found, "not_found", "no such UI route");

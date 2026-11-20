@@ -10,6 +10,7 @@
 #   tests/demo/demo.sh head REPO BRANCH      print a branch's commit
 #   tests/demo/demo.sh race REPO BRANCH N    N agents commit to BRANCH at once via the API
 #   tests/demo/demo.sh merge REPO BASE HEAD [merge|squash|fast-forward]
+#   tests/demo/demo.sh webhook REPO PATH     webhook to a local receiver: /ok, /fail/N, /down, /hang
 #   tests/demo/demo.sh stop
 #
 # State (admin key, port) lives in $DEMO_DIR (default /tmp/gitd-demo).
@@ -39,14 +40,17 @@ cmd="${1:-}"; shift || true
 case "$cmd" in
   start)
     pkill -f "gitd serve --data $DEMO_DIR/data" 2>/dev/null || true
+    pkill -f "webhook_receiver.py $DEMO_DIR" 2>/dev/null || true
     rm -rf "$DEMO_DIR"; mkdir -p "$DEMO_DIR"
     "$BIN" admin create-key --data "$DEMO_DIR/data" >"$DEMO_DIR/key"
-    "$BIN" serve --data "$DEMO_DIR/data" --listen "127.0.0.1:$PORT" --ui >"$DEMO_DIR/server.log" 2>&1 &
+    GITD_WEBHOOK_BACKOFF_MS="${GITD_WEBHOOK_BACKOFF_MS:-1000}" GITD_WEBHOOK_TIMEOUT_MS="${GITD_WEBHOOK_TIMEOUT_MS:-3000}" \
+      "$BIN" serve --data "$DEMO_DIR/data" --listen "127.0.0.1:$PORT" --ui >"$DEMO_DIR/server.log" 2>&1 &
     for _ in $(seq 1 100); do curl -sf "$BASE/healthz" >/dev/null && break; sleep 0.05; done
     echo "gitd at $BASE/ui"
     ;;
   stop)
     pkill -TERM -f "gitd serve --data $DEMO_DIR/data" || true
+    pkill -f "webhook_receiver.py $DEMO_DIR" || true
     ;;
   repo)
     api -X POST "$BASE/v1/repos" -d "{\"name\":\"$1\"}" >/dev/null
@@ -80,6 +84,16 @@ case "$cmd" in
   head)
     # head REPO BRANCH: print the branch's commit
     api "$BASE/v1/repos/$1/branches" | python3 -c "import json,sys; print(next(b['commit'] for b in json.load(sys.stdin)['branches'] if b['name']=='$2'))"
+    ;;
+  webhook)
+    # webhook REPO PATH: register a webhook on a local test receiver (started
+    # on first use). PATH: /ok, /fail/N, /down, or /hang.
+    if [[ ! -s "$DEMO_DIR/hooks.port" ]]; then
+      python3 "$ROOT/tests/e2e/webhook_receiver.py" "$DEMO_DIR/hooks.log" "$DEMO_DIR/hooks.port" >/dev/null 2>&1 &
+      for _ in $(seq 1 100); do [[ -s "$DEMO_DIR/hooks.port" ]] && break; sleep 0.05; done
+    fi
+    api -X POST "$BASE/v1/repos/$1/webhooks" -d "{\"url\":\"http://127.0.0.1:$(cat "$DEMO_DIR/hooks.port")$2\"}" >/dev/null
+    echo "webhook on $1 -> $2"
     ;;
   merge)
     # merge REPO BASE HEAD [STRATEGY]: merge HEAD into BASE through the API

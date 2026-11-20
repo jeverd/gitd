@@ -16,8 +16,10 @@ LOG="$WORK/server.log"
 SERVER_PID=""
 PASSED=0
 
+RECEIVER_PID=""
 cleanup() {
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then kill -KILL "$SERVER_PID" 2>/dev/null || true; fi
+  if [[ -n "$RECEIVER_PID" ]]; then kill "$RECEIVER_PID" 2>/dev/null || true; fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -42,7 +44,7 @@ start_server() {
   local skip
   skip=$(($(wc -l <"$LOG" 2>/dev/null || echo 0) + 1))
   PORT=""
-  GITD_IDLE_TIMEOUT_SECONDS=2 GITD_HEAD_TIMEOUT_SECONDS=3 "$BIN" serve --data "$DATA" --listen 127.0.0.1:0 --ui >>"$LOG" 2>&1 &
+  GITD_IDLE_TIMEOUT_SECONDS=2 GITD_HEAD_TIMEOUT_SECONDS=3 GITD_WEBHOOK_BACKOFF_MS=100 GITD_WEBHOOK_TIMEOUT_MS=1000 "$BIN" serve --data "$DATA" --listen 127.0.0.1:0 --ui >>"$LOG" 2>&1 &
   SERVER_PID=$!
   for _ in $(seq 1 100); do
     PORT="$(tail -n +"$skip" "$LOG" | sed -n 's/.*listening on 127\.0\.0\.1:\([0-9]*\),.*/\1/p' | tail -1)"
@@ -402,6 +404,72 @@ expect_eq "pushed branch expired" gone "$(expires_of ttl/push)"
 expect_eq "main survives" None "$(expires_of main)"
 expect_eq "three expiries logged" "$((EXPIRED_BEFORE + 3))" "$(count_events kind=branch_expired)"
 
+echo "== webhooks"
+python3 "$(dirname "$0")/webhook_receiver.py" "$WORK/hooks.log" "$WORK/hooks.port" &
+RECEIVER_PID=$!
+for _ in $(seq 1 100); do [[ -s "$WORK/hooks.port" ]] && break; sleep 0.05; done
+HP="$(cat "$WORK/hooks.port")"
+admin -X POST "$BASE/v1/repos" -d '{"name":"acme/hooks"}' >/dev/null
+HB="$BASE/v1/repos/acme/hooks"
+hook() { admin -X POST "$HB/webhooks" -d "{\"url\":\"http://127.0.0.1:$HP$1\"}"; }
+expect_eq "create webhook" 201 "$(hook /ok)"
+HOOK_OK="$(json '["id"]')"; HOOK_SECRET="$(json '["secret"]')"
+[[ "$HOOK_SECRET" == whsec_* ]] || fail "webhook secret format"
+expect_eq "create flaky webhook" 201 "$(hook /fail/2)"
+expect_eq "create dead webhook" 201 "$(hook /down)"
+expect_eq "create hanging webhook" 201 "$(hook /hang)"
+HOOK_HANG="$(json '["id"]')"
+expect_eq "list webhooks" 200 "$(admin "$HB/webhooks")"
+expect_eq "four webhooks" 4 "$(json '["webhooks"].__len__()')"
+grep -q whsec_ "$WORK/body" && fail "webhook list shows secrets"
+pass "webhook list hides secrets"
+for bad in ftp://x/y /relative 'http://' 'javascript:alert(1)'; do
+  expect_eq "invalid webhook url $bad" 400 "$(admin -X POST "$HB/webhooks" -d "{\"url\":\"$bad\"}")"
+done
+HOOKS_TOK="$(mint acme/hooks '["git:read","git:write"]')"
+expect_eq "tokens cannot manage webhooks" 403 "$(status -H "authorization: Bearer $HOOKS_TOK" -X POST "$HB/webhooks" -d '{"url":"http://127.0.0.1:1/x"}')"
+git -C "$LREPO" push -q "$(url "$HOOKS_TOK" acme/hooks)" FETCH_HEAD:refs/heads/main 2>"$WORK/err" || fail "push to acme/hooks: $(cat "$WORK/err")"
+HOOKS_MAIN="$(git -C "$LREPO" rev-parse FETCH_HEAD)"
+sleep 3
+deliveries() { admin "$HB/webhooks/deliveries" >/dev/null; python3 -c "import json; print(' '.join(d['status']+':'+str(d['attempts']) for d in json.load(open('$WORK/body'))['deliveries'] if d['url'].endswith('$1') and d['event']['kind']=='$2'))"; }
+expect_eq "push delivered once" "delivered:1" "$(deliveries /ok push)"
+expect_eq "flaky endpoint delivered on the third try" "delivered:3" "$(deliveries /fail/2 push)"
+expect_eq "dead endpoint gives up after 5 tries" "failed:5" "$(deliveries /down push)"
+[[ "$(deliveries /hang push)" =~ ^(pending|sending):[1-9]$ ]] || fail "hanging endpoint: $(deliveries /hang push)"
+admin "$HB/webhooks/deliveries" >/dev/null
+expect_eq "hanging endpoint times out" "timed out" "$(python3 -c "import json; print(next(d['last_error'] for d in json.load(open('$WORK/body'))['deliveries'] if d['url'].endswith('/hang')))")"
+python3 - "$WORK/hooks.log" "$HOOK_SECRET" "$HOOKS_MAIN" >"$WORK/sigcheck" <<'PY'
+import hashlib, hmac, json, sys
+log, secret, sha = sys.argv[1], sys.argv[2], sys.argv[3]
+ok = [json.loads(l) for l in open(log) if json.loads(l)["path"] == "/ok"]
+r = ok[0]
+body = json.loads(r["body"])
+want = "sha256=" + hmac.new(secret.encode(), r["body"].encode(), hashlib.sha256).hexdigest()
+print("sig", r["headers"]["x-gitd-signature"] == want)
+print("event", r["headers"]["x-gitd-event"], body["event"]["kind"], body["event"]["ref"], body["event"]["new"] == sha)
+print("delivery", r["headers"]["x-gitd-delivery"] == str(body["delivery"]))
+print("type", r["headers"]["content-type"])
+PY
+expect_eq "signature verifies" "sig True" "$(sed -n 1p "$WORK/sigcheck")"
+expect_eq "payload is the push event" "event push push refs/heads/main True" "$(sed -n 2p "$WORK/sigcheck")"
+expect_eq "delivery header matches body" "delivery True" "$(sed -n 3p "$WORK/sigcheck")"
+expect_eq "content type" "type application/json" "$(sed -n 4p "$WORK/sigcheck")"
+expect_eq "delete hanging webhook" 204 "$(admin -X DELETE "$HB/webhooks/$HOOK_HANG")"
+expect_eq "delete it again" 404 "$(admin -X DELETE "$HB/webhooks/$HOOK_HANG")"
+expect_eq "delete with a bad id" 400 "$(admin -X DELETE "$HB/webhooks/abc")"
+OK_BEFORE="$(grep -c '"path": "/ok"' "$WORK/hooks.log")"
+HANG_BEFORE="$(grep -c '"path": "/hang"' "$WORK/hooks.log")"
+expect_eq "another event" 201 "$(admin -X POST "$HB/branches" -d '{"name":"b2","from":"main"}')"
+sleep 1
+expect_eq "remaining webhooks get it" "$((OK_BEFORE + 1))" "$(grep -c '"path": "/ok"' "$WORK/hooks.log")"
+expect_eq "deleted webhook gets nothing" "$HANG_BEFORE" "$(grep -c '"path": "/hang"' "$WORK/hooks.log")"
+expect_eq "UI deliveries" 200 "$(status "$BASE/ui/api/deliveries")"
+grep -q whsec_ "$WORK/body" && fail "UI shows a webhook secret"
+pass "UI deliveries hide secrets"
+expect_eq "delete repo with webhooks" 204 "$(admin -X DELETE "$HB")"
+expect_eq "recreate it" 201 "$(admin -X POST "$BASE/v1/repos" -d '{"name":"acme/hooks"}')"
+expect_eq "old webhooks are gone" 0 "$(admin "$HB/webhooks" >/dev/null; json '["webhooks"].__len__()')"
+
 echo "== protocol hardening"
 expect_eq "dumb protocol HEAD" 400 "$(status -u "t:$RO" "$BASE/acme/web.git/HEAD")"
 expect_eq "dumb protocol objects" 400 "$(status -u "t:$RO" "$BASE/acme/web.git/objects/info/packs")"
@@ -599,8 +667,8 @@ echo "== activity log and UI"
 expect_eq "UI page served" 200 "$(status "$BASE/ui")"
 grep -q "<title>gitd</title>" "$WORK/body" || fail "UI page content"
 expect_eq "UI state" 200 "$(status "$BASE/ui/api/state")"
-expect_eq "UI state lists both repos" 2 "$(json '["repos"].__len__()')"
-expect_eq "repo_created events" 4 "$(count_events kind=repo_created)"
+expect_eq "UI state lists all repos" 3 "$(json '["repos"].__len__()')"
+expect_eq "repo_created events" 6 "$(count_events kind=repo_created)"
 expect_eq "repo_deleted event" 1 "$(count_events kind=repo_deleted repo=acme/web)"
 expect_eq "first push recorded with its commit" 1 "$(count_events kind=push repo=acme/web ref=refs/heads/main detail=created)"
 AGENT_PUSHES="$(events; python3 -c "import json; print(sum(1 for e in json.load(open('$WORK/body'))['events'] if e['kind']=='push' and e['repo']=='acme/web' and e['ref'].startswith('refs/heads/agent/')))")"
@@ -658,7 +726,7 @@ for _ in $(seq 1 40); do [[ -z "$(leftover)" ]] && break; sleep 0.1; done
 pass "stopping mid-clone leaves no git processes"
 start_server
 expect_eq "list after restart" 200 "$(admin "$BASE/v1/repos")"
-expect_eq "repos survive restart" 2 "$(json '["repos"].__len__()')"
+expect_eq "repos survive restart" 3 "$(json '["repos"].__len__()')"
 git ls-remote "$(url "$RW" acme/web)" >/dev/null 2>"$WORK/err" || fail "token from before restart: $(cat "$WORK/err")"
 pass "token minted before restart still works"
 sleep 4
@@ -670,6 +738,7 @@ if grep -nE '^(error|warning)|panic|leak|Segmentation' "$LOG"; then fail "server
 pass "no errors, warnings, panics, or leaks in server log"
 grep -q "$KEY" "$LOG" && fail "admin key appears in server log"
 grep -qF "$RW" "$LOG" && fail "token appears in server log"
+grep -qF "$HOOK_SECRET" "$LOG" && fail "webhook secret appears in server log"
 pass "no secrets in server log"
 
 echo "PASS: $PASSED checks"
