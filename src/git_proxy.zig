@@ -45,6 +45,33 @@ pub const ProxyError = error{
     ResponseBroken,
 } || Io.Cancelable || std.mem.Allocator.Error;
 
+/// A request body spooled to an unlinked temp file, read from offset 0.
+pub const Body = struct {
+    file: Io.File,
+    len: u64,
+
+    pub fn close(b: Body, io: Io) void {
+        b.file.close(io);
+    }
+
+    /// Reads up to `buf.len` leading bytes, for inspecting the start of a
+    /// push without disturbing the offset git reads from.
+    pub fn head(b: Body, io: Io, buf: []u8) ProxyError![]u8 {
+        const n = b.file.readPositionalAll(io, buf, 0) catch |err| return fail("reading body", err);
+        return buf[0..n];
+    }
+};
+
+/// Spools the request body. Call before `serve` for rpc routes.
+pub fn spool(io: Io, store: *const store_mod.Store, request: *std.http.Server.Request) ProxyError!Body {
+    const file = try createUnlinked(io, store, "body");
+    errdefer file.close(io);
+    const len = try spoolBody(io, request, file);
+    return .{ .file = file, .len = len };
+}
+
+/// Runs `git http-backend` for the request and relays its response. `body`
+/// is the spooled body for rpc routes and null for info/refs.
 pub fn serve(
     io: Io,
     gpa: std.mem.Allocator,
@@ -52,15 +79,11 @@ pub fn serve(
     request: *std.http.Server.Request,
     route: git_http.Route,
     input: CgiInput,
+    body: ?Body,
+    after: ?After,
 ) ProxyError!std.http.Status {
-    // Spool the body (rpc only; info/refs is a GET with no body).
-    var body_file: ?Io.File = null;
-    defer if (body_file) |f| f.close(io);
-    var body_len: u64 = 0;
-    if (route.kind == .rpc) {
-        body_file = try createUnlinked(io, store, "body");
-        body_len = try spoolBody(io, request, body_file.?);
-    }
+    const body_file: ?Io.File = if (body) |b| b.file else null;
+    const body_len: u64 = if (body) |b| b.len else 0;
 
     const err_file = try createUnlinked(io, store, "err");
     defer err_file.close(io);
@@ -93,29 +116,50 @@ pub fn serve(
     }) catch |err| return fail("spawning git http-backend", err);
     defer killGroup(io, &child);
 
-    const status = try relay(io, request, child.stdout.?);
+    var read_buf: [git_http.max_cgi_head_len * 2]u8 = undefined;
+    var send_buf: [16 * 1024]u8 = undefined;
+    var response: std.http.BodyWriter = undefined;
+    const status = try relay(io, request, child.stdout.?, &read_buf, &send_buf, &response);
 
-    // The response is already sent: from here a failure is only logged, so
+    // The response is under way: from here a failure is only logged, so
     // the caller never writes a second response.
-    const term = child.wait(io) catch |err| switch (err) {
+    const term: ?std.process.Child.Term = child.wait(io) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
-        else => {
+        else => blk: {
             std.log.err("git proxy waiting for git http-backend: {t}", .{err});
-            return status;
+            break :blk null;
         },
     };
-    switch (term) {
+    if (term) |t| switch (t) {
         .exited => |code| if (code != 0 or @backingInt(status) >= 500) logStderr(io, err_file, status, code),
         .signal, .stopped, .unknown => logStderr(io, err_file, status, null),
-    }
+    };
+    // git has finished: let the caller record what it changed before the
+    // client sees the end of the response, so anyone who reads the event
+    // log after `git push` returns sees the push.
+    if (after) |a| a.run(a.ctx);
+    response.end() catch return error.ResponseBroken;
     return status;
 }
 
-/// Reads the CGI response from `stdout` and sends it to the client.
-/// Returns the status sent.
-fn relay(io: Io, request: *std.http.Server.Request, stdout: Io.File) ProxyError!std.http.Status {
-    var read_buf: [git_http.max_cgi_head_len * 2]u8 = undefined;
-    var reader = stdout.readerStreaming(io, &read_buf);
+/// Work to run after git exits and before the response ends.
+pub const After = struct {
+    ctx: *anyopaque,
+    run: *const fn (*anyopaque) void,
+};
+
+/// Reads the CGI head from `stdout`, starts the response in `response`,
+/// and streams git's output into it, leaving it open for the caller to
+/// end. Returns the status sent.
+fn relay(
+    io: Io,
+    request: *std.http.Server.Request,
+    stdout: Io.File,
+    read_buf: []u8,
+    send_buf: []u8,
+    response: *std.http.BodyWriter,
+) ProxyError!std.http.Status {
+    var reader = stdout.readerStreaming(io, read_buf);
     const r = &reader.interface;
 
     const head = while (true) {
@@ -130,8 +174,7 @@ fn relay(io: Io, request: *std.http.Server.Request, stdout: Io.File) ProxyError!
         }
     };
 
-    var send_buf: [16 * 1024]u8 = undefined;
-    var body = request.respondStreaming(&send_buf, .{
+    response.* = request.respondStreaming(send_buf, .{
         .respond_options = .{
             .status = head.status,
             .keep_alive = http_util.keepAlive(request),
@@ -140,8 +183,7 @@ fn relay(io: Io, request: *std.http.Server.Request, stdout: Io.File) ProxyError!
     }) catch return error.ResponseBroken;
     // `head` borrows the reader's buffer; it is not used after this point.
     r.toss(head.body_start);
-    _ = r.streamRemaining(&body.writer) catch return error.ResponseBroken;
-    body.end() catch return error.ResponseBroken;
+    _ = r.streamRemaining(&response.writer) catch return error.ResponseBroken;
     return head.status;
 }
 

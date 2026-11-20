@@ -9,11 +9,12 @@ const server = @import("server.zig");
 
 const usage =
     \\usage:
-    \\  gitd serve [--data DIR] [--listen HOST:PORT]
+    \\  gitd serve [--data DIR] [--listen HOST:PORT] [--ui]
     \\  gitd admin create-key [--data DIR]
     \\
     \\  --data    data directory (env GITD_DATA, default ./data)
     \\  --listen  address to listen on (env GITD_LISTEN, default 127.0.0.1:8080)
+    \\  --ui      serve the read-only activity page at /ui (to this machine only)
     \\
     \\  env GITD_IDLE_TIMEOUT_SECONDS: drop a connection idle this long (default 60)
     \\  env GITD_HEAD_TIMEOUT_SECONDS: time allowed to send a request head (default 10)
@@ -23,6 +24,7 @@ const usage =
 const Options = struct {
     data_dir: []const u8,
     listen: []const u8,
+    ui: bool = false,
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -44,6 +46,10 @@ pub fn main(init: std.process.Init) !u8 {
     var i: usize = 0;
     while (i < rest.len) : (i += 1) {
         const flag = rest[i];
+        if (std.mem.eql(u8, flag, "--ui")) {
+            opts.ui = true;
+            continue;
+        }
         if (i + 1 >= rest.len) return usageError();
         if (std.mem.eql(u8, flag, "--data")) {
             opts.data_dir = rest[i + 1];
@@ -145,10 +151,12 @@ fn serve(init: std.process.Init, opts: Options) !u8 {
         .secret = &secret,
         .idle_timeout_seconds = idle_timeout,
         .head_timeout_seconds = head_timeout,
+        .ui_enabled = opts.ui,
     };
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
     std.log.info("listening on {f}, data in {s}", .{ listener.socket.address, data.root });
+    if (opts.ui) std.log.info("activity page at http://{f}/ui", .{listener.socket.address});
 
     var accept_loop = try io.concurrent(server.run, .{ &app, &listener });
 
@@ -174,4 +182,11 @@ test {
     _ = @import("server.zig");
     _ = @import("timed_stream.zig");
     _ = @import("http_util.zig");
+    _ = @import("git_cmd.zig");
+    _ = @import("ref_name.zig");
+    _ = @import("receive_pack.zig");
+    _ = @import("repo_git.zig");
+    _ = @import("events.zig");
+    _ = @import("ui.zig");
+    _ = @import("api.zig");
 }

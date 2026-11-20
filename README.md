@@ -40,6 +40,7 @@ All `/v1` routes need `Authorization: Bearer <admin key>`. Errors look like `{"e
 | `DELETE /v1/repos/{ns}/{repo}` | Delete a repo and its files. Its tokens stop working |
 | `POST /v1/tokens` `{"repo","scopes","ttl_seconds"}` | Mint a repo token |
 | `GET /healthz` | Liveness, no auth |
+| `GET /ui` | Live activity page: repos, branches, and every push. Only with `gitd serve --ui`, only from this machine |
 | `/{ns}/{repo}.git/...` | git smart HTTP. The token goes in the password: `http://t:<token>@host/...` |
 
 Repo names are `ns/repo`: lowercase letters, digits, `.`, `_`, `-`, up to 64 characters per part.

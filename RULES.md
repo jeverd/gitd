@@ -10,7 +10,7 @@ Hard rules. Cite the ID when a change touches one. To change a rule, ask the mai
 
 ## R2 Security
 
-- **R2.1** Every request except `GET /healthz` is authenticated. Admin keys manage the server; repo tokens are scoped to one repo (by id, so a deleted repo's tokens die with it), scopes, a branch pattern, and an expiry.
+- **R2.1** Every request except `GET /healthz` and the read-only `/ui` page (only with `serve --ui`, only to loopback clients) is authenticated. Admin keys manage the server; repo tokens are scoped to one repo (by id, so a deleted repo's tokens die with it), scopes, a branch pattern, and an expiry.
 - **R2.2** Branch limits are checked before git writes anything. A rejected push changes nothing.
 - **R2.3** Git data from clients and from repos is untrusted: pack files, pkt-lines, paths, ref names, and repo config. Validate and bound every length before use.
 - **R2.4** When gitd runs `git`, it disables hooks and any program a repo's config can name.

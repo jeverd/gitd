@@ -42,7 +42,15 @@ src/
   store.zig         data directory, repo storage on disk, safe `git` environment
   timed_stream.zig  socket reader and writer with per-operation timeouts
   http_util.zig     keep-alive rules and the per-address connection cap
+  api.zig           shared handler helpers: JSON bodies, errors, headers, clock
+  events.zig        the activity log (pushes, rejections, merges, ...)
+  ui.zig, ui.html   read-only activity page at /ui (`serve --ui`, loopback only)
+  git_cmd.zig       runs one git plumbing command safely, with bounded output
+  repo_git.zig      repo operations built on git plumbing (branches, refs, ...)
+  ref_name.zig      ref name and ref pattern validation (pure)
+  receive_pack.zig  reads the ref update commands at the start of a push (pure)
 tests/e2e/run.sh    end-to-end test
+tests/demo/demo.sh  drives a UI-enabled gitd for demos and recordings
 scripts/verify.sh   verification gate
 ```
 
