@@ -204,9 +204,11 @@ pub const Repo = struct {
     pub fn log(r: *const Repo, commit: []const u8, limit: u32, path: ?[]const u8, single: bool) git_cmd.Error!Log {
         var n_buf: [24]u8 = undefined;
         const n = std.mem.print(&n_buf, "-n{d}", .{if (single) 1 else limit}) catch unreachable;
-        const format = "--format=%H%x00%P%x00%an%x00%ae%x00%ct%x00%s%x00%b%x1e";
+        // Records end in NUL, RS, NUL: commit text cannot break the split
+        // unless it contains that exact sequence.
+        const format = "--format=%H%x00%P%x00%an%x00%ae%x00%ct%x00%s%x00%b%x00%x1e%x00";
         const raw = if (path) |p|
-            try r.gitOutput(&.{ "log", format, n, "--no-walk=unsorted", "--end-of-options", commit, "--", p }, .{})
+            try r.gitOutput(&.{ "log", format, n, "--end-of-options", commit, "--", p }, .{})
         else if (single)
             try r.gitOutput(&.{ "log", format, n, "--no-walk", "--end-of-options", commit }, .{})
         else
@@ -214,7 +216,7 @@ pub const Repo = struct {
         errdefer r.gpa.free(raw);
         var list: std.ArrayList(Commit) = .empty;
         errdefer list.deinit(r.gpa);
-        var records = std.mem.splitScalar(u8, raw, 0x1e);
+        var records = std.mem.splitSequence(u8, raw, "\x00\x1e\x00");
         while (records.next()) |rec_raw| {
             const rec = std.mem.trimStart(u8, rec_raw, "\n");
             if (rec.len == 0) continue;
@@ -279,21 +281,42 @@ pub const Repo = struct {
                 const oid_raw = try r.gitOutput(&.{ "hash-object", "-w", "--stdin" }, .{ .stdin = data });
                 defer r.gpa.free(oid_raw);
                 const oid = std.mem.trimEnd(u8, oid_raw, "\n");
-                try info.print(r.gpa, "100644 {s}\t{s}\n", .{ oid, change.path });
+                try info.print(r.gpa, "100644 {s}\t{s}\x00", .{ oid, change.path });
             } else {
                 // Mode 0 removes the path from the index.
-                try info.print(r.gpa, "0 0000000000000000000000000000000000000000\t{s}\n", .{change.path});
+                try info.print(r.gpa, "0 0000000000000000000000000000000000000000\t{s}\x00", .{change.path});
             }
         }
         if (info.items.len > 0) {
-            r.gpa.free(try r.gitOutput(&.{ "update-index", "--index-info" }, .{ .env = &index_env, .stdin = info.items }));
+            // -z: records end in NUL and paths are taken literally. Without
+            // it git C-unquotes a path that starts with '"'.
+            r.gpa.free(try r.gitOutput(&.{ "update-index", "-z", "--index-info" }, .{ .env = &index_env, .stdin = info.items }));
         }
+        // git silently skips paths it considers unsafe (some .git look-alikes
+        // on case-insensitive or HFS file systems). Refuse rather than
+        // report a commit that lacks a file the caller sent.
+        try r.checkIndexHas(&index_env, changes);
         const tree_raw = try r.gitOutput(&.{"write-tree"}, .{ .env = &index_env });
         defer r.gpa.free(tree_raw);
         const tree = std.mem.trimEnd(u8, tree_raw, "\n");
 
         const parents: []const []const u8 = if (parent) |p| &.{p} else &.{};
         return r.commitTree(tree, parents, message, author, out);
+    }
+
+    fn checkIndexHas(r: *const Repo, index_env: []const [2][]const u8, changes: []const Change) git_cmd.Error!void {
+        const listing = try r.gitOutput(&.{ "ls-files", "-z" }, .{ .env = index_env });
+        defer r.gpa.free(listing);
+        for (changes) |change| {
+            if (change.content == null) continue;
+            var found = false;
+            var it = std.mem.splitScalar(u8, listing, 0);
+            while (it.next()) |p| if (std.mem.eql(u8, p, change.path)) {
+                found = true;
+                break;
+            };
+            if (!found) return error.PathRejected;
+        }
     }
 
     /// Writes a commit of `tree` with `parents` and returns its oid.

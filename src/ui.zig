@@ -40,8 +40,8 @@ pub fn serve(app: *server.App, request: *http.Server.Request, path: []const u8, 
             return api.respondError(request, .not_found, "not_found", "no such UI route");
         const repo = (app.db.getRepo(app.io, app.gpa, parts.name.full) catch return api.internal(request)) orelse
             return api.respondError(request, .not_found, "not_found", "no such repo");
-        repo.deinit(app.gpa);
-        return @import("content.zig").serve(app, request, parts.name, parts.rest, query, .{ .claims = null, .read_only = true });
+        defer repo.deinit(app.gpa);
+        return @import("content.zig").serve(app, request, parts.name, parts.rest, query, .{ .claims = null, .read_only = true, .repo_id = repo.id });
     }
     return api.respondError(request, .not_found, "not_found", "no such UI route");
 }

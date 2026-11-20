@@ -119,7 +119,13 @@ pub fn serve(
     var read_buf: [git_http.max_cgi_head_len * 2]u8 = undefined;
     var send_buf: [16 * 1024]u8 = undefined;
     var response: std.http.BodyWriter = undefined;
-    const status = try relay(io, request, child.stdout.?, &read_buf, &send_buf, &response);
+    const status = relay(io, request, child.stdout.?, &read_buf, &send_buf, &response) catch |err| {
+        // git may already have moved refs. Stop it, then let the caller
+        // record whatever actually changed, before giving up on the client.
+        killGroup(io, &child);
+        if (after) |a| a.run(a.ctx);
+        return err;
+    };
 
     // The response is under way: from here a failure is only logged, so
     // the caller never writes a second response.

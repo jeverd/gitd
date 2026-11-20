@@ -59,7 +59,10 @@ fn reapOne(app: *server.App, ttl: Db.BranchTtl, now: i64) Io.Cancelable!void {
         std.log.err("checking repo {s}: {t}", .{ ttl.repo, err });
         return;
     }) orelse return forget(app, ttl);
+    const same = std.mem.eql(u8, exists.id, ttl.repo_id);
     exists.deinit(app.gpa);
+    // The expiry belongs to a deleted repo that has since been made again.
+    if (!same) return forget(app, ttl);
 
     const repo = repo_git.Repo.open(io, app.gpa, app.store, name) catch return forget(app, ttl);
     var buf: [64]u8 = undefined;

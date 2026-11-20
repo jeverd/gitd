@@ -51,6 +51,23 @@ pub const Access = struct {
     claims: ?*const auth.Claims,
     /// The UI may only read.
     read_only: bool = false,
+    /// The repo's id, for anything stored against it.
+    repo_id: []const u8,
+
+    /// Whether this caller may write anything at all.
+    pub fn canWriteAny(a: Access) bool {
+        if (a.read_only) return false;
+        const c = a.claims orelse return true;
+        return c.scopes.git_write;
+    }
+
+    /// The lifetime of a branch this caller creates: `requested`, else the
+    /// token's branch_ttl, else none.
+    pub fn branchTtl(a: Access, requested: ?i64) ?i64 {
+        if (requested) |r| return r;
+        const c = a.claims orelse return null;
+        return if (c.branch_ttl > 0) c.branch_ttl else null;
+    }
 
     pub fn canRead(a: Access) bool {
         const c = a.claims orelse return true;
@@ -157,6 +174,8 @@ fn pathFromUrl(request: *http.Server.Request, raw: []const u8, out: *[repo_path.
 fn gitError(request: *http.Server.Request, err: anyerror) Error!http.Status {
     if (err == error.Canceled) return error.Canceled;
     if (err == error.OutputTooLarge) return api.respondError(request, .payload_too_large, "too_large", "the result is too large");
+    if (err == error.PathRejected) return api.respondError(request, .bad_request, "invalid_path", "git refused one of the paths");
+    if (err == error.GitTimedOut) return api.respondError(request, .service_unavailable, "timeout", "the operation took too long");
     return api.internal(request);
 }
 
@@ -194,9 +213,9 @@ fn ttlInvalid(ttl: ?i64) bool {
     return t < 1 or t > expiry.max_ttl_seconds;
 }
 
-fn setTtl(app: *server.App, name: repo_name.Name, ref: []const u8, ttl: ?i64) void {
+fn setTtl(app: *server.App, name: repo_name.Name, repo_id: []const u8, ref: []const u8, ttl: ?i64) void {
     const t = ttl orelse return;
-    app.db.setBranchTtl(app.io, name.full, ref, api.unixNow(app.io) + t) catch |err| std.log.err("setting expiry of {s}: {t}", .{ ref, err });
+    app.db.setBranchTtl(app.io, name.full, repo_id, ref, api.unixNow(app.io) + t) catch |err| std.log.err("setting expiry of {s}: {t}", .{ ref, err });
 }
 
 fn readFile(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, raw_path: []const u8, query: []const u8) Error!http.Status {
@@ -351,6 +370,8 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
         /// When creating the branch: delete it after this many seconds.
         ttl_seconds: ?i64 = null,
     };
+    // Refuse before buffering up to 16 MiB for a caller that cannot write.
+    if (!access.canWriteAny()) return api.respondError(request, .forbidden, "forbidden", "this token lacks git:write");
     var parsed = api.readJsonLimit(Body, app.gpa, request, max_commit_body) catch |err| return api.respondBodyError(request, err);
     defer parsed.deinit();
     const body = parsed.value;
@@ -359,7 +380,9 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
     const ref = ref_name.validateBranch(body.branch, &ref_buf) catch
         return api.respondError(request, .bad_request, "invalid_branch", "branch must be a valid branch name like agent/3/work");
     if (!access.canWrite(ref)) return forbiddenRef(request, ref);
-    if (body.message.len == 0 or body.message.len > max_message) return api.respondError(request, .bad_request, "invalid_message", "message must be 1-65536 bytes");
+    if (body.message.len == 0 or body.message.len > max_message or std.mem.findScalar(u8, body.message, 0) != null) {
+        return api.respondError(request, .bad_request, "invalid_message", "message must be 1-65536 bytes with no NUL");
+    }
     if (body.changes.len == 0 or body.changes.len > max_changes) return api.respondError(request, .bad_request, "invalid_changes", "give 1-100 changes");
     if (ttlInvalid(body.ttl_seconds)) return api.respondError(request, .bad_request, "invalid_ttl", "ttl_seconds must be 1-604800");
     if (body.ttl_seconds != null and body.expected_head != null) return api.respondError(request, .bad_request, "invalid_ttl", "ttl_seconds applies only when creating a branch (expected_head null)");
@@ -403,7 +426,8 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
     const outcome = repo.updateRef(ref, sha, body.expected_head) catch |err| return gitError(request, err);
     if (outcome == .stale) return staleHead(app, request, repo, name, ref, body.expected_head);
 
-    setTtl(app, name, ref, body.ttl_seconds);
+    // A branch made by commit gets the token's lifetime like a pushed one.
+    setTtl(app, name, access.repo_id, ref, if (body.expected_head == null) access.branchTtl(body.ttl_seconds) else null);
     const subject = body.message[0 .. std.mem.findScalar(u8, body.message, '\n') orelse body.message.len];
     events.record(app, .{
         .repo = name.full,
@@ -411,7 +435,7 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
         .ref = ref,
         .old = body.expected_head orelse "",
         .new = sha,
-        .detail = subject[0..@min(subject.len, 200)],
+        .detail = truncateUtf8(subject, 200),
         .created_at = api.unixNow(app.io),
     });
     return api.respondJson(app.gpa, request, .created, .{ .sha = sha, .branch = body.branch, .parent = parent });
@@ -454,7 +478,7 @@ fn createBranch(app: *server.App, request: *http.Server.Request, repo: *const re
         return api.respondError(request, .not_found, "not_found", "from names no commit");
     const outcome = repo.updateRef(ref, commit, null) catch |err| return gitError(request, err);
     if (outcome == .stale) return api.respondError(request, .conflict, "already_exists", "that branch already exists");
-    setTtl(app, name, ref, parsed.value.ttl_seconds);
+    setTtl(app, name, access.repo_id, ref, access.branchTtl(parsed.value.ttl_seconds));
     events.record(app, .{ .repo = name.full, .kind = "branch_created", .ref = ref, .new = commit, .created_at = api.unixNow(app.io) });
     return api.respondJson(app.gpa, request, .created, .{ .name = parsed.value.name, .commit = commit });
 }
@@ -621,6 +645,21 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
             return api.respondJson(app.gpa, request, .created, .{ .result = if (body.strategy == .squash) "squashed" else "merged", .sha = sha });
         },
     }
+}
+
+/// At most `max` bytes of `text`, cut before a UTF-8 sequence rather than
+/// inside one.
+pub fn truncateUtf8(text: []const u8, max: usize) []const u8 {
+    if (text.len <= max) return text;
+    var end = max;
+    while (end > 0 and (text[end] & 0xc0) == 0x80) end -= 1;
+    return text[0..end];
+}
+
+test truncateUtf8 {
+    try std.testing.expectEqualStrings("ab", truncateUtf8("ab", 5));
+    try std.testing.expectEqualStrings("ab", truncateUtf8("ab\xc3\xa9", 3)); // é is 2 bytes
+    try std.testing.expectEqualStrings("ab\xc3\xa9", truncateUtf8("ab\xc3\xa9x", 4));
 }
 
 test revFromName {

@@ -19,7 +19,12 @@ pub const Options = struct {
     /// Extra environment, such as GIT_INDEX_FILE or author identity.
     env: []const [2][]const u8 = &.{},
     max_output: usize = default_max_output,
+    /// The command is killed if it has not finished by then (R3.4): a
+    /// request's git work never outlives the request by much.
+    timeout_ms: i64 = default_timeout_ms,
 };
+
+pub const default_timeout_ms = 60_000;
 
 pub const Result = struct {
     /// Exit code; 0 is success. Callers decide what other codes mean.
@@ -33,7 +38,7 @@ pub const Result = struct {
     }
 };
 
-pub const Error = error{ GitFailed, OutputTooLarge } || Io.Cancelable || std.mem.Allocator.Error;
+pub const Error = error{ GitFailed, OutputTooLarge, PathRejected, GitTimedOut } || Io.Cancelable || std.mem.Allocator.Error;
 
 /// Runs `git <args>` with GIT_DIR set to `git_dir`. The caller owns the
 /// result. Returns error.GitFailed only when git could not be run or was
@@ -76,16 +81,21 @@ pub fn run(
     }) catch |err| return fail("spawning git", err);
     defer killGroup(io, &child);
 
+    const deadline: Io.Clock.Timestamp = .fromNow(io, .{ .raw = .fromMilliseconds(options.timeout_ms), .clock = .awake });
     var mr_buffer: Io.File.MultiReader.Buffer(2) = undefined;
     var mr: Io.File.MultiReader = undefined;
     mr.init(gpa, io, mr_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
     defer mr.deinit();
-    while (mr.fill(4096, .none)) |_| {
+    while (mr.fill(4096, .{ .deadline = deadline })) |_| {
         if (mr.reader(0).buffered().len > options.max_output) return error.OutputTooLarge;
         if (mr.reader(1).buffered().len > max_stderr) return error.OutputTooLarge;
     } else |err| switch (err) {
         error.EndOfStream => {},
         error.Canceled => return error.Canceled,
+        error.Timeout => {
+            std.log.warn("git {s} ran past {d}ms and was stopped", .{ args[0], options.timeout_ms });
+            return error.GitTimedOut;
+        },
         else => return fail("reading git output", err),
     }
     mr.checkAnyError() catch |err| return fail("reading git output", err);

@@ -36,7 +36,7 @@ pub fn validateBranch(branch: []const u8, buf: *[max_len]u8) Error![]const u8 {
 }
 
 fn validateSegment(segment: []const u8) Error!void {
-    if (segment.len == 0 or segment[0] == '.') return error.InvalidRefName;
+    if (segment.len == 0 or segment[0] == '.' or segment[segment.len - 1] == '.') return error.InvalidRefName;
     if (std.mem.endsWith(u8, segment, ".lock")) return error.InvalidRefName;
     if (std.mem.find(u8, segment, "..") != null) return error.InvalidRefName;
     for (segment) |c| {
@@ -72,7 +72,7 @@ test "valid and invalid ref names" {
         "refs/heads/",       "refs//heads",      "refs/heads/../x", "refs/heads/.x",
         "refs/heads/x.lock", "refs/heads/a b",   "refs/heads/a~1",  "refs/heads/a^",
         "refs/heads/a:b",    "refs/heads/a@{1}", "refs/heads/a\\b", "refs/heads/\x00",
-        "refs/heads/x/",
+        "refs/heads/x/",     "refs/heads/x.",    "refs/heads/a./b",
     }) |n| try testing.expectError(error.InvalidRefName, validate(n));
 }
 

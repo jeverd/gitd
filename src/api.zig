@@ -57,10 +57,13 @@ pub fn respondJson(gpa: std.mem.Allocator, request: *http.Server.Request, status
 pub const json_headers = [_]http.Header{.{ .name = "content-type", .value = "application/json" }};
 
 pub fn respondError(request: *http.Server.Request, status: http.Status, code: []const u8, message: []const u8) HandleError!http.Status {
-    var buf: [512]u8 = undefined;
+    var buf: [2048]u8 = undefined;
     const Err = struct { code: []const u8, message: []const u8 };
-    // Codes and messages are short constants, so this always fits.
-    const body = std.mem.print(&buf, "{f}\n", .{std.json.fmt(.{ .@"error" = Err{ .code = code, .message = message } }, .{})}) catch unreachable;
+    // Messages can carry user-supplied text (ref patterns), so a long one
+    // falls back to the code alone instead of failing.
+    const body = std.mem.print(&buf, "{f}\n", .{std.json.fmt(.{ .@"error" = Err{ .code = code, .message = message } }, .{})}) catch
+        std.mem.print(&buf, "{f}\n", .{std.json.fmt(.{ .@"error" = Err{ .code = code, .message = "see the error code" } }, .{})}) catch
+        "{\"error\":{\"code\":\"error\"}}\n";
     try request.respond(body, .{ .status = status, .keep_alive = keepAlive(request), .extra_headers = &json_headers });
     return status;
 }

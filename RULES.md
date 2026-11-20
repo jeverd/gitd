@@ -21,7 +21,8 @@ Hard rules. Cite the ID when a change touches one. To change a rule, ask the mai
 - **R3.1** Bad input never crashes or hangs gitd. Handle every error path. A new `catch {}` says why in a comment.
 - **R3.2** Concurrent writes to one branch use compare-and-swap. The loser gets a 409, never a silent overwrite.
 - **R3.3** Every allocation has one owner and is freed on both success and failure. Tests use `std.testing.allocator`.
-- **R3.4** A client cannot hold resources without limit: connections are capped, idle reads time out, unread request bodies are never drained, and every git process a request starts is killed if the request ends early.
+- **R3.4** A client cannot hold resources without limit: connections are capped, idle reads time out, unread request bodies are never drained, and every git process a request starts is killed if the request ends early or runs past its time limit.
+- **R3.5** Nothing taken from `request.head` (the target, a header) is used after the request body is read: reading the body overwrites it. Handlers route on the copy `handle` makes; anything else is copied first.
 
 ## R4 Dependencies
 
