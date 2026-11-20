@@ -74,6 +74,8 @@ All `/v1` routes need `Authorization: Bearer <admin key>`. Per-repo routes (`/v1
 | `POST /v1/repos/{ns}/{repo}/branches` `{"name","from","ttl_seconds"}` | Create a branch (409 if it exists); with `ttl_seconds` it is deleted after that long. Commits that create a branch take `ttl_seconds` too |
 | `DELETE /v1/repos/{ns}/{repo}/branches/{name}?expected=` | Delete a branch, optionally only if it is at `expected` |
 | `GET /v1/repos/{ns}/{repo}/compare/{base}...{head}` | Ahead/behind, changed files, and the patch (up to 1 MiB) |
+| `GET /v1/repos/{ns}/{repo}/grep?q=&ref=&path=&fixed=&ignore_case=&limit=` | Search text files at `ref` without cloning (returns matching paths, line numbers, lines) |
+| `GET /v1/repos/{ns}/{repo}/archive?ref=&format=&path=` | Download a `tar.gz` (default), `tar`, or `zip` archive of `ref` (or `path` within it) |
 | `POST /v1/repos/{ns}/{repo}/merges` `{"base","head","strategy"}` | Merge `head` into `base`: fast-forward when possible, else a merge commit (`merge`) or one squashed commit (`squash`). Conflicts give 409 with the paths |
 | `POST /v1/repos/{ns}/{repo}/webhooks` `{"url"}` | Add a webhook (admin key only). The response has the signing `secret`, shown once |
 | `GET /v1/repos/{ns}/{repo}/webhooks` | List webhooks (no secrets) |
