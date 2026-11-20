@@ -2,7 +2,7 @@
 
 Open-source git storage for AI agents, written in Zig. Create repos over an API, give each agent a scoped token, and let agents push with plain `git` or commit through the API.
 
-Status: early. Repos, tokens, and `git clone`/`git push` work. Everything else in the MVP list is not built yet.
+Status: MVP complete. Every feature below works end to end; `tests/demo/agents.sh` runs the whole scenario.
 
 ## Quick start
 
@@ -63,7 +63,7 @@ Webhook deliveries are `POST`s of `{"delivery": id, "event": {...}}` with `x-git
 
 ## MVP
 
-- **Stack:** Zig, SQLite, and the `git` binary for now (libgit2 comes with the file and commit API). One server, repos on a persistent disk.
+- **Stack:** Zig, SQLite, and git plumbing commands (no libgit2 needed so far). One server, repos on a persistent disk.
 - **Features:**
   1. ✅ Repos: create, list, delete over an API
   2. ✅ Git: `git clone` and `git push` work normally
@@ -73,7 +73,12 @@ Webhook deliveries are `POST`s of `{"delivery": id, "event": {...}}` with `x-git
   6. ✅ Diff and merge branches
   7. ✅ Branches that delete themselves after a set time
   8. ✅ Webhooks on every event (signed, retried, survive restarts)
-- **Done when:** 5 fake agents work on separate branches at once, one is blocked from pushing to `main`, the winner is merged, and the rest expire.
+- ✅ **Done when:** 5 fake agents work on separate branches at once, one is blocked from pushing to `main`, the winner is merged, and the rest expire. Run it:
+
+  ```sh
+  zig build
+  DEMO_PACE=3 AGENT_TTL=20 DEMO_KEEP=1 tests/demo/agents.sh   # then open http://127.0.0.1:18910/ui
+  ```
 
 ## After the MVP
 

@@ -55,6 +55,7 @@ src/
   webhooks.zig      webhook API and the delivery worker (signed, retried, concurrent)
 tests/e2e/run.sh    end-to-end test
 tests/demo/demo.sh  drives a UI-enabled gitd for demos and recordings
+tests/demo/agents.sh  the full MVP scenario with checks (e2e runs it)
 tests/tla/          TLA+ models; each folder has a check.sh that verify.sh runs
 scripts/verify.sh   verification gate
 ```
