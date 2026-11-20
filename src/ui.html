@@ -35,7 +35,7 @@
   tr.selected td:first-child::before { content: "▸ "; }
   #browser { border: var(--line); margin-top: 8px; }
   #browser .bar { padding: 6px 10px; border-bottom: var(--line); display: flex; gap: 12px; flex-wrap: wrap; }
-  #browser .crumbs a, #browser .entries a { color: inherit; cursor: pointer; text-decoration: underline; }
+  #browser a { color: inherit; cursor: pointer; text-decoration: underline; }
   #browser .entries { padding: 6px 10px; }
   #browser .entries div { padding: 2px 0; }
   #browser pre { margin: 0; padding: 10px; border-top: var(--line); white-space: pre-wrap; word-break: break-word; max-height: 420px; overflow: auto; }
@@ -79,6 +79,10 @@ const ago = (unix, now) => {
   return s < 60 ? s + "s ago" : s < 3600 ? Math.floor(s / 60) + "m ago" : Math.floor(s / 3600) + "h ago";
 };
 const branchName = (ref) => ref.replace(/^refs\/heads\//, "");
+const left = (until, now) => {
+  const s = until - now;
+  return s <= 0 ? "expiring…" : s < 60 ? "in " + s + "s" : s < 3600 ? "in " + Math.ceil(s / 60) + "m" : "in " + Math.ceil(s / 3600) + "h";
+};
 
 let lastEvent = 0;
 // The branch whose files are open: { repo, branch, dir, file }.
@@ -155,6 +159,7 @@ function describe(e) {
     case "branch_created": return ["branch created", `${e.repo} ${ref} at ${short(e.new)}`];
     case "branch_deleted": return ["branch deleted", `${e.repo} ${ref}`];
     case "merge": return ["merge", `${e.repo} ${e.detail}: ${short(e.old)} → ${short(e.new)}`];
+    case "branch_expired": return ["branch expired", `${e.repo} ${ref} (was at ${short(e.old)})`];
     case "merge_conflict": return ["merge CONFLICT", `${e.repo} ${e.detail} → 409`];
     default: return [e.kind.replace(/_/g, " "), `${e.repo} ${ref} ${e.detail}`.trim()];
   }
@@ -183,6 +188,7 @@ function renderRepos(state) {
   const key = JSON.stringify(state.repos) + "|" + (browse ? browse.repo + " " + browse.branch : "");
   if (key === lastReposKey) {
     for (const td of document.querySelectorAll("td[data-at]")) td.textContent = ago(Number(td.dataset.at), state.now);
+    for (const td of document.querySelectorAll("td[data-until]")) td.textContent = left(Number(td.dataset.until), state.now);
     for (const tr of document.querySelectorAll("tr.fresh")) tr.classList.remove("fresh");
     return;
   }
@@ -201,7 +207,7 @@ function renderRepos(state) {
     } else {
       const table = el("table");
       const head = el("tr");
-      for (const h of ["branch", "commit", "updated", "message"]) head.append(el("th", "", h));
+      for (const h of ["branch", "commit", "updated", "expires", "message"]) head.append(el("th", "", h));
       table.append(head);
       for (const b of repo.branches) {
         const key = repo.name + " " + b.name;
@@ -217,7 +223,9 @@ function renderRepos(state) {
         nameCell.append(link);
         const when = el("td", "", ago(b.committed_at, state.now));
         when.dataset.at = b.committed_at;
-        tr.append(nameCell, el("td", "oid", short(b.commit)), when, el("td", "subject", b.subject));
+        const expires = el("td", "", b.expires_at ? left(b.expires_at, state.now) : "never");
+        if (b.expires_at) expires.dataset.until = b.expires_at;
+        tr.append(nameCell, el("td", "oid", short(b.commit)), when, expires, el("td", "subject", b.subject));
         table.append(tr);
       }
       card.append(table);

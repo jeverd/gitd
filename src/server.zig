@@ -25,6 +25,7 @@ const repo_git = @import("repo_git.zig");
 const events = @import("events.zig");
 const ui = @import("ui.zig");
 const content = @import("content.zig");
+const expiry = @import("expiry.zig");
 const http_util = @import("http_util.zig");
 const keepAlive = http_util.keepAlive;
 
@@ -49,6 +50,8 @@ pub const App = struct {
     peers: http_util.PeerLimit = .{ .max_per_peer = max_connections_per_peer },
     /// Serve the read-only activity page at /ui, to loopback clients only.
     ui_enabled: bool = false,
+    /// How often the reaper looks for expired branches.
+    reaper_interval_ms: i64 = 1000,
 };
 
 pub const default_idle_timeout_seconds = 60;
@@ -62,6 +65,9 @@ pub fn run(app: *App, listener: *Io.net.Server) Io.Cancelable!void {
     const io = app.io;
     var group: Io.Group = .init;
     defer group.cancel(io);
+    group.concurrent(io, expiry.run, .{app}) catch |err| {
+        std.log.err("starting the branch reaper: {t}", .{err});
+    };
     while (true) {
         try app.connection_slots.wait(io);
         const stream = listener.accept(io) catch |err| {
@@ -336,6 +342,7 @@ fn deleteRepo(app: *App, request: *http.Server.Request, name: repo_name.Name) Ha
     // leftover directory is cleared by the next create of the same name.
     const deleted = app.db.deleteRepo(io, name.full) catch return internal(request);
     if (!deleted) return respondError(request, .not_found, "not_found", "no such repo");
+    app.db.clearBranchTtl(io, name.full, "") catch |err| std.log.err("clearing expiries of {s}: {t}", .{ name.full, err });
     app.store.delete(io, name) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => std.log.err("removing files of deleted repo {s}: {t}", .{ name.full, err }),
@@ -353,6 +360,8 @@ fn createToken(app: *App, request: *http.Server.Request) HandleError!http.Status
         /// Ref patterns the token may write, like "refs/heads/agent/7/*".
         /// Omitted means any ref.
         refs: []const []const u8 = &.{},
+        /// Branches this token creates by push expire after this long.
+        branch_ttl_seconds: i64 = 0,
     };
     var parsed = api.readJson(Body, app.gpa, request) catch |err| return api.respondBodyError(request, err);
     defer parsed.deinit();
@@ -380,6 +389,10 @@ fn createToken(app: *App, request: *http.Server.Request) HandleError!http.Status
         error.InvalidRefPattern => respondError(request, .bad_request, "invalid_ref_pattern", "ref patterns are full ref names, optionally ending in /*, like refs/heads/agent/7/*"),
         error.TooManyRefPatterns => respondError(request, .bad_request, "invalid_ref_pattern", "at most 4 ref patterns, 600 bytes in total"),
     };
+    if (body.branch_ttl_seconds < 0 or body.branch_ttl_seconds > expiry.max_ttl_seconds) {
+        return respondError(request, .bad_request, "invalid_ttl", "branch_ttl_seconds must be 0-604800");
+    }
+    claims.branch_ttl = @intCast(body.branch_ttl_seconds);
     var token_buf: [auth.max_token_len]u8 = undefined;
     const token = auth.mint(app.secret, &claims, &token_buf) catch return internal(request);
     return api.respondJson(app.gpa, request, .created, .{ .token = token, .expires_at = expires_at });
@@ -474,7 +487,7 @@ fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route,
         if (!push.?.allowedBy(&claims)) return rejectPush(app, request, &push.?, &claims, repo_copy);
     }
 
-    var recorder: Push.Recorder = .{ .app = app, .push = if (push) |*p| p else null, .repo = repo_copy };
+    var recorder: Push.Recorder = .{ .app = app, .push = if (push) |*p| p else null, .repo = repo_copy, .branch_ttl = claims.branch_ttl };
     const after: ?git_proxy.After = if (push != null) .{ .ctx = &recorder, .run = Push.Recorder.run } else null;
     return git_proxy.serve(app.io, app.gpa, app.store, request, git_route, input, body, after) catch |err|
         proxyError(request, err);
@@ -559,10 +572,11 @@ const Push = struct {
         app: *App,
         push: ?*Push,
         repo: repo_name.Name,
+        branch_ttl: u32,
 
         fn run(ctx: *anyopaque) void {
             const self: *Recorder = @ptrCast(@alignCast(ctx));
-            if (self.push) |p| p.record(self.app, self.repo);
+            if (self.push) |p| p.record(self.app, self.repo, self.branch_ttl);
         }
     };
 
@@ -574,7 +588,9 @@ const Push = struct {
     /// Records an event for each ref git actually moved. git can refuse
     /// some or all commands (a stale old value, fsck), so each ref is
     /// checked rather than trusting the request.
-    fn record(p: *const Push, app: *App, name: repo_name.Name) void {
+    /// Branches the push created get `branch_ttl` seconds to live (when
+    /// non-zero); deleted branches lose any expiry.
+    fn record(p: *const Push, app: *App, name: repo_name.Name, branch_ttl: u32) void {
         const repo = repo_git.Repo.open(app.io, app.gpa, app.store, name) catch return;
         const now = unixNow(app.io);
         for (p.commands) |cmd| {
@@ -587,6 +603,11 @@ const Push = struct {
             if (!applied) continue;
             const detail = if (cmd.isCreate()) "created" else if (cmd.isDelete()) "deleted" else "updated";
             events.record(app, .{ .repo = name.full, .kind = "push", .ref = cmd.ref, .old = cmd.old, .new = cmd.new, .detail = detail, .created_at = now });
+            if (cmd.isDelete()) {
+                app.db.clearBranchTtl(app.io, name.full, cmd.ref) catch |err| std.log.err("clearing expiry of {s}: {t}", .{ cmd.ref, err });
+            } else if (cmd.isCreate() and branch_ttl > 0 and std.mem.startsWith(u8, cmd.ref, "refs/heads/")) {
+                app.db.setBranchTtl(app.io, name.full, cmd.ref, now + branch_ttl) catch |err| std.log.err("setting expiry of {s}: {t}", .{ cmd.ref, err });
+            }
         }
     }
 };

@@ -60,6 +60,13 @@ const schema =
     \\  detail TEXT NOT NULL DEFAULT '',
     \\  created_at INTEGER NOT NULL
     \\) STRICT;
+    \\CREATE TABLE IF NOT EXISTS branch_ttls (
+    \\  repo TEXT NOT NULL,
+    \\  ref TEXT NOT NULL,
+    \\  expires_at INTEGER NOT NULL,
+    \\  PRIMARY KEY (repo, ref)
+    \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS branch_ttls_due ON branch_ttls (expires_at);
     \\CREATE TABLE IF NOT EXISTS api_keys (
     \\  id INTEGER PRIMARY KEY,
     \\  key_hash TEXT NOT NULL UNIQUE,
@@ -276,6 +283,80 @@ pub const Db = struct {
         gpa.free(events);
     }
 
+    /// Sets (or replaces) when a branch expires.
+    pub fn setBranchTtl(db: *Db, io: Io, repo: []const u8, ref: []const u8, expires_at: i64) Error!void {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare("INSERT INTO branch_ttls (repo, ref, expires_at) VALUES (?1, ?2, ?3) ON CONFLICT (repo, ref) DO UPDATE SET expires_at = excluded.expires_at");
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        try db.bindText(stmt, 2, ref);
+        try db.check(sqlite3_bind_int64(stmt, 3, expires_at));
+        if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("set branch ttl");
+    }
+
+    /// Forgets a branch's expiry. An empty `ref` clears every branch in
+    /// the repo.
+    pub fn clearBranchTtl(db: *Db, io: Io, repo: []const u8, ref: []const u8) Error!void {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare("DELETE FROM branch_ttls WHERE repo = ?1 AND (?2 = '' OR ref = ?2)");
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        try db.bindText(stmt, 2, ref);
+        if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("clear branch ttl");
+    }
+
+    pub const BranchTtl = struct {
+        repo: []const u8,
+        ref: []const u8,
+        expires_at: i64,
+
+        pub fn deinit(t: BranchTtl, gpa: std.mem.Allocator) void {
+            gpa.free(t.repo);
+            gpa.free(t.ref);
+        }
+    };
+
+    /// Branch expiries, soonest first: those due by `due_by` (all repos),
+    /// or every one in `repo` when `repo` is not empty. Free with
+    /// `freeBranchTtls`.
+    pub fn listBranchTtls(db: *Db, io: Io, gpa: std.mem.Allocator, repo: []const u8, due_by: i64, limit: u32) Error![]BranchTtl {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare(
+            \\SELECT repo, ref, expires_at FROM branch_ttls
+            \\WHERE (?1 != '' AND repo = ?1) OR (?1 = '' AND expires_at <= ?2)
+            \\ORDER BY expires_at LIMIT ?3
+        );
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        try db.check(sqlite3_bind_int64(stmt, 2, due_by));
+        try db.check(sqlite3_bind_int64(stmt, 3, limit));
+        var list: std.ArrayList(BranchTtl) = .empty;
+        errdefer {
+            for (list.items) |t| t.deinit(gpa);
+            list.deinit(gpa);
+        }
+        while (true) switch (sqlite3_step(stmt)) {
+            SQLITE_ROW => {
+                const r = try columnText(stmt, 0, gpa);
+                errdefer gpa.free(r);
+                const ref = try columnText(stmt, 1, gpa);
+                errdefer gpa.free(ref);
+                try list.append(gpa, .{ .repo = r, .ref = ref, .expires_at = sqlite3_column_int64(stmt, 2) });
+            },
+            SQLITE_DONE => break,
+            else => return db.fail("list branch ttls"),
+        };
+        return list.toOwnedSlice(gpa);
+    }
+
+    pub fn freeBranchTtls(gpa: std.mem.Allocator, ttls: []const BranchTtl) void {
+        for (ttls) |t| t.deinit(gpa);
+        gpa.free(ttls);
+    }
+
     fn readEvent(stmt: *sqlite3_stmt, gpa: std.mem.Allocator) Error!Event {
         var texts: [6][]const u8 = undefined;
         var done: usize = 0;
@@ -392,6 +473,38 @@ test "events round-trip and filter by repo" {
     defer Db.freeEvents(gpa, only_ab);
     try std.testing.expectEqual(@as(usize, 1), only_ab.len);
     try std.testing.checkAllAllocationFailures(gpa, listEventsAndFree, .{ &db, io });
+}
+
+test "branch expiries" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var db: Db = try .open(":memory:");
+    defer db.close();
+    try db.setBranchTtl(io, "a/b", "refs/heads/x", 100);
+    try db.setBranchTtl(io, "a/b", "refs/heads/y", 50);
+    try db.setBranchTtl(io, "a/c", "refs/heads/z", 300);
+    try db.setBranchTtl(io, "a/b", "refs/heads/x", 200); // replaces
+
+    const due = try db.listBranchTtls(io, gpa, "", 200, 10);
+    defer Db.freeBranchTtls(gpa, due);
+    try std.testing.expectEqual(@as(usize, 2), due.len);
+    try std.testing.expectEqualStrings("refs/heads/y", due[0].ref);
+    try std.testing.expectEqual(@as(i64, 200), due[1].expires_at);
+
+    const in_repo = try db.listBranchTtls(io, gpa, "a/c", 0, 10);
+    defer Db.freeBranchTtls(gpa, in_repo);
+    try std.testing.expectEqual(@as(usize, 1), in_repo.len);
+
+    try db.clearBranchTtl(io, "a/b", "refs/heads/y");
+    try db.clearBranchTtl(io, "a/c", "");
+    const left = try db.listBranchTtls(io, gpa, "", 1000, 10);
+    defer Db.freeBranchTtls(gpa, left);
+    try std.testing.expectEqual(@as(usize, 1), left.len);
+    try std.testing.checkAllAllocationFailures(gpa, listTtlsAndFree, .{ &db, io });
+}
+
+fn listTtlsAndFree(gpa: std.mem.Allocator, db: *Db, io: Io) !void {
+    Db.freeBranchTtls(gpa, try db.listBranchTtls(io, gpa, "", 1000, 10));
 }
 
 fn listEventsAndFree(gpa: std.mem.Allocator, db: *Db, io: Io) !void {
