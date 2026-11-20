@@ -28,6 +28,32 @@ TOKEN=$(curl -s -X POST localhost:8080/v1/tokens -H "authorization: Bearer $KEY"
 git clone "http://t:$TOKEN@127.0.0.1:8080/acme/web.git"
 ```
 
+### In Docker
+
+```sh
+docker build -t gitd .
+docker run -d --name gitd -v gitd-data:/data -p 8080:8080 gitd
+KEY=$(docker exec gitd cat /data/admin-key)   # made on first start, kept in the volume
+```
+
+The container listens on 0.0.0.0:8080 with `/ui` off. To choose the admin key up front, pass
+`-e GITD_ADMIN_KEY=gitd_k_...` (any key `gitd admin create-key` printed); the container adds it
+on start.
+
+## Speed
+
+`python3 tests/bench/bench.py http://127.0.0.1:8080 "$KEY"` against the Docker image
+(Docker Desktop, 4 CPUs, arm64):
+
+| call | p50 | p95 |
+|---|---|---|
+| commit through the API | 6.7 ms | 7.3 ms |
+| commit, 16 agents at once (≈380 commits/s) | 41.6 ms | 56.5 ms |
+| git clone | 87.9 ms | 88.6 ms |
+| git push, one commit | 37.3 ms | 39.3 ms |
+| compare | 6.8 ms | 7.6 ms |
+| merge | 10.6 ms | 14.2 ms |
+
 ## API
 
 All `/v1` routes need `Authorization: Bearer <admin key>`. Per-repo routes (`/v1/repos/{ns}/{repo}/...`) also accept that repo's token as the Bearer value. `ref` is a branch name, a full ref, or a commit oid, and defaults to `main`. Errors look like `{"error":{"code":"...","message":"..."}}`.
@@ -89,7 +115,8 @@ Webhook deliveries are `POST`s of `{"delivery": id, "event": {...}}` with `x-git
 ## Development
 
 ```sh
-scripts/verify.sh   # the full gate; must print VERIFY PASSED (needs Java and tla2tools.jar, see tests/tla/commit_cas/check.sh)
+scripts/verify.sh         # the full gate; must print VERIFY PASSED (needs Java and tla2tools.jar, see tests/tla/commit_cas/check.sh)
+scripts/verify-linux.sh   # unit tests and e2e on Linux, in Docker
 ```
 
 See `AGENTS.md` and `RULES.md`.

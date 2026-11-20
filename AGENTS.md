@@ -26,6 +26,7 @@ zig build fmt         # format
 zig build fmt-check   # fail if anything is unformatted
 tests/e2e/run.sh      # end-to-end: real server, curl, and the real git client
 scripts/verify.sh     # the full gate: everything below, plus fuzzing
+scripts/verify-linux.sh  # unit tests and e2e on Linux in Docker; run it when touching files, processes, or sockets
 ```
 
 ## Layout

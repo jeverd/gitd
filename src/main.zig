@@ -11,6 +11,7 @@ const usage =
     \\usage:
     \\  gitd serve [--data DIR] [--listen HOST:PORT] [--ui]
     \\  gitd admin create-key [--data DIR]
+    \\  gitd admin add-key [--data DIR]    (reads a key made by create-key from stdin)
     \\
     \\  --data    data directory (env GITD_DATA, default ./data)
     \\  --listen  address to listen on (env GITD_LISTEN, default 127.0.0.1:8080)
@@ -63,6 +64,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     if (std.mem.eql(u8, command, "serve")) return serve(init, opts);
     if (std.mem.eql(u8, command, "admin") and std.mem.eql(u8, sub.?, "create-key")) return createKey(init, opts);
+    if (std.mem.eql(u8, command, "admin") and std.mem.eql(u8, sub.?, "add-key")) return addKey(init, opts);
     if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help")) {
         std.debug.print("{s}", .{usage});
         return 0;
@@ -115,6 +117,34 @@ fn createKey(init: std.process.Init, opts: Options) !u8 {
     var stdout = Io.File.stdout().writer(io, &buf);
     try stdout.interface.print("{s}\n", .{key});
     try stdout.interface.flush();
+    return 0;
+}
+
+/// Registers an admin key read from stdin, so a deployment can choose the
+/// key up front (a container's environment, say). The key is never an
+/// argument, where other processes could read it. Adding a key that is
+/// already there does nothing.
+fn addKey(init: std.process.Init, opts: Options) !u8 {
+    const io = init.io;
+    var buf: [256]u8 = undefined;
+    var stdin = Io.File.stdin().reader(io, &buf);
+    var text: [auth.key_len + 2]u8 = undefined;
+    const n = try stdin.interface.readSliceShort(&text);
+    const key = std.mem.trimEnd(u8, text[0..n], "\r\n");
+    if (!auth.isKey(key)) {
+        std.log.err("stdin is not an admin key: expected {s} and 64 lowercase hex digits", .{auth.key_prefix});
+        return 2;
+    }
+    const data = try store.DataDir.prepare(io, init.arena.allocator(), opts.data_dir);
+    var db: Db = try .open(data.db);
+    defer db.close();
+    const hash = auth.hashKey(key);
+    if (try db.apiKeyExists(io, &hash)) {
+        std.log.info("admin key already present", .{});
+        return 0;
+    }
+    try db.insertApiKey(io, &hash, server.unixNow(io));
+    std.log.info("admin key added", .{});
     return 0;
 }
 
