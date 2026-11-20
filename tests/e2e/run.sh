@@ -370,6 +370,38 @@ expect_eq "conflict leaves main alone" "$MAIN_BEFORE" "$(head_of main)"
 expect_eq "merge events" "3 1" "$(count_events kind=merge) $(count_events kind=merge_conflict)"
 expect_eq "limited token merges into its own branch" 201 "$(status -H "authorization: Bearer $LIM" -X POST "$CB/merges" -d '{"base":"agent/7/api","head":"main"}')"
 
+echo "== expiring branches"
+expires_of() { admin "$BASE/v1/repos/acme/other/branches" >/dev/null; python3 -c "import json; print(next((str(b['expires_at']) for b in json.load(open('$WORK/body'))['branches'] if b['name']=='$1'), 'gone'))"; }
+EXPIRED_BEFORE="$(count_events kind=branch_expired)"
+expect_eq "branch with ttl" 201 "$(admin -X POST "$CB/branches" -d '{"name":"ttl/api","from":"main","ttl_seconds":2}')"
+[[ "$(expires_of ttl/api)" =~ ^[0-9]+$ ]] || fail "branch list lacks expires_at"
+pass "branch list shows expires_at"
+expect_eq "commit creating a branch with ttl" 201 "$(admin -X POST "$CB/commits" -d '{"branch":"ttl/commit","expected_head":null,"from":"main","message":"m","ttl_seconds":2,"changes":[{"path":"t.txt","content":"t"}]}')"
+TTL_TOK="$(admin -X POST "$BASE/v1/tokens" -d '{"repo":"acme/other","scopes":["git:read","git:write"],"refs":["refs/heads/ttl/*","refs/heads/main"],"branch_ttl_seconds":2}' >/dev/null; json '["token"]')"
+git -C "$LREPO" fetch -q "$(url "$FULL_OTHER" acme/other)" main 2>/dev/null
+git -C "$LREPO" push -q "$(url "$TTL_TOK" acme/other)" FETCH_HEAD:refs/heads/ttl/push 2>"$WORK/err" || fail "push with ttl token: $(cat "$WORK/err")"
+[[ "$(expires_of ttl/push)" =~ ^[0-9]+$ ]] || fail "pushed branch has no expiry"
+pass "a branch created by push gets the token's ttl"
+expect_eq "existing branches gain no expiry" None "$(expires_of main)"
+expect_eq "branch deleted before it expires" 201 "$(admin -X POST "$CB/branches" -d '{"name":"ttl/gone","from":"main","ttl_seconds":2}')"
+expect_eq "delete it now" 204 "$(admin -X DELETE "$CB/branches/ttl/gone")"
+admin -X POST "$BASE/v1/repos" -d '{"name":"acme/doomed"}' >/dev/null
+DOOMED_TOK="$(mint acme/doomed '["git:read","git:write"]')"
+git -C "$LREPO" push -q "$(url "$DOOMED_TOK" acme/doomed)" FETCH_HEAD:refs/heads/main 2>/dev/null
+expect_eq "branch in a repo about to be deleted" 201 "$(admin -X POST "$BASE/v1/repos/acme/doomed/branches" -d '{"name":"soon","from":"main","ttl_seconds":2}')"
+expect_eq "delete that repo" 204 "$(admin -X DELETE "$BASE/v1/repos/acme/doomed")"
+for bad in '{"name":"ttl/bad","from":"main","ttl_seconds":0}' '{"name":"ttl/bad","from":"main","ttl_seconds":604801}'; do
+  expect_eq "invalid ttl rejected" 400 "$(admin -X POST "$CB/branches" -d "$bad")"
+done
+expect_eq "ttl with expected_head rejected" 400 "$(admin -X POST "$CB/commits" -d "{\"branch\":\"main\",\"expected_head\":\"$(head_of main)\",\"message\":\"m\",\"ttl_seconds\":5,\"changes\":[{\"path\":\"a\",\"content\":\"a\"}]}")"
+expect_eq "invalid token branch_ttl_seconds" 400 "$(admin -X POST "$BASE/v1/tokens" -d '{"repo":"acme/other","scopes":["git:write"],"branch_ttl_seconds":-1}')"
+sleep 4
+expect_eq "api branch expired" gone "$(expires_of ttl/api)"
+expect_eq "commit-created branch expired" gone "$(expires_of ttl/commit)"
+expect_eq "pushed branch expired" gone "$(expires_of ttl/push)"
+expect_eq "main survives" None "$(expires_of main)"
+expect_eq "three expiries logged" "$((EXPIRED_BEFORE + 3))" "$(count_events kind=branch_expired)"
+
 echo "== protocol hardening"
 expect_eq "dumb protocol HEAD" 400 "$(status -u "t:$RO" "$BASE/acme/web.git/HEAD")"
 expect_eq "dumb protocol objects" 400 "$(status -u "t:$RO" "$BASE/acme/web.git/objects/info/packs")"
@@ -568,7 +600,7 @@ expect_eq "UI page served" 200 "$(status "$BASE/ui")"
 grep -q "<title>gitd</title>" "$WORK/body" || fail "UI page content"
 expect_eq "UI state" 200 "$(status "$BASE/ui/api/state")"
 expect_eq "UI state lists both repos" 2 "$(json '["repos"].__len__()')"
-expect_eq "repo_created events" 3 "$(count_events kind=repo_created)"
+expect_eq "repo_created events" 4 "$(count_events kind=repo_created)"
 expect_eq "repo_deleted event" 1 "$(count_events kind=repo_deleted repo=acme/web)"
 expect_eq "first push recorded with its commit" 1 "$(count_events kind=push repo=acme/web ref=refs/heads/main detail=created)"
 AGENT_PUSHES="$(events; python3 -c "import json; print(sum(1 for e in json.load(open('$WORK/body'))['events'] if e['kind']=='push' and e['repo']=='acme/web' and e['ref'].startswith('refs/heads/agent/')))")"
@@ -606,6 +638,7 @@ expect_eq "no UI without --ui" 404 "$(status "http://127.0.0.1:$NOUI_PORT/ui")"
 kill -TERM "$NOUI"; wait "$NOUI" || true
 
 echo "== restart keeps data and secret"
+expect_eq "branch that expires across a restart" 201 "$(admin -X POST "$BASE/v1/repos/acme/other/branches" -d '{"name":"ttl/restart","from":"main","ttl_seconds":3}')"
 # Stop while a slow clone is mid-transfer: gitd must still exit promptly and
 # take its git processes with it.
 head -c 4000000 /dev/urandom >"$SRC/big2.bin"
@@ -628,6 +661,8 @@ expect_eq "list after restart" 200 "$(admin "$BASE/v1/repos")"
 expect_eq "repos survive restart" 2 "$(json '["repos"].__len__()')"
 git ls-remote "$(url "$RW" acme/web)" >/dev/null 2>"$WORK/err" || fail "token from before restart: $(cat "$WORK/err")"
 pass "token minted before restart still works"
+sleep 4
+expect_eq "expiry survives a restart" gone "$(expires_of ttl/restart)"
 stop_server
 
 echo "== server log is clean"

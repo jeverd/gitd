@@ -38,14 +38,14 @@ All `/v1` routes need `Authorization: Bearer <admin key>`. Per-repo routes (`/v1
 | `GET /v1/repos` | List repos |
 | `GET /v1/repos/{ns}/{repo}` | Get one repo |
 | `DELETE /v1/repos/{ns}/{repo}` | Delete a repo and its files. Its tokens stop working |
-| `POST /v1/tokens` `{"repo","scopes","ttl_seconds","refs"}` | Mint a repo token. `refs` (optional, up to 4) limits which refs it may write, like `["refs/heads/agent/7/*"]` |
+| `POST /v1/tokens` `{"repo","scopes","ttl_seconds","refs","branch_ttl_seconds"}` | Mint a repo token. `refs` (optional, up to 4) limits which refs it may write, like `["refs/heads/agent/7/*"]`. With `branch_ttl_seconds`, branches it creates by push are deleted after that long |
 | `GET /v1/repos/{ns}/{repo}/branches` | Branches with their commits |
 | `GET /v1/repos/{ns}/{repo}/files/{path}?ref=` | Raw file contents (up to 10 MiB) |
 | `GET /v1/repos/{ns}/{repo}/tree[/{path}]?ref=` | Directory listing |
 | `GET /v1/repos/{ns}/{repo}/log?ref=&limit=&path=` | Commits, newest first |
 | `GET /v1/repos/{ns}/{repo}/commits/{sha}` | One commit |
 | `POST /v1/repos/{ns}/{repo}/commits` | Commit file changes to a branch. Send `expected_head` (the commit you built on, or `null` for a new branch); if the branch moved, you get 409 with `current_head` |
-| `POST /v1/repos/{ns}/{repo}/branches` `{"name","from"}` | Create a branch (409 if it exists) |
+| `POST /v1/repos/{ns}/{repo}/branches` `{"name","from","ttl_seconds"}` | Create a branch (409 if it exists); with `ttl_seconds` it is deleted after that long. Commits that create a branch take `ttl_seconds` too |
 | `DELETE /v1/repos/{ns}/{repo}/branches/{name}?expected=` | Delete a branch, optionally only if it is at `expected` |
 | `GET /v1/repos/{ns}/{repo}/compare/{base}...{head}` | Ahead/behind, changed files, and the patch (up to 1 MiB) |
 | `POST /v1/repos/{ns}/{repo}/merges` `{"base","head","strategy"}` | Merge `head` into `base`: fast-forward when possible, else a merge commit (`merge`) or one squashed commit (`squash`). Conflicts give 409 with the paths |
@@ -65,7 +65,7 @@ Repo names are `ns/repo`: lowercase letters, digits, `.`, `_`, `-`, up to 64 cha
   4. ✅ Read files, folders, history without cloning
   5. ✅ Commit through the API, with a 409 when two agents race (TLA+ model in `tests/tla/commit_cas`)
   6. ✅ Diff and merge branches
-  7. Branches that delete themselves after a set time
+  7. ✅ Branches that delete themselves after a set time
   8. Webhooks on push
 - **Done when:** 5 fake agents work on separate branches at once, one is blocked from pushing to `main`, the winner is merged, and the rest expire.
 

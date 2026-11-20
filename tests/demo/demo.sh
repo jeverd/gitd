@@ -6,6 +6,7 @@
 #   tests/demo/demo.sh seed REPO             push a small app to main
 #   tests/demo/demo.sh agent N REPO [BRANCH] clone, change a file, push (default branch agent/N/work)
 #                                            with a token limited to refs/heads/agent/N/*
+#                                            (AGENT_TTL=SECONDS: its new branches expire)
 #   tests/demo/demo.sh head REPO BRANCH      print a branch's commit
 #   tests/demo/demo.sh race REPO BRANCH N    N agents commit to BRANCH at once via the API
 #   tests/demo/demo.sh merge REPO BASE HEAD [merge|squash|fast-forward]
@@ -63,7 +64,9 @@ case "$cmd" in
   agent)
     n="$1"; repo="$2"; branch="${3:-agent/$n/work}"
     # Each agent may only write under refs/heads/agent/N/.
-    tok="${AGENT_TOKEN:-$(token "$repo" '["git:read","git:write"]' "\"refs\":[\"refs/heads/agent/$n/*\"]")}"
+    # With AGENT_TTL set, branches the agent creates expire after that many seconds.
+    extra="\"refs\":[\"refs/heads/agent/$n/*\"]${AGENT_TTL:+,\"branch_ttl_seconds\":$AGENT_TTL}"
+    tok="${AGENT_TOKEN:-$(token "$repo" '["git:read","git:write"]' "$extra")}"
     dir="$DEMO_DIR/agent$n"
     rm -rf "$dir"; git clone -q "$(url "$tok" "$repo")" "$dir"
     printf 'body.dark { background: black; color: white; } /* agent %s */\n' "$n" >>"$dir/style.css"

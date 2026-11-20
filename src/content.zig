@@ -35,6 +35,8 @@ const repo_git = @import("repo_git.zig");
 const receive_pack = @import("receive_pack.zig");
 const events = @import("events.zig");
 const http_util = @import("http_util.zig");
+const expiry = @import("expiry.zig");
+const Db = @import("db.zig").Db;
 
 const max_file_bytes = 10 * 1024 * 1024;
 const max_commit_body = 16 * 1024 * 1024;
@@ -78,7 +80,7 @@ pub fn serve(
 
     if (method == .GET) {
         if (!access.canRead()) return api.respondError(request, .forbidden, "forbidden", "this token lacks git:read");
-        if (std.mem.eql(u8, rest, "branches")) return listBranches(app, request, &repo);
+        if (std.mem.eql(u8, rest, "branches")) return listBranches(app, request, &repo, name);
         if (std.mem.startsWith(u8, rest, "files/")) return readFile(app, request, &repo, rest["files/".len..], query);
         if (std.mem.eql(u8, rest, "tree")) return readTree(app, request, &repo, null, query);
         if (std.mem.startsWith(u8, rest, "tree/")) return readTree(app, request, &repo, rest["tree/".len..], query);
@@ -157,14 +159,41 @@ fn gitError(request: *http.Server.Request, err: anyerror) Error!http.Status {
 
 // ---- Reads ----
 
-fn listBranches(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo) Error!http.Status {
+pub const BranchJson = struct { name: []const u8, commit: []const u8, committed_at: i64, subject: []const u8, expires_at: ?i64 };
+
+/// Every branch in `repo` with its expiry, if any. Strings borrow
+/// `branches` and `ttls`; the caller frees the result.
+pub fn branchesWithExpiry(gpa: std.mem.Allocator, branches: repo_git.Repo.Branches, ttls: []const Db.BranchTtl) ![]BranchJson {
+    const items = try gpa.alloc(BranchJson, branches.items.len);
+    for (branches.items, items) |b, *i| {
+        var expires_at: ?i64 = null;
+        for (ttls) |t| {
+            if (std.mem.startsWith(u8, t.ref, "refs/heads/") and std.mem.eql(u8, t.ref["refs/heads/".len..], b.name)) expires_at = t.expires_at;
+        }
+        i.* = .{ .name = b.name, .commit = b.commit, .committed_at = b.committed_at, .subject = b.subject, .expires_at = expires_at };
+    }
+    return items;
+}
+
+fn listBranches(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, name: repo_name.Name) Error!http.Status {
     const branches = repo.listBranches() catch |err| return gitError(request, err);
     defer branches.deinit(app.gpa);
-    const Item = struct { name: []const u8, commit: []const u8, committed_at: i64, subject: []const u8 };
-    const items = app.gpa.alloc(Item, branches.items.len) catch return api.internal(request);
+    const ttls = app.db.listBranchTtls(app.io, app.gpa, name.full, 0, 10_000) catch return api.internal(request);
+    defer Db.freeBranchTtls(app.gpa, ttls);
+    const items = branchesWithExpiry(app.gpa, branches, ttls) catch return api.internal(request);
     defer app.gpa.free(items);
-    for (branches.items, items) |b, *i| i.* = .{ .name = b.name, .commit = b.commit, .committed_at = b.committed_at, .subject = b.subject };
     return api.respondJson(app.gpa, request, .ok, .{ .branches = items });
+}
+
+/// Validates an optional `ttl_seconds` and records the expiry of `ref`.
+fn ttlInvalid(ttl: ?i64) bool {
+    const t = ttl orelse return false;
+    return t < 1 or t > expiry.max_ttl_seconds;
+}
+
+fn setTtl(app: *server.App, name: repo_name.Name, ref: []const u8, ttl: ?i64) void {
+    const t = ttl orelse return;
+    app.db.setBranchTtl(app.io, name.full, ref, api.unixNow(app.io) + t) catch |err| std.log.err("setting expiry of {s}: {t}", .{ ref, err });
 }
 
 fn readFile(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, raw_path: []const u8, query: []const u8) Error!http.Status {
@@ -316,6 +345,8 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
         message: []const u8,
         author: ?AuthorJson = null,
         changes: []const ChangeJson,
+        /// When creating the branch: delete it after this many seconds.
+        ttl_seconds: ?i64 = null,
     };
     var parsed = api.readJsonLimit(Body, app.gpa, request, max_commit_body) catch |err| return api.respondBodyError(request, err);
     defer parsed.deinit();
@@ -327,6 +358,8 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
     if (!access.canWrite(ref)) return forbiddenRef(request, ref);
     if (body.message.len == 0 or body.message.len > max_message) return api.respondError(request, .bad_request, "invalid_message", "message must be 1-65536 bytes");
     if (body.changes.len == 0 or body.changes.len > max_changes) return api.respondError(request, .bad_request, "invalid_changes", "give 1-100 changes");
+    if (ttlInvalid(body.ttl_seconds)) return api.respondError(request, .bad_request, "invalid_ttl", "ttl_seconds must be 1-604800");
+    if (body.ttl_seconds != null and body.expected_head != null) return api.respondError(request, .bad_request, "invalid_ttl", "ttl_seconds applies only when creating a branch (expected_head null)");
     const author: repo_git.Repo.Author = if (body.author) |a| blk: {
         if (!validAuthorField(a.name) or !validAuthorField(a.email)) return api.respondError(request, .bad_request, "invalid_author", "author name and email must be 1-200 plain characters");
         break :blk .{ .name = a.name, .email = a.email };
@@ -367,6 +400,7 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
     const outcome = repo.updateRef(ref, sha, body.expected_head) catch |err| return gitError(request, err);
     if (outcome == .stale) return staleHead(app, request, repo, name, ref, body.expected_head);
 
+    setTtl(app, name, ref, body.ttl_seconds);
     const subject = body.message[0 .. std.mem.findScalar(u8, body.message, '\n') orelse body.message.len];
     events.record(app, .{
         .repo = name.full,
@@ -402,13 +436,14 @@ fn staleHead(app: *server.App, request: *http.Server.Request, repo: *const repo_
 }
 
 fn createBranch(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, name: repo_name.Name, access: Access) Error!http.Status {
-    const Body = struct { name: []const u8, from: []const u8 = "main" };
+    const Body = struct { name: []const u8, from: []const u8 = "main", ttl_seconds: ?i64 = null };
     var parsed = api.readJson(Body, app.gpa, request) catch |err| return api.respondBodyError(request, err);
     defer parsed.deinit();
     var ref_buf: [ref_name.max_len]u8 = undefined;
     const ref = ref_name.validateBranch(parsed.value.name, &ref_buf) catch
         return api.respondError(request, .bad_request, "invalid_branch", "name must be a valid branch name like agent/3/try-2");
     if (!access.canWrite(ref)) return forbiddenRef(request, ref);
+    if (ttlInvalid(parsed.value.ttl_seconds)) return api.respondError(request, .bad_request, "invalid_ttl", "ttl_seconds must be 1-604800");
     var full: [ref_name.max_len]u8 = undefined;
     const rev = revFromName(parsed.value.from, &full) orelse return api.respondError(request, .bad_request, "invalid_ref", "from must be a branch name, a full ref, or a commit oid");
     var oid_buf: [64]u8 = undefined;
@@ -416,6 +451,7 @@ fn createBranch(app: *server.App, request: *http.Server.Request, repo: *const re
         return api.respondError(request, .not_found, "not_found", "from names no commit");
     const outcome = repo.updateRef(ref, commit, null) catch |err| return gitError(request, err);
     if (outcome == .stale) return api.respondError(request, .conflict, "already_exists", "that branch already exists");
+    setTtl(app, name, ref, parsed.value.ttl_seconds);
     events.record(app, .{ .repo = name.full, .kind = "branch_created", .ref = ref, .new = commit, .created_at = api.unixNow(app.io) });
     return api.respondJson(app.gpa, request, .created, .{ .name = parsed.value.name, .commit = commit });
 }
@@ -437,6 +473,7 @@ fn deleteBranch(app: *server.App, request: *http.Server.Request, repo: *const re
         return api.respondError(request, .not_found, "not_found", "no such branch");
     const outcome = repo.updateRef(ref, null, expected) catch |err| return gitError(request, err);
     if (outcome == .stale) return api.respondError(request, .conflict, "stale_head", "the branch is not at the expected commit");
+    app.db.clearBranchTtl(app.io, name.full, ref) catch |err| std.log.err("clearing expiry of {s}: {t}", .{ ref, err });
     events.record(app, .{ .repo = name.full, .kind = "branch_deleted", .ref = ref, .old = current, .created_at = api.unixNow(app.io) });
     try request.respond("", .{ .status = .no_content, .keep_alive = http_util.keepAlive(request) });
     return .no_content;

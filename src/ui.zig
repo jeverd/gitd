@@ -14,6 +14,7 @@ const server = @import("server.zig");
 const repo_name = @import("repo_name.zig");
 const repo_git = @import("repo_git.zig");
 const Db = @import("db.zig").Db;
+const content = @import("content.zig");
 
 const page = @embedFile("ui.html");
 const max_events = 500;
@@ -43,16 +44,9 @@ pub fn serve(app: *server.App, request: *http.Server.Request, path: []const u8, 
     return api.respondError(request, .not_found, "not_found", "no such UI route");
 }
 
-const BranchJson = struct {
-    name: []const u8,
-    commit: []const u8,
-    committed_at: i64,
-    subject: []const u8,
-};
-
 const RepoJson = struct {
     name: []const u8,
-    branches: []const BranchJson,
+    branches: []const content.BranchJson,
 };
 
 fn state(app: *server.App, request: *http.Server.Request) api.HandleError!http.Status {
@@ -71,8 +65,8 @@ fn state(app: *server.App, request: *http.Server.Request) api.HandleError!http.S
             // The repo may be mid-delete; show it without branches.
             else => repo_git.Repo.Branches{ .raw = &.{}, .items = &.{} },
         };
-        const items = arena.alloc(BranchJson, branches.items.len) catch return api.internal(request);
-        for (branches.items, items) |b, *j| j.* = .{ .name = b.name, .commit = b.commit, .committed_at = b.committed_at, .subject = b.subject };
+        const ttls = app.db.listBranchTtls(app.io, arena, repo.name, 0, 10_000) catch return api.internal(request);
+        const items = content.branchesWithExpiry(arena, branches, ttls) catch return api.internal(request);
         item.* = .{ .name = repo.name, .branches = items };
     }
     return api.respondJson(app.gpa, request, .ok, .{ .now = api.unixNow(app.io), .repos = out });

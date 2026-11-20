@@ -191,4 +191,5 @@ test {
     _ = @import("api.zig");
     _ = @import("repo_path.zig");
     _ = @import("content.zig");
+    _ = @import("expiry.zig");
 }

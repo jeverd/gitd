@@ -82,6 +82,9 @@ pub const Claims = struct {
     refs_buf: [max_ref_patterns_bytes]u8 = undefined,
     refs_ends: [max_ref_patterns]u16 = undefined,
     refs_count: usize = 0,
+    /// Seconds a branch created by a push with this token lives before
+    /// gitd deletes it. Zero means such branches do not expire.
+    branch_ttl: u32 = 0,
 
     pub fn repo(c: *const Claims) []const u8 {
         return c.repo_buf[0..c.repo_len];
@@ -128,6 +131,7 @@ const Payload = struct {
     scopes: []const []const u8,
     exp: i64,
     refs: []const []const u8 = &.{},
+    bttl: u32 = 0,
 };
 
 pub const VerifyError = error{ InvalidToken, ExpiredToken };
@@ -153,6 +157,7 @@ pub fn mint(secret: *const Secret, claims: *const Claims, out: *[max_token_len]u
         .scopes = names[0..count],
         .exp = claims.expires_at,
         .refs = refs[0..claims.refs_count],
+        .bttl = claims.branch_ttl,
     };
 
     var json_buf: [1400]u8 = undefined;
@@ -209,6 +214,7 @@ pub fn verify(secret: *const Secret, token: []const u8, now: i64) VerifyError!Cl
     }
     var claims = Claims.init(payload.repo, payload.rid, scopes, payload.exp) catch return error.InvalidToken;
     for (payload.refs) |pattern| claims.addRefPattern(pattern) catch return error.InvalidToken;
+    claims.branch_ttl = payload.bttl;
     if (now >= claims.expires_at) return error.ExpiredToken;
     return claims;
 }
@@ -364,6 +370,10 @@ test "ref patterns survive mint and verify, and limit writes" {
     try std.testing.expect(got.allowsRef("refs/tags/v1"));
     try std.testing.expect(!got.allowsRef("refs/heads/main"));
     try std.testing.expect(!got.allowsRef("refs/heads/agent/70/x"));
+    try std.testing.expectEqual(@as(u32, 0), got.branch_ttl);
+    var with_ttl = claims;
+    with_ttl.branch_ttl = 90;
+    try std.testing.expectEqual(@as(u32, 90), (try verify(&test_secret, try mint(&test_secret, &with_ttl, &buf), 0)).branch_ttl);
 
     try std.testing.expectError(error.InvalidRefPattern, claims.addRefPattern("main"));
     try claims.addRefPattern("refs/heads/a");
