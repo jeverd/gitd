@@ -47,6 +47,8 @@ All `/v1` routes need `Authorization: Bearer <admin key>`. Per-repo routes (`/v1
 | `POST /v1/repos/{ns}/{repo}/commits` | Commit file changes to a branch. Send `expected_head` (the commit you built on, or `null` for a new branch); if the branch moved, you get 409 with `current_head` |
 | `POST /v1/repos/{ns}/{repo}/branches` `{"name","from"}` | Create a branch (409 if it exists) |
 | `DELETE /v1/repos/{ns}/{repo}/branches/{name}?expected=` | Delete a branch, optionally only if it is at `expected` |
+| `GET /v1/repos/{ns}/{repo}/compare/{base}...{head}` | Ahead/behind, changed files, and the patch (up to 1 MiB) |
+| `POST /v1/repos/{ns}/{repo}/merges` `{"base","head","strategy"}` | Merge `head` into `base`: fast-forward when possible, else a merge commit (`merge`) or one squashed commit (`squash`). Conflicts give 409 with the paths |
 | `GET /healthz` | Liveness, no auth |
 | `GET /ui` | Live activity page: repos, branches, and every push. Only with `gitd serve --ui`, only from this machine |
 | `/{ns}/{repo}.git/...` | git smart HTTP. The token goes in the password: `http://t:<token>@host/...` |
@@ -62,7 +64,7 @@ Repo names are `ns/repo`: lowercase letters, digits, `.`, `_`, `-`, up to 64 cha
   3. ✅ Tokens: short-lived, limited to ref patterns
   4. ✅ Read files, folders, history without cloning
   5. ✅ Commit through the API, with a 409 when two agents race (TLA+ model in `tests/tla/commit_cas`)
-  6. Diff and merge branches
+  6. ✅ Diff and merge branches
   7. Branches that delete themselves after a set time
   8. Webhooks on push
 - **Done when:** 5 fake agents work on separate branches at once, one is blocked from pushing to `main`, the winner is merged, and the rest expire.

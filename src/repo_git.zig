@@ -292,16 +292,33 @@ pub const Repo = struct {
         defer r.gpa.free(tree_raw);
         const tree = std.mem.trimEnd(u8, tree_raw, "\n");
 
+        const parents: []const []const u8 = if (parent) |p| &.{p} else &.{};
+        return r.commitTree(tree, parents, message, author, out);
+    }
+
+    /// Writes a commit of `tree` with `parents` and returns its oid.
+    pub fn commitTree(r: *const Repo, tree: []const u8, parents: []const []const u8, message: []const u8, author: Author, out: *[64]u8) git_cmd.Error![]const u8 {
         const ident_env = [_][2][]const u8{
             .{ "GIT_AUTHOR_NAME", author.name },
             .{ "GIT_AUTHOR_EMAIL", author.email },
             .{ "GIT_COMMITTER_NAME", "gitd" },
             .{ "GIT_COMMITTER_EMAIL", "gitd@localhost" },
         };
-        const commit_raw = if (parent) |p|
-            try r.gitOutput(&.{ "commit-tree", tree, "-p", p, "-F", "-" }, .{ .env = &ident_env, .stdin = message })
-        else
-            try r.gitOutput(&.{ "commit-tree", tree, "-F", "-" }, .{ .env = &ident_env, .stdin = message });
+        var args: [8][]const u8 = undefined;
+        var n: usize = 0;
+        args[n] = "commit-tree";
+        n += 1;
+        args[n] = tree;
+        n += 1;
+        for (parents) |p| {
+            args[n] = "-p";
+            args[n + 1] = p;
+            n += 2;
+        }
+        args[n] = "-F";
+        args[n + 1] = "-";
+        n += 2;
+        const commit_raw = try r.gitOutput(args[0..n], .{ .env = &ident_env, .stdin = message });
         defer r.gpa.free(commit_raw);
         const sha = std.mem.trimEnd(u8, commit_raw, "\n");
         if (sha.len > out.len) return error.GitFailed;
@@ -336,5 +353,138 @@ pub const Repo = struct {
         if (!matches) return .stale;
         std.log.err("git update-ref {s} failed: {s}", .{ ref, std.mem.trimEnd(u8, result.stderr, "\n") });
         return error.GitFailed;
+    }
+
+    /// The best common ancestor of two commits, or null if they share none.
+    pub fn mergeBase(r: *const Repo, a: []const u8, b: []const u8, out: *[64]u8) git_cmd.Error!?[]const u8 {
+        const result = try r.git(&.{ "merge-base", "--end-of-options", a, b }, .{});
+        defer result.deinit(r.gpa);
+        if (result.code != 0) return null;
+        const oid = std.mem.trimEnd(u8, result.stdout, "\n");
+        if (oid.len > out.len) return error.GitFailed;
+        @memcpy(out[0..oid.len], oid);
+        return out[0..oid.len];
+    }
+
+    /// Whether `ancestor` is reachable from `descendant` (or equal to it).
+    pub fn isAncestor(r: *const Repo, ancestor: []const u8, descendant: []const u8) git_cmd.Error!bool {
+        const result = try r.git(&.{ "merge-base", "--is-ancestor", "--end-of-options", ancestor, descendant }, .{});
+        defer result.deinit(r.gpa);
+        return switch (result.code) {
+            0 => true,
+            1 => false,
+            else => error.GitFailed,
+        };
+    }
+
+    /// Commits only in `head` (ahead) and only in `base` (behind).
+    pub fn aheadBehind(r: *const Repo, base: []const u8, head: []const u8) git_cmd.Error!struct { ahead: u64, behind: u64 } {
+        var range_buf: [140]u8 = undefined;
+        const range = std.mem.print(&range_buf, "{s}...{s}", .{ base, head }) catch return error.GitFailed;
+        const raw = try r.gitOutput(&.{ "rev-list", "--left-right", "--count", "--end-of-options", range }, .{});
+        defer r.gpa.free(raw);
+        var it = std.mem.tokenizeAny(u8, raw, "\t \n");
+        const behind = std.fmt.parseInt(u64, it.next() orelse return error.GitFailed, 10) catch return error.GitFailed;
+        const ahead = std.fmt.parseInt(u64, it.next() orelse return error.GitFailed, 10) catch return error.GitFailed;
+        return .{ .ahead = ahead, .behind = behind };
+    }
+
+    /// Flags for every diff gitd runs: no external diff or textconv
+    /// programs (R2.4), no color, no rename detection.
+    const diff_flags = [_][]const u8{ "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames" };
+
+    pub const FileChange = struct {
+        /// Slices borrow `FileChanges.raw_*`.
+        path: []const u8,
+        status: []const u8,
+        /// Null for binary files.
+        additions: ?u64,
+        deletions: ?u64,
+    };
+
+    pub const FileChanges = struct {
+        raw_status: []u8,
+        raw_numstat: []u8,
+        items: []FileChange,
+
+        pub fn deinit(f: FileChanges, gpa: std.mem.Allocator) void {
+            gpa.free(f.items);
+            gpa.free(f.raw_status);
+            gpa.free(f.raw_numstat);
+        }
+    };
+
+    /// Files that differ between commits `from` and `to`.
+    pub fn diffFiles(r: *const Repo, from: []const u8, to: []const u8) git_cmd.Error!FileChanges {
+        const raw_status = try r.gitOutput(&(.{ "diff", "--name-status", "-z" } ++ diff_flags ++ .{ "--end-of-options", from, to }), .{});
+        errdefer r.gpa.free(raw_status);
+        const raw_numstat = try r.gitOutput(&(.{ "diff", "--numstat", "-z" } ++ diff_flags ++ .{ "--end-of-options", from, to }), .{});
+        errdefer r.gpa.free(raw_numstat);
+
+        var list: std.ArrayList(FileChange) = .empty;
+        errdefer list.deinit(r.gpa);
+        var it = std.mem.splitScalar(u8, raw_status, 0);
+        while (it.next()) |status| {
+            if (status.len == 0) break;
+            const path = it.next() orelse break;
+            try list.append(r.gpa, .{ .path = path, .status = status, .additions = null, .deletions = null });
+        }
+        // numstat -z: "<add>\t<del>\t<path>\0", in the same order.
+        var nit = std.mem.splitScalar(u8, raw_numstat, 0);
+        var i: usize = 0;
+        while (nit.next()) |rec| : (i += 1) {
+            if (rec.len == 0 or i >= list.items.len) break;
+            var f = std.mem.splitScalar(u8, rec, '\t');
+            list.items[i].additions = std.fmt.parseInt(u64, f.next() orelse "-", 10) catch null;
+            list.items[i].deletions = std.fmt.parseInt(u64, f.next() orelse "-", 10) catch null;
+        }
+        return .{ .raw_status = raw_status, .raw_numstat = raw_numstat, .items = try list.toOwnedSlice(r.gpa) };
+    }
+
+    /// The unified diff from `from` to `to`, or null if it exceeds `max`.
+    pub fn diffPatch(r: *const Repo, from: []const u8, to: []const u8, max: usize) git_cmd.Error!?[]u8 {
+        return r.gitOutput(&(.{"diff"} ++ diff_flags ++ .{ "--end-of-options", from, to }), .{ .max_output = max }) catch |err| switch (err) {
+            error.OutputTooLarge => null,
+            else => |e| e,
+        };
+    }
+
+    pub const MergeTree = union(enum) {
+        /// The merged tree's oid, written into the caller's buffer.
+        clean: []const u8,
+        /// Conflicted paths; the caller frees `raw`.
+        conflicts: struct { raw: []u8, paths: [][]const u8 },
+    };
+
+    /// Merges `ours` and `theirs` without a work tree (`git merge-tree
+    /// --write-tree`). The caller frees `.conflicts.raw` and `.paths`.
+    pub fn mergeTree(r: *const Repo, ours: []const u8, theirs: []const u8, tree_out: *[64]u8) git_cmd.Error!MergeTree {
+        const result = try r.git(&.{ "merge-tree", "--write-tree", "--name-only", "-z", "--end-of-options", ours, theirs }, .{});
+        errdefer r.gpa.free(result.stdout);
+        defer r.gpa.free(result.stderr);
+        // Output: <tree>\0, then on conflict <path>\0 ... \0\0 and messages.
+        var it = std.mem.splitScalar(u8, result.stdout, 0);
+        const tree = it.next() orelse return error.GitFailed;
+        switch (result.code) {
+            0 => {
+                if (tree.len > tree_out.len) return error.GitFailed;
+                @memcpy(tree_out[0..tree.len], tree);
+                r.gpa.free(result.stdout);
+                return .{ .clean = tree_out[0..tree.len] };
+            },
+            1 => {
+                var paths: std.ArrayList([]const u8) = .empty;
+                errdefer paths.deinit(r.gpa);
+                while (it.next()) |p| {
+                    if (p.len == 0) break;
+                    try paths.append(r.gpa, p);
+                }
+                return .{ .conflicts = .{ .raw = result.stdout, .paths = try paths.toOwnedSlice(r.gpa) } };
+            },
+            else => {
+                std.log.err("git merge-tree exited {d}: {s}", .{ result.code, std.mem.trimEnd(u8, result.stderr, "\n") });
+                return error.GitFailed;
+            },
+        }
     }
 };

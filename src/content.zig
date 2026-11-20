@@ -7,12 +7,14 @@
 //!   GET tree[/{path}]?ref=REF       directory listing
 //!   GET log?ref=REF&limit=N&path=P  commits, newest first
 //!   GET commits/{sha}
+//!   GET compare/{base}...{head}     ahead/behind, changed files, patch
 //!
 //! Writes (admin key, or a repo token with git:write whose ref patterns
 //! cover the branch):
 //!   POST   commits              {"branch", "expected_head", "message", "changes", ...}
 //!   POST   branches             {"name", "from"}
 //!   DELETE branches/{name}?expected=SHA
+//!   POST   merges               {"base", "head", "strategy", "expected_base_head", ...}
 //!
 //! Every ref change is a compare-and-swap (R3.2): a commit names the head
 //! it was built on, and loses with 409 if the branch moved.
@@ -38,6 +40,7 @@ const max_file_bytes = 10 * 1024 * 1024;
 const max_commit_body = 16 * 1024 * 1024;
 const max_changes = 100;
 const max_message = 64 * 1024;
+const max_patch_bytes = 1024 * 1024;
 const default_log_limit = 50;
 const max_log_limit = 500;
 
@@ -81,7 +84,9 @@ pub fn serve(
         if (std.mem.startsWith(u8, rest, "tree/")) return readTree(app, request, &repo, rest["tree/".len..], query);
         if (std.mem.eql(u8, rest, "log")) return readLog(app, request, &repo, query);
         if (std.mem.startsWith(u8, rest, "commits/")) return readCommit(app, request, &repo, rest["commits/".len..]);
+        if (std.mem.startsWith(u8, rest, "compare/")) return compare(app, request, &repo, rest["compare/".len..]);
     }
+    if (method == .POST and std.mem.eql(u8, rest, "merges")) return merge(app, request, &repo, name, access);
     if (method == .POST and std.mem.eql(u8, rest, "commits")) return createCommit(app, request, &repo, name, access);
     if (method == .POST and std.mem.eql(u8, rest, "branches")) return createBranch(app, request, &repo, name, access);
     if (method == .DELETE and std.mem.startsWith(u8, rest, "branches/")) return deleteBranch(app, request, &repo, name, rest["branches/".len..], query, access);
@@ -435,6 +440,147 @@ fn deleteBranch(app: *server.App, request: *http.Server.Request, repo: *const re
     events.record(app, .{ .repo = name.full, .kind = "branch_deleted", .ref = ref, .old = current, .created_at = api.unixNow(app.io) });
     try request.respond("", .{ .status = .no_content, .keep_alive = http_util.keepAlive(request) });
     return .no_content;
+}
+
+// ---- Diff and merge ----
+
+/// Resolves a branch name, full ref, or oid to a commit; responds with
+/// 400/404 and returns null when it cannot.
+fn resolveNamed(request: *http.Server.Request, repo: *const repo_git.Repo, text: []const u8, what: []const u8, out: *[64]u8) Error!?[]const u8 {
+    var full: [ref_name.max_len]u8 = undefined;
+    const rev = revFromName(text, &full) orelse {
+        var buf: [96]u8 = undefined;
+        _ = try api.respondError(request, .bad_request, "invalid_ref", std.mem.print(&buf, "{s} must be a branch name, a full ref, or a commit oid", .{what}) catch "invalid ref");
+        return null;
+    };
+    const commit = repo.resolveCommit(rev, out) catch |err| {
+        _ = try gitError(request, err);
+        return null;
+    };
+    return commit orelse {
+        var buf: [64]u8 = undefined;
+        _ = try api.respondError(request, .not_found, "not_found", std.mem.print(&buf, "{s} names no commit", .{what}) catch "no such commit");
+        return null;
+    };
+}
+
+fn compare(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, spec_raw: []const u8) Error!http.Status {
+    var spec_buf: [2 * ref_name.max_len + 8]u8 = undefined;
+    const spec = api.percentDecode(&spec_buf, spec_raw, false) orelse return api.respondError(request, .bad_request, "invalid_ref", "compare/{base}...{head}");
+    const sep = std.mem.find(u8, spec, "...") orelse return api.respondError(request, .bad_request, "invalid_ref", "compare/{base}...{head}");
+    var base_buf: [64]u8 = undefined;
+    var head_buf: [64]u8 = undefined;
+    const base = (try resolveNamed(request, repo, spec[0..sep], "base", &base_buf)) orelse return .not_found;
+    const head = (try resolveNamed(request, repo, spec[sep + 3 ..], "head", &head_buf)) orelse return .not_found;
+
+    var mb_buf: [64]u8 = undefined;
+    const merge_base = repo.mergeBase(base, head, &mb_buf) catch |err| return gitError(request, err);
+    const counts = repo.aheadBehind(base, head) catch |err| return gitError(request, err);
+    // Like a pull request: what head changed since it left base.
+    const from = merge_base orelse base;
+    const files = repo.diffFiles(from, head) catch |err| return gitError(request, err);
+    defer files.deinit(app.gpa);
+    const patch = repo.diffPatch(from, head, max_patch_bytes) catch |err| return gitError(request, err);
+    defer if (patch) |p| app.gpa.free(p);
+
+    const FileJson = struct { path: []const u8, status: []const u8, additions: ?u64, deletions: ?u64 };
+    const items = app.gpa.alloc(FileJson, files.items.len) catch return api.internal(request);
+    defer app.gpa.free(items);
+    for (files.items, items) |f, *i| i.* = .{ .path = f.path, .status = f.status, .additions = f.additions, .deletions = f.deletions };
+    return api.respondJson(app.gpa, request, .ok, .{
+        .base = base,
+        .head = head,
+        .merge_base = merge_base,
+        .ahead = counts.ahead,
+        .behind = counts.behind,
+        .files = items,
+        .patch = patch orelse "",
+        .patch_truncated = patch == null,
+    });
+}
+
+fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, name: repo_name.Name, access: Access) Error!http.Status {
+    const Strategy = enum { merge, squash, @"fast-forward" };
+    const Body = struct {
+        base: []const u8,
+        head: []const u8,
+        strategy: Strategy = .merge,
+        /// Only merge if base is still here.
+        expected_base_head: ?[]const u8 = null,
+        message: ?[]const u8 = null,
+        author: ?AuthorJson = null,
+    };
+    var parsed = api.readJson(Body, app.gpa, request) catch |err| return api.respondBodyError(request, err);
+    defer parsed.deinit();
+    const body = parsed.value;
+
+    var ref_buf: [ref_name.max_len]u8 = undefined;
+    const base_ref = ref_name.validateBranch(body.base, &ref_buf) catch
+        return api.respondError(request, .bad_request, "invalid_branch", "base must be a branch name");
+    if (!access.canWrite(base_ref)) return forbiddenRef(request, base_ref);
+    const author: repo_git.Repo.Author = if (body.author) |a| blk: {
+        if (!validAuthorField(a.name) or !validAuthorField(a.email)) return api.respondError(request, .bad_request, "invalid_author", "author name and email must be 1-200 plain characters");
+        break :blk .{ .name = a.name, .email = a.email };
+    } else .{ .name = "gitd", .email = "gitd@localhost" };
+    if (body.message) |m| if (m.len == 0 or m.len > max_message) return api.respondError(request, .bad_request, "invalid_message", "message must be 1-65536 bytes");
+
+    var b_buf: [64]u8 = undefined;
+    var h_buf: [64]u8 = undefined;
+    const base = (try resolveNamed(request, repo, body.base, "base", &b_buf)) orelse return .not_found;
+    const head = (try resolveNamed(request, repo, body.head, "head", &h_buf)) orelse return .not_found;
+    if (body.expected_base_head) |e| {
+        if (!std.mem.eql(u8, e, base)) return staleHead(app, request, repo, name, base_ref, e);
+    }
+    const now = api.unixNow(app.io);
+    var detail_buf: [2 * ref_name.max_len + 32]u8 = undefined;
+
+    if (repo.isAncestor(head, base) catch |err| return gitError(request, err)) {
+        return api.respondJson(app.gpa, request, .ok, .{ .result = "up_to_date", .sha = base });
+    }
+    const can_ff = repo.isAncestor(base, head) catch |err| return gitError(request, err);
+    if (body.strategy == .@"fast-forward" or (can_ff and body.strategy == .merge)) {
+        if (!can_ff) return api.respondError(request, .conflict, "not_fast_forward", "base has commits head does not; use strategy merge or squash");
+        const outcome = repo.updateRef(base_ref, head, base) catch |err| return gitError(request, err);
+        if (outcome == .stale) return staleHead(app, request, repo, name, base_ref, base);
+        const detail = std.mem.print(&detail_buf, "{s} into {s} (fast-forward)", .{ body.head, body.base }) catch "fast-forward";
+        events.record(app, .{ .repo = name.full, .kind = "merge", .ref = base_ref, .old = base, .new = head, .detail = detail, .created_at = now });
+        return api.respondJson(app.gpa, request, .created, .{ .result = "fast_forward", .sha = head });
+    }
+
+    var tree_buf: [64]u8 = undefined;
+    const merged = repo.mergeTree(base, head, &tree_buf) catch |err| return gitError(request, err);
+    switch (merged) {
+        .conflicts => |c| {
+            defer app.gpa.free(c.raw);
+            defer app.gpa.free(c.paths);
+            var list_buf: [512]u8 = undefined;
+            var list: std.Io.Writer = .fixed(&list_buf);
+            for (c.paths, 0..) |p, i| {
+                if (i > 0) list.writeAll(", ") catch break;
+                list.writeAll(p) catch break;
+            }
+            const detail = std.mem.print(&detail_buf, "{s} into {s}: {s}", .{ body.head, body.base, list.buffered() }) catch "conflicts";
+            events.record(app, .{ .repo = name.full, .kind = "merge_conflict", .ref = base_ref, .old = base, .new = head, .detail = detail, .created_at = now });
+            const Err = struct { code: []const u8, message: []const u8 };
+            return api.respondJson(app.gpa, request, .conflict, .{
+                .@"error" = Err{ .code = "merge_conflict", .message = "the branches change the same lines; resolve on head and retry" },
+                .conflicts = c.paths,
+            });
+        },
+        .clean => |tree| {
+            var msg_buf: [2 * ref_name.max_len + 32]u8 = undefined;
+            const message = body.message orelse (std.mem.print(&msg_buf, "Merge {s} into {s}", .{ body.head, body.base }) catch "Merge");
+            const parents: []const []const u8 = if (body.strategy == .squash) &.{base} else &.{ base, head };
+            var sha_buf: [64]u8 = undefined;
+            const sha = repo.commitTree(tree, parents, message, author, &sha_buf) catch |err| return gitError(request, err);
+            const outcome = repo.updateRef(base_ref, sha, base) catch |err| return gitError(request, err);
+            if (outcome == .stale) return staleHead(app, request, repo, name, base_ref, base);
+            const how = if (body.strategy == .squash) "squash" else "merge commit";
+            const detail = std.mem.print(&detail_buf, "{s} into {s} ({s})", .{ body.head, body.base, how }) catch "merge";
+            events.record(app, .{ .repo = name.full, .kind = "merge", .ref = base_ref, .old = base, .new = sha, .detail = detail, .created_at = now });
+            return api.respondJson(app.gpa, request, .created, .{ .result = if (body.strategy == .squash) "squashed" else "merged", .sha = sha });
+        },
+    }
 }
 
 test revFromName {

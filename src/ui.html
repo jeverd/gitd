@@ -39,6 +39,9 @@
   #browser .entries { padding: 6px 10px; }
   #browser .entries div { padding: 2px 0; }
   #browser pre { margin: 0; padding: 10px; border-top: var(--line); white-space: pre-wrap; word-break: break-word; max-height: 420px; overflow: auto; }
+  #browser pre .add { font-weight: 700; }
+  #browser pre .del { text-decoration: line-through; opacity: 0.6; }
+  #browser pre .hunk { opacity: 0.6; }
 </style>
 </head>
 <body>
@@ -83,8 +86,8 @@ let browse = null;
 const repoApi = (repo, rest) => "/ui/api/repos/" + repo + "/" + rest;
 const enc = (path) => path.split("/").map(encodeURIComponent).join("/");
 
-async function openBrowser(repo, branch, dir, file) {
-  browse = { repo, branch, dir: dir || "", file: file || "" };
+async function openBrowser(repo, branch, dir, file, diff) {
+  browse = { repo, branch, dir: dir || "", file: file || "", diff: !!diff };
   const box = $("browser");
   const ref = "?ref=" + encodeURIComponent(branch);
   const tree = await fetch(repoApi(repo, browse.dir ? "tree/" + enc(browse.dir) : "tree") + ref).then((r) => r.json());
@@ -102,6 +105,7 @@ async function openBrowser(repo, branch, dir, file) {
     crumbs.append(link(part + "/", () => openBrowser(repo, branch, target)));
   }
   bar.append(crumbs, el("span", "oid", "commit " + short(tree.commit)));
+  if (branch !== "main") bar.append(link("diff vs main", () => openBrowser(repo, branch, browse.dir, "", true)));
   box.append(bar);
   const list = el("div", "entries");
   for (const e of tree.entries || []) {
@@ -112,6 +116,18 @@ async function openBrowser(repo, branch, dir, file) {
     list.append(row);
   }
   box.append(list);
+  if (browse.diff) {
+    const cmp = await fetch(repoApi(repo, "compare/main..." + branch)).then((r) => r.json());
+    const files = (cmp.files || []).map((f) => `${f.status} ${f.path} +${f.additions ?? "?"} -${f.deletions ?? "?"}`).join("   ");
+    box.append(el("div", "bar", `diff main...${branch}: ${cmp.ahead} ahead, ${cmp.behind} behind · ${files}`));
+    const pre = el("pre");
+    pre.dataset.diff = branch;
+    for (const line of (cmp.patch || "").split("\n")) {
+      const cls = line.startsWith("+") && !line.startsWith("+++") ? "add" : line.startsWith("-") && !line.startsWith("---") ? "del" : line.startsWith("@@") ? "hunk" : "";
+      pre.append(el("span", cls, line + "\n"));
+    }
+    box.append(pre);
+  }
   if (browse.file) {
     const text = await fetch(repoApi(repo, "files/" + enc(browse.file)) + ref).then((r) => r.text());
     const pre = el("pre", "", text);
@@ -138,6 +154,8 @@ function describe(e) {
     case "commit_conflict": return ["commit CONFLICT", `${e.repo} ${ref}: built on ${short(e.old)}, branch is at ${short(e.new)} → 409`];
     case "branch_created": return ["branch created", `${e.repo} ${ref} at ${short(e.new)}`];
     case "branch_deleted": return ["branch deleted", `${e.repo} ${ref}`];
+    case "merge": return ["merge", `${e.repo} ${e.detail}: ${short(e.old)} → ${short(e.new)}`];
+    case "merge_conflict": return ["merge CONFLICT", `${e.repo} ${e.detail} → 409`];
     default: return [e.kind.replace(/_/g, " "), `${e.repo} ${ref} ${e.detail}`.trim()];
   }
 }
