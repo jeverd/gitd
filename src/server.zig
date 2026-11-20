@@ -154,11 +154,16 @@ pub const unixNow = api.unixNow;
 fn handle(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress) HandleError!void {
     const start = Io.Clock.awake.now(app.io);
     const method = request.head.method;
-    var target_buf: [256]u8 = undefined;
-    // Copy for the log line; the head's strings die when the body is read.
-    const logged_target = copyTruncated(&target_buf, pathOf(request.head.target));
+    var log_buf: [256]u8 = undefined;
+    const logged_target = copyTruncated(&log_buf, pathOf(request.head.target));
+    // Every handler routes on this copy. The head's strings live in the
+    // connection's read buffer, which reading the body overwrites, so a
+    // name or path taken from `request.head.target` would change under a
+    // handler that reads a body (it fits: the head is at most this big).
+    var target_buf: [head_buffer_len]u8 = undefined;
+    const target = copyBounded(&target_buf, request.head.target) orelse unreachable; // head <= head_buffer_len
 
-    const status = route(app, request, peer) catch |err| switch (err) {
+    const status = route(app, request, peer, target) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         // Clients hang up mid-transfer routinely (a canceled clone or
         // push), so these are not errors.
@@ -173,8 +178,7 @@ fn handle(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress) Hand
 }
 
 /// Handles one request and returns the status it sent.
-fn route(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress) HandleError!http.Status {
-    const target = request.head.target;
+fn route(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress, target: []const u8) HandleError!http.Status {
     const path = pathOf(target);
     const query = if (std.mem.findScalar(u8, target, '?')) |q| target[q + 1 ..] else "";
 
@@ -198,6 +202,10 @@ fn route(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress) Handl
     if (std.mem.eql(u8, path, "/ui") or std.mem.startsWith(u8, path, "/ui/")) {
         if (!app.ui_enabled) return respondError(request, .not_found, "not_found", "start gitd with --ui to serve this page");
         if (!isLoopback(peer)) return respondError(request, .forbidden, "forbidden", "the UI is only served to this machine");
+        // A loopback peer is not enough: a web page can point its own
+        // domain at 127.0.0.1 (DNS rebinding) and read the UI. The Host
+        // header still names that domain, so require a loopback host.
+        if (!loopbackHost(findHeader(request, "host") orelse "")) return respondError(request, .forbidden, "forbidden", "open the UI at 127.0.0.1, localhost, or [::1]");
         return ui.serve(app, request, path, query);
     }
     return respondError(request, .not_found, "not_found", "no such route");
@@ -271,10 +279,10 @@ fn serveContent(app: *App, request: *http.Server.Request, name: repo_name.Name, 
         if (!std.mem.eql(u8, claims.repo(), name.full) or !std.mem.eql(u8, &claims.repo_id, repo.id)) {
             return respondError(request, .forbidden, "forbidden", "this token is for another repo");
         }
-        return content.serve(app, request, name, rest, query, .{ .claims = &claims });
+        return content.serve(app, request, name, rest, query, .{ .claims = &claims, .repo_id = repo.id });
     }
     switch (checkAdmin(app, request)) {
-        .ok => return content.serve(app, request, name, rest, query, .{ .claims = null }),
+        .ok => return content.serve(app, request, name, rest, query, .{ .claims = null, .repo_id = repo.id }),
         .missing, .invalid => return respondError(request, .unauthorized, "unauthorized", "unknown admin key or token"),
         .failed => return internal(request),
     }
@@ -496,7 +504,7 @@ fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route,
         if (!push.?.allowedBy(&claims)) return rejectPush(app, request, &push.?, &claims, repo_copy);
     }
 
-    var recorder: Push.Recorder = .{ .app = app, .push = if (push) |*p| p else null, .repo = repo_copy, .branch_ttl = claims.branch_ttl };
+    var recorder: Push.Recorder = .{ .app = app, .push = if (push) |*p| p else null, .repo = repo_copy, .repo_id = claims.repo_id, .branch_ttl = claims.branch_ttl };
     const after: ?git_proxy.After = if (push != null) .{ .ctx = &recorder, .run = Push.Recorder.run } else null;
     return git_proxy.serve(app.io, app.gpa, app.store, request, git_route, input, body, after) catch |err|
         proxyError(request, err);
@@ -581,11 +589,12 @@ const Push = struct {
         app: *App,
         push: ?*Push,
         repo: repo_name.Name,
+        repo_id: auth.RepoId,
         branch_ttl: u32,
 
         fn run(ctx: *anyopaque) void {
             const self: *Recorder = @ptrCast(@alignCast(ctx));
-            if (self.push) |p| p.record(self.app, self.repo, self.branch_ttl);
+            if (self.push) |p| p.record(self.app, self.repo, &self.repo_id, self.branch_ttl);
         }
     };
 
@@ -599,7 +608,7 @@ const Push = struct {
     /// checked rather than trusting the request.
     /// Branches the push created get `branch_ttl` seconds to live (when
     /// non-zero); deleted branches lose any expiry.
-    fn record(p: *const Push, app: *App, name: repo_name.Name, branch_ttl: u32) void {
+    fn record(p: *const Push, app: *App, name: repo_name.Name, repo_id: []const u8, branch_ttl: u32) void {
         const repo = repo_git.Repo.open(app.io, app.gpa, app.store, name) catch return;
         const now = unixNow(app.io);
         for (p.commands) |cmd| {
@@ -615,7 +624,7 @@ const Push = struct {
             if (cmd.isDelete()) {
                 app.db.clearBranchTtl(app.io, name.full, cmd.ref) catch |err| std.log.err("clearing expiry of {s}: {t}", .{ cmd.ref, err });
             } else if (cmd.isCreate() and branch_ttl > 0 and std.mem.startsWith(u8, cmd.ref, "refs/heads/")) {
-                app.db.setBranchTtl(app.io, name.full, cmd.ref, now + branch_ttl) catch |err| std.log.err("setting expiry of {s}: {t}", .{ cmd.ref, err });
+                app.db.setBranchTtl(app.io, name.full, repo_id, cmd.ref, now + branch_ttl) catch |err| std.log.err("setting expiry of {s}: {t}", .{ cmd.ref, err });
             }
         }
     }
@@ -648,4 +657,24 @@ test splitRepoPath {
     try std.testing.expectEqual(null, splitRepoPath("acme/web"));
     try std.testing.expectEqual(null, splitRepoPath("acme/web/"));
     try std.testing.expectEqual(null, splitRepoPath("acme/../x/log"));
+}
+
+/// Whether a Host header names this machine: 127.0.0.1, localhost, or
+/// [::1], with or without a port.
+pub fn loopbackHost(host: []const u8) bool {
+    const name = if (std.mem.startsWith(u8, host, "[")) blk: {
+        const end = std.mem.findScalar(u8, host, ']') orelse return false;
+        break :blk host[0 .. end + 1];
+    } else host[0 .. std.mem.findScalar(u8, host, ':') orelse host.len];
+    const rest = host[name.len..];
+    if (rest.len > 0) {
+        if (rest[0] != ':' or rest.len == 1) return false;
+        for (rest[1..]) |c| if (!std.ascii.isDigit(c)) return false;
+    }
+    return std.ascii.eqlIgnoreCase(name, "localhost") or std.mem.eql(u8, name, "127.0.0.1") or std.mem.eql(u8, name, "[::1]");
+}
+
+test loopbackHost {
+    for ([_][]const u8{ "127.0.0.1", "127.0.0.1:18910", "localhost:80", "LOCALHOST", "[::1]:8080", "[::1]" }) |h| try std.testing.expect(loopbackHost(h));
+    for ([_][]const u8{ "", "evil.com", "evil.com:18910", "127.0.0.1.evil.com", "localhost.evil.com", "127.0.0.1:x", "127.0.0.1:", "[::2]:80" }) |h| try std.testing.expect(!loopbackHost(h));
 }

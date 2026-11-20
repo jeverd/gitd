@@ -63,6 +63,7 @@ const schema =
     \\) STRICT;
     \\CREATE TABLE IF NOT EXISTS branch_ttls (
     \\  repo TEXT NOT NULL,
+    \\  repo_id TEXT NOT NULL,
     \\  ref TEXT NOT NULL,
     \\  expires_at INTEGER NOT NULL,
     \\  PRIMARY KEY (repo, ref)
@@ -532,15 +533,18 @@ pub const Db = struct {
         gpa.free(events);
     }
 
-    /// Sets (or replaces) when a branch expires.
-    pub fn setBranchTtl(db: *Db, io: Io, repo: []const u8, ref: []const u8, expires_at: i64) Error!void {
+    /// Sets (or replaces) when a branch expires. `repo_id` ties the expiry
+    /// to this incarnation of the repo: the reaper ignores it if the repo
+    /// was deleted and made again under the same name.
+    pub fn setBranchTtl(db: *Db, io: Io, repo: []const u8, repo_id: []const u8, ref: []const u8, expires_at: i64) Error!void {
         db.mutex.lockUncancelable(io);
         defer db.mutex.unlock(io);
-        const stmt = try db.prepare("INSERT INTO branch_ttls (repo, ref, expires_at) VALUES (?1, ?2, ?3) ON CONFLICT (repo, ref) DO UPDATE SET expires_at = excluded.expires_at");
+        const stmt = try db.prepare("INSERT INTO branch_ttls (repo, repo_id, ref, expires_at) VALUES (?1, ?4, ?2, ?3) ON CONFLICT (repo, ref) DO UPDATE SET expires_at = excluded.expires_at, repo_id = excluded.repo_id");
         defer _ = sqlite3_finalize(stmt);
         try db.bindText(stmt, 1, repo);
         try db.bindText(stmt, 2, ref);
         try db.check(sqlite3_bind_int64(stmt, 3, expires_at));
+        try db.bindText(stmt, 4, repo_id);
         if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("set branch ttl");
     }
 
@@ -558,11 +562,13 @@ pub const Db = struct {
 
     pub const BranchTtl = struct {
         repo: []const u8,
+        repo_id: []const u8,
         ref: []const u8,
         expires_at: i64,
 
         pub fn deinit(t: BranchTtl, gpa: std.mem.Allocator) void {
             gpa.free(t.repo);
+            gpa.free(t.repo_id);
             gpa.free(t.ref);
         }
     };
@@ -574,7 +580,7 @@ pub const Db = struct {
         db.mutex.lockUncancelable(io);
         defer db.mutex.unlock(io);
         const stmt = try db.prepare(
-            \\SELECT repo, ref, expires_at FROM branch_ttls
+            \\SELECT repo, ref, expires_at, repo_id FROM branch_ttls
             \\WHERE (?1 != '' AND repo = ?1) OR (?1 = '' AND expires_at <= ?2)
             \\ORDER BY expires_at LIMIT ?3
         );
@@ -593,7 +599,9 @@ pub const Db = struct {
                 errdefer gpa.free(r);
                 const ref = try columnText(stmt, 1, gpa);
                 errdefer gpa.free(ref);
-                try list.append(gpa, .{ .repo = r, .ref = ref, .expires_at = sqlite3_column_int64(stmt, 2) });
+                const rid = try columnText(stmt, 3, gpa);
+                errdefer gpa.free(rid);
+                try list.append(gpa, .{ .repo = r, .repo_id = rid, .ref = ref, .expires_at = sqlite3_column_int64(stmt, 2) });
             },
             SQLITE_DONE => break,
             else => return db.fail("list branch ttls"),
@@ -780,16 +788,17 @@ test "branch expiries" {
     const gpa = std.testing.allocator;
     var db: Db = try .open(":memory:");
     defer db.close();
-    try db.setBranchTtl(io, "a/b", "refs/heads/x", 100);
-    try db.setBranchTtl(io, "a/b", "refs/heads/y", 50);
-    try db.setBranchTtl(io, "a/c", "refs/heads/z", 300);
-    try db.setBranchTtl(io, "a/b", "refs/heads/x", 200); // replaces
+    try db.setBranchTtl(io, "a/b", "id1", "refs/heads/x", 100);
+    try db.setBranchTtl(io, "a/b", "id1", "refs/heads/y", 50);
+    try db.setBranchTtl(io, "a/c", "id2", "refs/heads/z", 300);
+    try db.setBranchTtl(io, "a/b", "id1", "refs/heads/x", 200); // replaces
 
     const due = try db.listBranchTtls(io, gpa, "", 200, 10);
     defer Db.freeBranchTtls(gpa, due);
     try std.testing.expectEqual(@as(usize, 2), due.len);
     try std.testing.expectEqualStrings("refs/heads/y", due[0].ref);
     try std.testing.expectEqual(@as(i64, 200), due[1].expires_at);
+    try std.testing.expectEqualStrings("id1", due[1].repo_id);
 
     const in_repo = try db.listBranchTtls(io, gpa, "a/c", 0, 10);
     defer Db.freeBranchTtls(gpa, in_repo);

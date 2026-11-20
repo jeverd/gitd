@@ -178,7 +178,13 @@ fn deliverTask(app: *server.App, d: Db.Delivery, in_flight: *std.atomic.Value(u3
     defer d.deinit(app.gpa);
     var client: http.Client = .{ .allocator = app.gpa, .io = app.io };
     defer client.deinit();
-    try deliverOne(app, &client, d);
+    if (!try deliverOne(app, &client, d)) {
+        // It could not even be tried; put it back rather than leave it
+        // claimed until the next restart.
+        app.db.updateDelivery(app.io, d.id, "pending", d.attempts, nowMs(app.io) + app.webhook_backoff_ms, d.last_status, d.last_error, api.unixNow(app.io)) catch |err| {
+            std.log.err("requeueing delivery {d}: {t}", .{ d.id, err });
+        };
+    }
 }
 
 /// The body sent for a delivery. The caller frees it.
@@ -202,9 +208,11 @@ const Outcome = union(enum) {
     timeout: Io.Cancelable!void,
 };
 
-fn deliverOne(app: *server.App, client: *http.Client, d: Db.Delivery) Io.Cancelable!void {
+/// Tries one delivery and records the outcome. Returns false when it
+/// could not be attempted at all, so the caller requeues it.
+fn deliverOne(app: *server.App, client: *http.Client, d: Db.Delivery) Io.Cancelable!bool {
     const io = app.io;
-    const body = payload(app.gpa, d) catch return;
+    const body = payload(app.gpa, d) catch return false;
     defer app.gpa.free(body);
     const sig = signature(d.secret, body);
     var id_buf: [24]u8 = undefined;
@@ -222,11 +230,11 @@ fn deliverOne(app: *server.App, client: *http.Client, d: Db.Delivery) Io.Cancela
     defer select.cancelDiscard();
     select.concurrent(.sent, post, .{ client, d.url, body, &headers }) catch |err| {
         std.log.err("starting webhook delivery: {t}", .{err});
-        return;
+        return false;
     };
     select.concurrent(.timeout, Io.sleep, .{ io, .fromMilliseconds(app.webhook_timeout_ms), .awake }) catch |err| {
         std.log.err("starting webhook timer: {t}", .{err});
-        return;
+        return false;
     };
     const outcome = try select.await();
 
@@ -250,7 +258,9 @@ fn deliverOne(app: *server.App, client: *http.Client, d: Db.Delivery) Io.Cancela
     app.db.updateDelivery(io, d.id, new_status, attempts, if (final) 0 else next, status, err_text, api.unixNow(io)) catch |err| {
         std.log.err("recording delivery {d}: {t}", .{ d.id, err });
     };
-    if (!ok and final) std.log.info("webhook delivery {d} to {s} failed after {d} attempts: {s}", .{ d.id, d.url, attempts, err_text });
+    // The URL is not logged: webhook URLs often carry credentials (R2.5).
+    if (!ok and final) std.log.info("webhook delivery {d} (webhook {d}) failed after {d} attempts: {s}", .{ d.id, d.webhook_id, attempts, err_text });
+    return true;
 }
 
 fn post(client: *http.Client, url: []const u8, body: []const u8, headers: []const http.Header) anyerror!http.Status {

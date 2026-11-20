@@ -470,6 +470,88 @@ expect_eq "delete repo with webhooks" 204 "$(admin -X DELETE "$HB")"
 expect_eq "recreate it" 201 "$(admin -X POST "$BASE/v1/repos" -d '{"name":"acme/hooks"}')"
 expect_eq "old webhooks are gone" 0 "$(admin "$HB/webhooks" >/dev/null; json '["webhooks"].__len__()')"
 
+echo "== review regressions"
+# A token for one repo must not affect another repo through a body large
+# enough to overwrite the request head (cross-repo writes and events).
+admin -X POST "$BASE/v1/repos" -d '{"name":"acme/victim"}' >/dev/null
+admin -X POST "$BASE/v1/repos" -d '{"name":"acme/evil"}' >/dev/null
+VICTIM_TOK="$(mint acme/victim '["git:read","git:write"]')"
+git -C "$LREPO" push -q "$(url "$VICTIM_TOK" acme/victim)" FETCH_HEAD:refs/heads/main 2>/dev/null || fail "seeding acme/victim"
+EVIL_TOK="$(mint acme/evil '["git:read","git:write"]')"
+VICTIM_EVENTS="$(count_events repo=acme/victim)"
+for i in $(seq 0 15); do
+  python3 -c "import json,sys; i=int(sys.argv[1]); print(json.dumps({'branch':'spray/%d'%i,'expected_head':None,'message':'m'*(i+1),'ttl_seconds':1,'changes':[{'path':'a','content':'acme/victim'*9000}]}))" "$i" >"$WORK/spray.json"
+  [[ "$(status -H "authorization: Bearer $EVIL_TOK" -X POST "$BASE/v1/repos/acme/evil/commits" --data-binary @"$WORK/spray.json")" == 201 ]] || fail "spray commit $i"
+done
+sleep 2.5
+expect_eq "no events land on another repo" "$VICTIM_EVENTS" "$(count_events repo=acme/victim)"
+expect_eq "the other repo's main survives" 200 "$(admin "$BASE/v1/repos/acme/victim/tree?ref=main")"
+expect_eq "the sprayed branches expired in their own repo" 16 "$(count_events repo=acme/evil kind=branch_expired)"
+# A rejected push without report-status, from a token with long patterns,
+# gets a 403 and the server stays up.
+LONG_PAT="refs/heads/$(python3 -c 'print("a"*240)')"
+LONG_TOK="$(admin -X POST "$BASE/v1/tokens" -d "{\"repo\":\"acme/victim\",\"scopes\":[\"git:write\"],\"refs\":[\"$LONG_PAT/*\",\"$LONG_PAT/b/*\"]}" >/dev/null; json '["token"]')"
+python3 - "$PORT" "$LONG_TOK" >"$WORK/raw2" <<'PY'
+import base64, socket, sys
+port, token = int(sys.argv[1]), sys.argv[2]
+auth = base64.b64encode(f"t:{token}".encode()).decode()
+line = f"{'0'*40} {'1'*40} refs/heads/main\0ofs-delta\n".encode()
+body = b"%04x" % (len(line) + 4) + line + b"0000"
+s = socket.create_connection(("127.0.0.1", port))
+s.sendall((f"POST /acme/victim.git/git-receive-pack HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {auth}\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body)
+data = b""
+while chunk := s.recv(65536):
+    data += chunk
+print(data.split(b"\r\n")[0].decode())
+PY
+expect_eq "long rejection reason without report-status" "HTTP/1.1 403 Forbidden" "$(cat "$WORK/raw2")"
+expect_eq "server still up" 200 "$(status "$BASE/healthz")"
+# Paths reach git literally (no C-unquoting), and a path git refuses is a
+# 400, never a 201 that silently drops the file.
+python3 -c 'import json; print(json.dumps({"branch":"q","expected_head":None,"from":"main","message":"q","changes":[{"path":"\"a\\033b\"","content":"q"}]}))' >"$WORK/q.json"
+expect_eq "quoted-looking path committed literally" 201 "$(admin -X POST "$BASE/v1/repos/acme/victim/commits" --data-binary @"$WORK/q.json")"
+admin "$BASE/v1/repos/acme/victim/tree?ref=q" >/dev/null
+python3 -c 'import json,sys; e=[x["name"] for x in json.load(open(sys.argv[1]))["entries"]]; sys.exit(0 if "\"a\\033b\"" in e else 1)' "$WORK/body" || fail "the quoted path was not stored literally: $(cat "$WORK/body")"
+pass "literal name in tree"
+LOOKALIKE="$(admin -X POST "$BASE/v1/repos/acme/victim/commits" -d '{"branch":"q2","expected_head":null,"from":"main","message":"q","changes":[{"path":".git\u200c/config","content":"x"}]}')"
+if [[ "$LOOKALIKE" == 201 ]]; then
+  admin "$BASE/v1/repos/acme/victim/tree?ref=q2" >/dev/null
+  python3 -c "import json; e=[x['name'] for x in json.load(open('$WORK/body'))['entries']]; assert any(n.startswith('.git') for n in e), e" || fail "201 but the file is missing"
+else
+  expect_eq "path git refuses is a 400" 400 "$LOOKALIKE"
+fi
+pass "a .git look-alike is committed in full or refused, never dropped"
+expect_eq "NUL in message" 400 "$(admin -X POST "$BASE/v1/repos/acme/victim/commits" -d '{"branch":"n","expected_head":null,"message":"a\u0000b","changes":[{"path":"a","content":"a"}]}')"
+expect_eq "branch name ending in a dot" 400 "$(admin -X POST "$BASE/v1/repos/acme/victim/branches" -d '{"name":"x.","from":"main"}')"
+# log?path= walks history, not just the tip.
+VH="$(admin "$BASE/v1/repos/acme/victim/branches" >/dev/null; python3 -c "import json; print(next(b['commit'] for b in json.load(open('$WORK/body'))['branches'] if b['name']=='main'))")"
+for n in 1 2 3; do
+  printf '{"branch":"main","expected_head":"%s","message":"readme %s","changes":[{"path":"README","content":"%s"}]}' "$VH" "$n" "$n" >"$WORK/r.json"
+  admin -X POST "$BASE/v1/repos/acme/victim/commits" --data-binary @"$WORK/r.json" >/dev/null; VH="$(json '["sha"]')"
+done
+printf '{"branch":"main","expected_head":"%s","message":"other","changes":[{"path":"OTHER","content":"o"}]}' "$VH" >"$WORK/r.json"
+admin -X POST "$BASE/v1/repos/acme/victim/commits" --data-binary @"$WORK/r.json" >/dev/null
+expect_eq "log for a path lists every commit touching it" "readme 3 readme 2 readme 1" "$(admin "$BASE/v1/repos/acme/victim/log?path=README" >/dev/null; python3 -c "import json; print(' '.join(c['subject'] for c in json.load(open('$WORK/body'))['commits']))")"
+# A token's branch_ttl_seconds also covers branches it makes through the API.
+TTL_API_TOK="$(admin -X POST "$BASE/v1/tokens" -d '{"repo":"acme/victim","scopes":["git:read","git:write"],"branch_ttl_seconds":60}' >/dev/null; json '["token"]')"
+expect_eq "API branch with a ttl token" 201 "$(status -H "authorization: Bearer $TTL_API_TOK" -X POST "$BASE/v1/repos/acme/victim/branches" -d '{"name":"by-token","from":"main"}')"
+[[ "$(admin "$BASE/v1/repos/acme/victim/branches" >/dev/null; python3 -c "import json; print(next(b['expires_at'] for b in json.load(open('$WORK/body'))['branches'] if b['name']=='by-token'))")" =~ ^[0-9]+$ ]] || fail "token ttl not applied to API branch"
+pass "token ttl applies to API-created branches"
+# An expiry dies with its repo: recreating the repo does not inherit it.
+admin -X POST "$BASE/v1/repos" -d '{"name":"acme/reborn"}' >/dev/null
+REBORN_TOK="$(mint acme/reborn '["git:read","git:write"]')"
+git -C "$LREPO" push -q "$(url "$REBORN_TOK" acme/reborn)" FETCH_HEAD:refs/heads/main 2>/dev/null
+admin -X POST "$BASE/v1/repos/acme/reborn/branches" -d '{"name":"keep","from":"main","ttl_seconds":2}' >/dev/null
+admin -X DELETE "$BASE/v1/repos/acme/reborn" >/dev/null
+admin -X POST "$BASE/v1/repos" -d '{"name":"acme/reborn"}' >/dev/null
+REBORN_TOK="$(mint acme/reborn '["git:read","git:write"]')"
+git -C "$LREPO" push -q "$(url "$REBORN_TOK" acme/reborn)" FETCH_HEAD:refs/heads/main FETCH_HEAD:refs/heads/keep 2>/dev/null
+sleep 3
+expect_eq "recreated repo keeps its same-named branch" 200 "$(admin "$BASE/v1/repos/acme/reborn/tree?ref=keep")"
+# DNS rebinding: a loopback peer with a foreign Host is refused.
+expect_eq "UI with a foreign Host" 403 "$(status -H 'Host: evil.example:80' "$BASE/ui/api/state")"
+expect_eq "UI with localhost Host" 200 "$(status -H "Host: localhost:$PORT" "$BASE/ui/api/state")"
+
 echo "== protocol hardening"
 expect_eq "dumb protocol HEAD" 400 "$(status -u "t:$RO" "$BASE/acme/web.git/HEAD")"
 expect_eq "dumb protocol objects" 400 "$(status -u "t:$RO" "$BASE/acme/web.git/objects/info/packs")"
@@ -667,8 +749,9 @@ echo "== activity log and UI"
 expect_eq "UI page served" 200 "$(status "$BASE/ui")"
 grep -q "<title>gitd</title>" "$WORK/body" || fail "UI page content"
 expect_eq "UI state" 200 "$(status "$BASE/ui/api/state")"
-expect_eq "UI state lists all repos" 3 "$(json '["repos"].__len__()')"
-expect_eq "repo_created events" 6 "$(count_events kind=repo_created)"
+UI_REPOS="$(json '["repos"].__len__()')"
+expect_eq "UI state lists every repo the API lists" "$(admin "$BASE/v1/repos" >/dev/null; json '["repos"].__len__()')" "$UI_REPOS"
+expect_eq "repo_created events" 10 "$(count_events kind=repo_created)"
 expect_eq "repo_deleted event" 1 "$(count_events kind=repo_deleted repo=acme/web)"
 expect_eq "first push recorded with its commit" 1 "$(count_events kind=push repo=acme/web ref=refs/heads/main detail=created)"
 AGENT_PUSHES="$(events; python3 -c "import json; print(sum(1 for e in json.load(open('$WORK/body'))['events'] if e['kind']=='push' and e['repo']=='acme/web' and e['ref'].startswith('refs/heads/agent/')))")"
@@ -706,6 +789,7 @@ expect_eq "no UI without --ui" 404 "$(status "http://127.0.0.1:$NOUI_PORT/ui")"
 kill -TERM "$NOUI"; wait "$NOUI" || true
 
 echo "== restart keeps data and secret"
+REPOS_BEFORE="$(admin "$BASE/v1/repos" >/dev/null; json '["repos"].__len__()')"
 expect_eq "branch that expires across a restart" 201 "$(admin -X POST "$BASE/v1/repos/acme/other/branches" -d '{"name":"ttl/restart","from":"main","ttl_seconds":3}')"
 # Stop while a slow clone is mid-transfer: gitd must still exit promptly and
 # take its git processes with it.
@@ -726,7 +810,7 @@ for _ in $(seq 1 40); do [[ -z "$(leftover)" ]] && break; sleep 0.1; done
 pass "stopping mid-clone leaves no git processes"
 start_server
 expect_eq "list after restart" 200 "$(admin "$BASE/v1/repos")"
-expect_eq "repos survive restart" 3 "$(json '["repos"].__len__()')"
+expect_eq "repos survive restart" "$REPOS_BEFORE" "$(json '["repos"].__len__()')"
 git ls-remote "$(url "$RW" acme/web)" >/dev/null 2>"$WORK/err" || fail "token from before restart: $(cat "$WORK/err")"
 pass "token minted before restart still works"
 sleep 4
@@ -753,6 +837,7 @@ pass "no errors, warnings, panics, or leaks in server log"
 grep -q "$KEY" "$LOG" && fail "admin key appears in server log"
 grep -qF "$RW" "$LOG" && fail "token appears in server log"
 grep -qF "$HOOK_SECRET" "$LOG" && fail "webhook secret appears in server log"
+grep -qF "127.0.0.1:$HP" "$LOG" && fail "a webhook URL appears in server log"
 pass "no secrets in server log"
 
 echo "PASS: $PASSED checks"
