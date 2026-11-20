@@ -8,6 +8,7 @@
 #                                            with a token limited to refs/heads/agent/N/*
 #   tests/demo/demo.sh head REPO BRANCH      print a branch's commit
 #   tests/demo/demo.sh race REPO BRANCH N    N agents commit to BRANCH at once via the API
+#   tests/demo/demo.sh merge REPO BASE HEAD [merge|squash|fast-forward]
 #   tests/demo/demo.sh stop
 #
 # State (admin key, port) lives in $DEMO_DIR (default /tmp/gitd-demo).
@@ -76,6 +77,13 @@ case "$cmd" in
   head)
     # head REPO BRANCH: print the branch's commit
     api "$BASE/v1/repos/$1/branches" | python3 -c "import json,sys; print(next(b['commit'] for b in json.load(sys.stdin)['branches'] if b['name']=='$2'))"
+    ;;
+  merge)
+    # merge REPO BASE HEAD [STRATEGY]: merge HEAD into BASE through the API
+    printf '{"base":"%s","head":"%s","strategy":"%s"}' "$2" "$3" "${4:-merge}" >"$DEMO_DIR/merge.json"
+    code="$(curl -s -o "$DEMO_DIR/merge.out" -w '%{http_code}' -H "authorization: Bearer $(key)" -X POST \
+      "$BASE/v1/repos/$1/merges" --data-binary @"$DEMO_DIR/merge.json")"
+    echo "merge $3 into $2: HTTP $code $(cat "$DEMO_DIR/merge.out")"
     ;;
   race)
     # race REPO BRANCH N: N agents commit to BRANCH at once, all built on its
