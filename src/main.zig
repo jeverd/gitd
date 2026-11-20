@@ -189,4 +189,6 @@ test {
     _ = @import("events.zig");
     _ = @import("ui.zig");
     _ = @import("api.zig");
+    _ = @import("repo_path.zig");
+    _ = @import("content.zig");
 }

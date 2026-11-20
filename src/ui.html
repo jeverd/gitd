@@ -31,6 +31,14 @@
   #events li.reject .when { opacity: 0.8; }
   .kind { font-weight: 700; }
   .oid { opacity: 0.7; }
+  tr[data-branch] a { color: inherit; }
+  tr.selected td:first-child::before { content: "▸ "; }
+  #browser { border: var(--line); margin-top: 8px; }
+  #browser .bar { padding: 6px 10px; border-bottom: var(--line); display: flex; gap: 12px; flex-wrap: wrap; }
+  #browser .crumbs a, #browser .entries a { color: inherit; cursor: pointer; text-decoration: underline; }
+  #browser .entries { padding: 6px 10px; }
+  #browser .entries div { padding: 2px 0; }
+  #browser pre { margin: 0; padding: 10px; border-top: var(--line); white-space: pre-wrap; word-break: break-word; max-height: 420px; overflow: auto; }
 </style>
 </head>
 <body>
@@ -42,6 +50,8 @@
   <section>
     <h2>Repos</h2>
     <div id="repos"><div class="empty">No repos yet.</div></div>
+    <h2 id="browser-title" hidden>Files</h2>
+    <div id="browser" hidden></div>
   </section>
   <section>
     <h2>Activity</h2>
@@ -68,6 +78,50 @@ const ago = (unix, now) => {
 const branchName = (ref) => ref.replace(/^refs\/heads\//, "");
 
 let lastEvent = 0;
+// The branch whose files are open: { repo, branch, dir, file }.
+let browse = null;
+const repoApi = (repo, rest) => "/ui/api/repos/" + repo + "/" + rest;
+const enc = (path) => path.split("/").map(encodeURIComponent).join("/");
+
+async function openBrowser(repo, branch, dir, file) {
+  browse = { repo, branch, dir: dir || "", file: file || "" };
+  const box = $("browser");
+  const ref = "?ref=" + encodeURIComponent(branch);
+  const tree = await fetch(repoApi(repo, browse.dir ? "tree/" + enc(browse.dir) : "tree") + ref).then((r) => r.json());
+  box.replaceChildren();
+  const bar = el("div", "bar");
+  const crumbs = el("span", "crumbs");
+  crumbs.append(el("strong", "", repo + " @ " + branch), document.createTextNode(" "));
+  const link = (text, go) => { const a = el("a", "", text); a.href = "#"; a.onclick = (ev) => { ev.preventDefault(); go(); }; return a; };
+  const root = link("/", () => openBrowser(repo, branch, ""));
+  crumbs.append(root);
+  let acc = "";
+  for (const part of browse.dir ? browse.dir.split("/") : []) {
+    acc = acc ? acc + "/" + part : part;
+    const target = acc;
+    crumbs.append(link(part + "/", () => openBrowser(repo, branch, target)));
+  }
+  bar.append(crumbs, el("span", "oid", "commit " + short(tree.commit)));
+  box.append(bar);
+  const list = el("div", "entries");
+  for (const e of tree.entries || []) {
+    const row = el("div");
+    const dir = browse.dir;
+    const a = link(e.name + (e.type === "tree" ? "/" : ""), () => (e.type === "tree" ? openBrowser(repo, branch, e.path) : openBrowser(repo, branch, dir, e.path)));
+    row.append(a, document.createTextNode(e.size != null ? "  " + e.size + " B" : ""));
+    list.append(row);
+  }
+  box.append(list);
+  if (browse.file) {
+    const text = await fetch(repoApi(repo, "files/" + enc(browse.file)) + ref).then((r) => r.text());
+    const pre = el("pre", "", text);
+    pre.dataset.file = browse.file;
+    box.append(el("div", "bar", browse.file), pre);
+  }
+  $("browser-title").hidden = false;
+  box.hidden = false;
+  lastReposKey = "";
+}
 let lastHeads = new Map();
 
 function describe(e) {
@@ -100,7 +154,17 @@ function renderEvents(list) {
   while (ol.children.length > 300) ol.lastChild.remove();
 }
 
+let lastReposKey = "";
 function renderRepos(state) {
+  // Rebuild only when something changed, so links stay put between polls;
+  // otherwise just refresh the relative times.
+  const key = JSON.stringify(state.repos) + "|" + (browse ? browse.repo + " " + browse.branch : "");
+  if (key === lastReposKey) {
+    for (const td of document.querySelectorAll("td[data-at]")) td.textContent = ago(Number(td.dataset.at), state.now);
+    for (const tr of document.querySelectorAll("tr.fresh")) tr.classList.remove("fresh");
+    return;
+  }
+  lastReposKey = key;
   const box = $("repos");
   box.replaceChildren();
   if (state.repos.length === 0) { box.append(el("div", "empty", "No repos yet.")); return; }
@@ -120,10 +184,18 @@ function renderRepos(state) {
       for (const b of repo.branches) {
         const key = repo.name + " " + b.name;
         heads.set(key, b.commit);
-        const tr = el("tr", lastHeads.size && lastHeads.get(key) !== b.commit ? "fresh" : "");
+        const fresh = lastHeads.size && lastHeads.get(key) !== b.commit;
+        const chosen = browse && browse.repo === repo.name && browse.branch === b.name;
+        const tr = el("tr", (fresh ? "fresh " : "") + (chosen ? "selected" : ""));
         tr.dataset.branch = b.name;
-        tr.append(el("td", "", b.name), el("td", "oid", short(b.commit)),
-                  el("td", "", ago(b.committed_at, state.now)), el("td", "subject", b.subject));
+        const link = el("a", "", b.name);
+        link.href = "#";
+        link.onclick = (ev) => { ev.preventDefault(); openBrowser(repo.name, b.name, ""); };
+        const nameCell = el("td");
+        nameCell.append(link);
+        const when = el("td", "", ago(b.committed_at, state.now));
+        when.dataset.at = b.committed_at;
+        tr.append(nameCell, el("td", "oid", short(b.commit)), when, el("td", "subject", b.subject));
         table.append(tr);
       }
       card.append(table);

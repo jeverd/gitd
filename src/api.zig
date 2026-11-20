@@ -91,3 +91,55 @@ pub fn unixNow(io: Io) i64 {
     const ns = Io.Clock.real.now(io).nanoseconds;
     return @intCast(@divFloor(ns, std.time.ns_per_s));
 }
+
+/// Decodes `%XX` escapes (and `+` as space in query values) into `out`.
+/// Returns null for a malformed escape or when `out` is too small.
+pub fn percentDecode(out: []u8, text: []const u8, plus_is_space: bool) ?[]const u8 {
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i < text.len) : (n += 1) {
+        if (n == out.len) return null;
+        switch (text[i]) {
+            '%' => {
+                if (i + 2 >= text.len) return null;
+                const hi = std.fmt.charToDigit(text[i + 1], 16) catch return null;
+                const lo = std.fmt.charToDigit(text[i + 2], 16) catch return null;
+                out[n] = hi * 16 + lo;
+                i += 3;
+            },
+            '+' => {
+                out[n] = if (plus_is_space) ' ' else '+';
+                i += 1;
+            },
+            else => |c| {
+                out[n] = c;
+                i += 1;
+            },
+        }
+    }
+    return out[0..n];
+}
+
+/// Finds `name=` in a query string and decodes its value into `out`.
+pub fn queryValue(out: []u8, query: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.findScalar(u8, pair, '=') orelse continue;
+        if (!std.mem.eql(u8, pair[0..eq], name)) continue;
+        return percentDecode(out, pair[eq + 1 ..], true);
+    }
+    return null;
+}
+
+test percentDecode {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("agent/3/work", percentDecode(&buf, "agent%2F3%2fwork", true).?);
+    try std.testing.expectEqualStrings("a b+c", percentDecode(&buf, "a+b%2Bc", true).?);
+    try std.testing.expectEqualStrings("a+b", percentDecode(&buf, "a+b", false).?);
+    try std.testing.expectEqual(null, percentDecode(&buf, "a%2", true));
+    try std.testing.expectEqual(null, percentDecode(&buf, "a%", true));
+    try std.testing.expectEqual(null, percentDecode(&buf, "%zz", true));
+    try std.testing.expectEqual(null, percentDecode(buf[0..2], "abc", true));
+    try std.testing.expectEqualStrings("main", queryValue(&buf, "x=1&ref=main", "ref").?);
+    try std.testing.expectEqual(null, queryValue(&buf, "x=1", "ref"));
+}

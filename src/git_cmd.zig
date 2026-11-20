@@ -54,6 +54,8 @@ pub fn run(
     var env = try store_mod.gitEnv(gpa, store.path_env);
     defer env.deinit();
     try env.put("GIT_DIR", git_dir);
+    // Paths are literal: no `:(glob)` or other pathspec magic from callers.
+    try env.put("GIT_LITERAL_PATHSPECS", "1");
     for (options.env) |kv| try env.put(kv[0], kv[1]);
 
     var stdin_file: ?Io.File = null;
