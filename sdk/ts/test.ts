@@ -1,0 +1,165 @@
+import assert from "node:assert/strict";
+import { spawn, execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { ConflictError, GitdClient, GitdError } from "./index.ts";
+
+async function startServer(): Promise<{ baseUrl: string; key: string; stop: () => Promise<void> }> {
+  if (process.env.GITD_URL && process.env.GITD_KEY) {
+    return { baseUrl: process.env.GITD_URL, key: process.env.GITD_KEY, stop: async () => {} };
+  }
+  const bin = process.env.GITD_BIN ?? path.resolve(import.meta.dirname, "../../zig-out/bin/gitd");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gitd-ts-sdk-"));
+  const dataDir = path.join(tmp, "data");
+  const key = execFileSync(bin, ["admin", "create-key", "--data", dataDir], { encoding: "utf8" }).trim();
+  const child = spawn(bin, ["serve", "--data", dataDir, "--listen", "127.0.0.1:0"], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const port = await new Promise<string>((resolve, reject) => {
+    let logs = "";
+    const timer = setTimeout(() => reject(new Error(`gitd did not start:\n${logs}`)), 5000);
+    child.stderr.on("data", (chunk: Buffer) => {
+      logs += chunk.toString("utf8");
+      const m = logs.match(/listening on 127\.0\.0\.1:(\d+),/);
+      if (m) {
+        clearTimeout(timer);
+        resolve(m[1]);
+      }
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      reject(new Error(`gitd exited ${code}:\n${logs}`));
+    });
+  });
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    key,
+    stop: async () => {
+      child.kill("SIGTERM");
+      await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      fs.rmSync(tmp, { recursive: true, force: true });
+    },
+  };
+}
+
+test("TypeScript SDK end-to-end", async () => {
+  const srv = await startServer();
+  try {
+    const admin = new GitdClient({ baseUrl: srv.baseUrl, token: srv.key });
+    assert.equal(await admin.healthz(), true);
+
+    const repoName = `sdk/ts-${Date.now()}`;
+    const mirrorName = `sdk/ts-mirror-${Date.now()}`;
+    await admin.createRepo(repoName);
+    await admin.createRepo(mirrorName);
+
+    const init = await admin.commit(repoName, {
+      branch: "main",
+      expected_head: null,
+      message: "Initial commit",
+      changes: [
+        { path: "README.md", content: "# Hello gitd\n" },
+        { path: "src/app.ts", content: "export const greeting = 'hello world';\n" },
+      ],
+    });
+    assert.equal(init.parent, null);
+
+    // Scoped agent token
+    const { token } = await admin.createToken({
+      repo: repoName,
+      scopes: ["git:read", "git:write"],
+      refs: ["refs/heads/agent/ts/*"],
+      ttl_seconds: 300,
+    });
+    const agent = admin.withToken(token);
+
+    assert.equal(await agent.readTextFile(repoName, "README.md"), "# Hello gitd\n");
+    const tree = await agent.readTree(repoName);
+    assert.deepEqual(
+      tree.entries.map((e) => e.name),
+      ["README.md", "src"],
+    );
+
+    // Scoped token blocked on main
+    await assert.rejects(
+      () =>
+        agent.commit(repoName, {
+          branch: "main",
+          expected_head: init.sha,
+          message: "nope",
+          changes: [{ path: "x.txt", content: "x" }],
+        }),
+      (err: unknown) => err instanceof GitdError && err.status === 403,
+    );
+
+    // Create branch + commitWithRetry recovering from a 409 conflict
+    const first = await agent.commit(repoName, {
+      branch: "agent/ts/work",
+      expected_head: null,
+      from: "main",
+      message: "Agent step 1",
+      changes: [{ path: "src/app.ts", content: "export const greeting = 'v1';\n" }],
+    });
+
+    // Advance branch behind the caller's back to force a 409 on attempt 1
+    const raced = await agent.commit(repoName, {
+      branch: "agent/ts/work",
+      expected_head: first.sha,
+      message: "Concurrent commit",
+      changes: [{ path: "notes.txt", content: "raced\n" }],
+    });
+
+    let attempts = 0;
+    const retried = await agent.commitWithRetry(
+      repoName,
+      "agent/ts/work",
+      (head) => {
+        attempts++;
+        return {
+          message: `Retry commit (attempt ${attempts})`,
+          changes: [{ path: "src/app.ts", content: `export const greeting = 'v2-${head?.slice(0, 7)}';\n` }],
+        };
+      },
+      { initialHead: first.sha },
+    );
+    assert.equal(attempts, 2);
+    assert.equal(retried.parent, raced.sha);
+
+    // Grep & Archive
+    const grepRes = await agent.grep(repoName, "greeting", { ref: "agent/ts/work" });
+    assert.equal(grepRes.matches.length, 1);
+    assert.equal(grepRes.matches[0].path, "src/app.ts");
+
+    const archiveBytes = await agent.archive(repoName, { ref: "agent/ts/work", format: "tar.gz" });
+    assert.ok(archiveBytes.byteLength > 20);
+    assert.equal(archiveBytes[0], 0x1f); // gzip magic
+    assert.equal(archiveBytes[1], 0x8b);
+
+    // Compare & Merge
+    const diff = await admin.compare(repoName, "main", "agent/ts/work");
+    assert.equal(diff.ahead, 3);
+    const merged = await admin.merge(repoName, { base: "main", head: "agent/ts/work" });
+    assert.equal(merged.result, "fast_forward");
+
+    // Upstream sync (fetch from repoName into mirrorName)
+    const { token: upToken } = await admin.createToken({
+      repo: repoName,
+      scopes: ["git:read", "git:write"],
+    });
+    const fetched = await admin.sync(mirrorName, {
+      direction: "fetch",
+      url: `${srv.baseUrl}/${repoName}.git`,
+      branch: "main",
+      token: upToken,
+    });
+    assert.equal(fetched.direction, "fetch");
+    assert.equal(fetched.new_sha, merged.sha);
+
+    await admin.deleteRepo(mirrorName);
+    await admin.deleteRepo(repoName);
+  } finally {
+    await srv.stop();
+  }
+});
