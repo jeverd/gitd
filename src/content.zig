@@ -8,6 +8,8 @@
 //!   GET log?ref=REF&limit=N&path=P  commits, newest first
 //!   GET commits/{sha}
 //!   GET compare/{base}...{head}     ahead/behind, changed files, patch
+//!   GET grep?q=Q&ref=REF&path=P&fixed=1&ignore_case=1&limit=N
+//!   GET archive?ref=REF&format=tar.gz|tar|zip&path=P
 //!
 //! Writes (admin key, or a repo token with git:write whose ref patterns
 //! cover the branch):
@@ -43,8 +45,12 @@ const max_commit_body = 16 * 1024 * 1024;
 const max_changes = 100;
 const max_message = 64 * 1024;
 const max_patch_bytes = 1024 * 1024;
+const max_archive_bytes = 64 * 1024 * 1024;
 const default_log_limit = 50;
 const max_log_limit = 500;
+const default_grep_limit = 100;
+const max_grep_limit = 500;
+const max_grep_query = 512;
 
 /// Who is asking. `claims` is null for the admin key and the UI.
 pub const Access = struct {
@@ -107,6 +113,8 @@ pub fn serve(
         if (std.mem.eql(u8, rest, "log")) return readLog(app, request, &repo, query);
         if (std.mem.startsWith(u8, rest, "commits/")) return readCommit(app, request, &repo, rest["commits/".len..]);
         if (std.mem.startsWith(u8, rest, "compare/")) return compare(app, request, &repo, rest["compare/".len..]);
+        if (std.mem.eql(u8, rest, "grep")) return grepRepo(app, request, &repo, query);
+        if (std.mem.eql(u8, rest, "archive")) return readArchive(app, request, &repo, name, query);
     }
     if (method == .POST and std.mem.eql(u8, rest, "merges")) return merge(app, request, &repo, name, access);
     if (method == .POST and std.mem.eql(u8, rest, "commits")) return createCommit(app, request, &repo, name, access);
@@ -333,6 +341,104 @@ fn readCommit(app: *server.App, request: *http.Server.Request, repo: *const repo
     defer arena_state.deinit();
     const items = commitsJson(arena_state.allocator(), log.items) catch return api.internal(request);
     return api.respondJson(app.gpa, request, .ok, items[0]);
+}
+
+fn queryBool(query: []const u8, name: []const u8) error{InvalidBool}!bool {
+    var buf: [16]u8 = undefined;
+    if (std.mem.find(u8, query, name) == null) return false;
+    const val = api.queryValue(&buf, query, name) orelse return false;
+    if (std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true")) return true;
+    if (std.mem.eql(u8, val, "0") or std.mem.eql(u8, val, "false")) return false;
+    return error.InvalidBool;
+}
+
+fn grepRepo(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, query: []const u8) Error!http.Status {
+    var q_buf: [max_grep_query]u8 = undefined;
+    const q = api.queryValue(&q_buf, query, "q") orelse
+        return api.respondError(request, .bad_request, "invalid_query", "q is required (1-512 bytes)");
+    if (q.len == 0 or std.mem.findScalar(u8, q, 0) != null) {
+        return api.respondError(request, .bad_request, "invalid_query", "q must be non-empty and contain no NUL bytes");
+    }
+    const fixed = queryBool(query, "fixed") catch
+        return api.respondError(request, .bad_request, "invalid_query", "fixed must be 0, 1, true, or false");
+    const ignore_case = queryBool(query, "ignore_case") catch
+        return api.respondError(request, .bad_request, "invalid_query", "ignore_case must be 0, 1, true, or false");
+    const limit_raw = @import("ui.zig").queryInt(query, "limit") orelse default_grep_limit;
+    if (limit_raw < 1 or limit_raw > max_grep_limit) {
+        return api.respondError(request, .bad_request, "invalid_limit", "limit must be 1-500");
+    }
+    var path_buf: [repo_path.max_len]u8 = undefined;
+    var path: ?[]const u8 = null;
+    if (std.mem.find(u8, query, "path=") != null) {
+        const p = api.queryValue(&path_buf, query, "path") orelse
+            return api.respondError(request, .bad_request, "invalid_path", "the path is not valid");
+        repo_path.validate(p) catch
+            return api.respondError(request, .bad_request, "invalid_path", "the path is not valid");
+        path = p;
+    }
+    var oid_buf: [64]u8 = undefined;
+    const commit = (try commitFromQuery(app, request, repo, query, &oid_buf)) orelse return .not_found;
+    const res = repo.grep(commit, q, .{
+        .fixed = fixed,
+        .ignore_case = ignore_case,
+        .path = path,
+        .limit = @intCast(limit_raw),
+    }) catch |err| switch (err) {
+        error.InvalidQuery => return api.respondError(request, .bad_request, "invalid_query", "the search pattern is not valid"),
+        else => |e| return gitError(request, e),
+    };
+    defer res.deinit(app.gpa);
+    return api.respondJson(app.gpa, request, .ok, .{
+        .commit = commit,
+        .matches = res.items,
+        .truncated = res.truncated,
+    });
+}
+
+fn readArchive(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, name: repo_name.Name, query: []const u8) Error!http.Status {
+    var fmt_buf: [16]u8 = undefined;
+    const format: repo_git.Repo.ArchiveFormat = if (std.mem.find(u8, query, "format=") != null) blk: {
+        const raw = api.queryValue(&fmt_buf, query, "format") orelse
+            return api.respondError(request, .bad_request, "invalid_format", "format must be tar.gz, tar, or zip");
+        break :blk std.meta.stringToEnum(repo_git.Repo.ArchiveFormat, raw) orelse
+            return api.respondError(request, .bad_request, "invalid_format", "format must be tar.gz, tar, or zip");
+    } else .@"tar.gz";
+
+    var path_buf: [repo_path.max_len]u8 = undefined;
+    var path: ?[]const u8 = null;
+    if (std.mem.find(u8, query, "path=") != null) {
+        const p = api.queryValue(&path_buf, query, "path") orelse
+            return api.respondError(request, .bad_request, "invalid_path", "the path is not valid");
+        repo_path.validate(p) catch
+            return api.respondError(request, .bad_request, "invalid_path", "the path is not valid");
+        path = p;
+    }
+    var oid_buf: [64]u8 = undefined;
+    const commit = (try commitFromQuery(app, request, repo, query, &oid_buf)) orelse return .not_found;
+    if (path) |p| {
+        const entries = repo.lsTree(commit, p, true) catch |err| return gitError(request, err);
+        defer entries.deinit(app.gpa);
+        if (entries.items.len == 0) {
+            return api.respondError(request, .not_found, "not_found", "no such path at that ref");
+        }
+    }
+    const data = repo.archive(commit, format, path, max_archive_bytes) catch |err| return gitError(request, err);
+    defer app.gpa.free(data);
+
+    var disp_buf: [160]u8 = undefined;
+    const short_sha = commit[0..@min(commit.len, 12)];
+    const disp = std.mem.print(&disp_buf, "attachment; filename=\"{s}-{s}.{s}\"", .{ name.repo, short_sha, @tagName(format) }) catch
+        "attachment; filename=\"archive\"";
+    try request.respond(data, .{
+        .keep_alive = http_util.keepAlive(request),
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = format.contentType() },
+            .{ .name = "content-disposition", .value = disp },
+            .{ .name = "x-gitd-commit", .value = commit },
+            .{ .name = "x-content-type-options", .value = "nosniff" },
+        },
+    });
+    return .ok;
 }
 
 // ---- Writes ----

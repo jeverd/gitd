@@ -510,4 +510,172 @@ pub const Repo = struct {
             },
         }
     }
+
+    pub const GrepOptions = struct {
+        fixed: bool = false,
+        ignore_case: bool = false,
+        path: ?[]const u8 = null,
+        limit: u32 = 100,
+        max_output: usize = 4 * 1024 * 1024,
+        timeout_ms: i64 = 10_000,
+    };
+
+    pub const GrepMatch = struct {
+        /// Slices borrow `GrepResult.raw`.
+        path: []const u8,
+        line: u64,
+        text: []const u8,
+    };
+
+    pub const GrepResult = struct {
+        raw: []u8,
+        items: []GrepMatch,
+        truncated: bool,
+
+        pub fn deinit(g: GrepResult, gpa: std.mem.Allocator) void {
+            gpa.free(g.items);
+            gpa.free(g.raw);
+        }
+    };
+
+    pub const GrepError = error{InvalidQuery} || git_cmd.Error;
+
+    /// Searches tracked text files at `commit` (R2.4: `--no-textconv`, `-I`
+    /// skips binary). Exit 1 means no matches; exit 128 is an invalid pattern.
+    pub fn grep(r: *const Repo, commit: []const u8, query: []const u8, opts: GrepOptions) GrepError!GrepResult {
+        var args: [16][]const u8 = undefined;
+        var n: usize = 0;
+        for ([_][]const u8{ "grep", "-n", "-z", "-I", "--no-color", "--no-textconv" }) |a| {
+            args[n] = a;
+            n += 1;
+        }
+        if (opts.fixed) {
+            args[n] = "-F";
+            n += 1;
+        }
+        if (opts.ignore_case) {
+            args[n] = "-i";
+            n += 1;
+        }
+        args[n] = "-e";
+        args[n + 1] = query;
+        args[n + 2] = commit;
+        n += 3;
+        if (opts.path) |p| {
+            args[n] = "--";
+            args[n + 1] = p;
+            n += 2;
+        }
+        const result = try r.git(args[0..n], .{ .max_output = opts.max_output, .timeout_ms = opts.timeout_ms });
+        defer r.gpa.free(result.stderr);
+        switch (result.code) {
+            0 => return parseGrepMatches(r.gpa, result.stdout, commit, opts.limit),
+            1 => {
+                r.gpa.free(result.stdout);
+                return .{ .raw = &.{}, .items = &.{}, .truncated = false };
+            },
+            128 => {
+                r.gpa.free(result.stdout);
+                return error.InvalidQuery;
+            },
+            else => {
+                std.log.err("git grep exited {d}: {s}", .{ result.code, std.mem.trimEnd(u8, result.stderr, "\n") });
+                r.gpa.free(result.stdout);
+                return error.GitFailed;
+            },
+        }
+    }
+
+    pub const ArchiveFormat = enum {
+        @"tar.gz",
+        tar,
+        zip,
+
+        pub fn contentType(f: ArchiveFormat) []const u8 {
+            return switch (f) {
+                .@"tar.gz" => "application/gzip",
+                .tar => "application/x-tar",
+                .zip => "application/zip",
+            };
+        }
+
+        pub fn formatFlag(f: ArchiveFormat) []const u8 {
+            return switch (f) {
+                .@"tar.gz" => "--format=tar.gz",
+                .tar => "--format=tar",
+                .zip => "--format=zip",
+            };
+        }
+    };
+
+    /// Produces an archive of `commit` (or `path` within it). Caller frees the bytes.
+    pub fn archive(r: *const Repo, commit: []const u8, format: ArchiveFormat, path: ?[]const u8, max: usize) git_cmd.Error![]u8 {
+        if (path) |p| {
+            return r.gitOutput(&.{ "archive", format.formatFlag(), commit, "--", p }, .{ .max_output = max });
+        }
+        return r.gitOutput(&.{ "archive", format.formatFlag(), commit }, .{ .max_output = max });
+    }
 };
+
+/// Parses `git grep -n -z` output (`<commit>:<path>\0<line>\0<text>\n`).
+/// Takes ownership of `raw` and frees it on error.
+pub fn parseGrepMatches(gpa: std.mem.Allocator, raw: []u8, commit: []const u8, limit: u32) std.mem.Allocator.Error!Repo.GrepResult {
+    errdefer gpa.free(raw);
+    var list: std.ArrayList(Repo.GrepMatch) = .empty;
+    errdefer list.deinit(gpa);
+    var truncated = false;
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |rec| {
+        if (rec.len == 0) continue;
+        if (rec.len <= commit.len or !std.mem.startsWith(u8, rec, commit) or rec[commit.len] != ':') continue;
+        var fields = std.mem.splitScalar(u8, rec[commit.len + 1 ..], 0);
+        const path = fields.next() orelse continue;
+        if (path.len == 0) continue;
+        const line_str = fields.next() orelse continue;
+        const line_num = std.fmt.parseInt(u64, line_str, 10) catch continue;
+        const text = fields.rest();
+        if (list.items.len >= limit) {
+            truncated = true;
+            break;
+        }
+        try list.append(gpa, .{ .path = path, .line = line_num, .text = text });
+    }
+    return .{ .raw = raw, .items = try list.toOwnedSlice(gpa), .truncated = truncated };
+}
+
+test "parseGrepMatches parses records, handles colons in paths, and truncates" {
+    const gpa = std.testing.allocator;
+    const sha = "0123456789abcdef0123456789abcdef01234567";
+    const input = sha ++ ":dir/a:b.txt\x0012\x00hello world\n" ++
+        sha ++ ":src/main.zig\x003\x00const x = 1;\n" ++
+        sha ++ ":src/more.zig\x009\x00extra\n";
+    const res = try parseGrepMatches(gpa, try gpa.dupe(u8, input), sha, 2);
+    defer res.deinit(gpa);
+    try std.testing.expect(res.truncated);
+    try std.testing.expectEqual(@as(usize, 2), res.items.len);
+    try std.testing.expectEqualStrings("dir/a:b.txt", res.items[0].path);
+    try std.testing.expectEqual(@as(u64, 12), res.items[0].line);
+    try std.testing.expectEqualStrings("hello world", res.items[0].text);
+    try std.testing.expectEqualStrings("src/main.zig", res.items[1].path);
+    try std.testing.expectEqual(@as(u64, 3), res.items[1].line);
+    try std.testing.expectEqualStrings("const x = 1;", res.items[1].text);
+}
+
+test "fuzz parse grep" {
+    try std.testing.fuzz({}, fuzzParseGrep, .{
+        .corpus = &.{
+            "abcd:a.txt\x001\x00hi\n",
+            "abcd:\x00\x00\n",
+            "no-prefix\n",
+        },
+    });
+}
+
+fn fuzzParseGrep(_: void, smith: *std.testing.Smith) anyerror!void {
+    const gpa = std.testing.allocator;
+    var buf: [512]u8 = undefined;
+    const raw = try gpa.dupe(u8, buf[0..smith.slice(&buf)]);
+    const res = try parseGrepMatches(gpa, raw, "abcd", 16);
+    defer res.deinit(gpa);
+    try std.testing.expect(res.items.len <= 16);
+}
