@@ -306,6 +306,9 @@ fn createToken(app: *App, request: *http.Server.Request) HandleError!http.Status
         repo: []const u8,
         scopes: []const []const u8,
         ttl_seconds: i64 = auth.default_ttl_seconds,
+        /// Ref patterns the token may write, like "refs/heads/agent/7/*".
+        /// Omitted means any ref.
+        refs: []const []const u8 = &.{},
     };
     var parsed = api.readJson(Body, app.gpa, request) catch |err| return api.respondBodyError(request, err);
     defer parsed.deinit();
@@ -328,7 +331,11 @@ fn createToken(app: *App, request: *http.Server.Request) HandleError!http.Status
     defer repo.deinit(app.gpa);
 
     const expires_at = unixNow(app.io) + body.ttl_seconds;
-    const claims = auth.Claims.init(name.full, repo.id, scopes, expires_at) catch return internal(request);
+    var claims = auth.Claims.init(name.full, repo.id, scopes, expires_at) catch return internal(request);
+    for (body.refs) |pattern| claims.addRefPattern(pattern) catch |err| return switch (err) {
+        error.InvalidRefPattern => respondError(request, .bad_request, "invalid_ref_pattern", "ref patterns are full ref names, optionally ending in /*, like refs/heads/agent/7/*"),
+        error.TooManyRefPatterns => respondError(request, .bad_request, "invalid_ref_pattern", "at most 4 ref patterns, 600 bytes in total"),
+    };
     var token_buf: [auth.max_token_len]u8 = undefined;
     const token = auth.mint(app.secret, &claims, &token_buf) catch return internal(request);
     return api.respondJson(app.gpa, request, .created, .{ .token = token, .expires_at = expires_at });
@@ -420,6 +427,7 @@ fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route,
             error.OutOfMemory => return internal(request),
             else => |e| return proxyError(request, e),
         };
+        if (!push.?.allowedBy(&claims)) return rejectPush(app, request, &push.?, &claims, repo_copy);
     }
 
     var recorder: Push.Recorder = .{ .app = app, .push = if (push) |*p| p else null, .repo = repo_copy };
@@ -438,11 +446,58 @@ fn proxyError(request: *http.Server.Request, err: git_proxy.ProxyError) HandleEr
     };
 }
 
+/// Refuses a push that touches a ref outside the token's patterns (R2.2).
+/// git never runs, so nothing changes; the client gets git's normal report
+/// with a reason per ref, and each refused ref is logged.
+fn rejectPush(app: *App, request: *http.Server.Request, push: *const Push, claims: *const auth.Claims, name: repo_name.Name) HandleError!http.Status {
+    var allowed_buf: [auth.max_ref_patterns_bytes + 16]u8 = undefined;
+    var allowed: std.Io.Writer = .fixed(&allowed_buf);
+    for (0..claims.refs_count) |i| {
+        if (i > 0) allowed.writeAll(", ") catch {};
+        allowed.writeAll(claims.refPattern(i)) catch {};
+    }
+    var reason_buf: [auth.max_ref_patterns_bytes + 64]u8 = undefined;
+    const reason = std.mem.print(&reason_buf, "token may only push to {s}", .{allowed.buffered()}) catch "token may not push here";
+    const other = "push refused: another ref in it is not allowed";
+
+    var reasons: [receive_pack.max_commands][]const u8 = undefined;
+    const now = unixNow(app.io);
+    for (push.commands, 0..) |cmd, i| {
+        const ok = claims.allowsRef(cmd.ref);
+        reasons[i] = if (ok) other else reason;
+        if (!ok) events.record(app, .{ .repo = name.full, .kind = "push_rejected", .ref = cmd.ref, .old = cmd.old, .new = cmd.new, .detail = reason, .created_at = now });
+    }
+    // Rejection lines are the same in report-status and report-status-v2.
+    if (!receive_pack.hasCapability(push.caps, "report-status") and !receive_pack.hasCapability(push.caps, "report-status-v2")) {
+        return respondError(request, .forbidden, "forbidden", reason);
+    }
+    var out: std.Io.Writer.Allocating = .init(app.gpa);
+    defer out.deinit();
+    var msg_buf: [auth.max_ref_patterns_bytes + 96]u8 = undefined;
+    const message = std.mem.print(&msg_buf, "gitd: push rejected: {s}", .{reason}) catch "gitd: push rejected";
+    receive_pack.writeRejection(&out.writer, push.caps, push.commands, reasons[0..push.commands.len], message) catch return internal(request);
+    try request.respond(out.written(), .{
+        .keep_alive = keepAlive(request),
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/x-git-receive-pack-result" },
+            .{ .name = "cache-control", .value = "no-cache" },
+        },
+    });
+    return .ok;
+}
+
 /// The ref updates a push asks for, read from its spooled body.
 const Push = struct {
     head: []u8,
     commands_buf: *[receive_pack.max_commands]receive_pack.Command,
     commands: []receive_pack.Command,
+    /// The client's capabilities, borrowing `head`.
+    caps: []const u8,
+
+    fn allowedBy(p: *const Push, claims: *const auth.Claims) bool {
+        for (p.commands) |cmd| if (!claims.allowsRef(cmd.ref)) return false;
+        return true;
+    }
 
     fn read(app: *App, body: git_proxy.Body) (receive_pack.ParseError || git_proxy.ProxyError)!Push {
         const buf = try app.gpa.alloc(u8, receive_pack.max_commands_bytes);
@@ -450,8 +505,9 @@ const Push = struct {
         const head = try body.head(app.io, buf);
         const commands_buf = try app.gpa.create([receive_pack.max_commands]receive_pack.Command);
         errdefer app.gpa.destroy(commands_buf);
-        const commands = try receive_pack.parse(head, commands_buf);
-        return .{ .head = buf, .commands_buf = commands_buf, .commands = commands };
+        var caps: []const u8 = undefined;
+        const commands = try receive_pack.parse(head, commands_buf, &caps);
+        return .{ .head = buf, .commands_buf = commands_buf, .commands = commands, .caps = caps };
     }
 
     /// Runs `record` from inside the proxy, after git exits.

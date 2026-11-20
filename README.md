@@ -38,7 +38,7 @@ All `/v1` routes need `Authorization: Bearer <admin key>`. Errors look like `{"e
 | `GET /v1/repos` | List repos |
 | `GET /v1/repos/{ns}/{repo}` | Get one repo |
 | `DELETE /v1/repos/{ns}/{repo}` | Delete a repo and its files. Its tokens stop working |
-| `POST /v1/tokens` `{"repo","scopes","ttl_seconds"}` | Mint a repo token |
+| `POST /v1/tokens` `{"repo","scopes","ttl_seconds","refs"}` | Mint a repo token. `refs` (optional, up to 4) limits which refs it may write, like `["refs/heads/agent/7/*"]` |
 | `GET /healthz` | Liveness, no auth |
 | `GET /ui` | Live activity page: repos, branches, and every push. Only with `gitd serve --ui`, only from this machine |
 | `/{ns}/{repo}.git/...` | git smart HTTP. The token goes in the password: `http://t:<token>@host/...` |
@@ -51,7 +51,7 @@ Repo names are `ns/repo`: lowercase letters, digits, `.`, `_`, `-`, up to 64 cha
 - **Features:**
   1. ✅ Repos: create, list, delete over an API
   2. ✅ Git: `git clone` and `git push` work normally
-  3. Tokens: short-lived ✅, limited to one branch pattern (next)
+  3. ✅ Tokens: short-lived, limited to ref patterns
   4. Read files, folders, history without cloning
   5. Commit through the API, with a 409 when two agents race
   6. Diff and merge branches

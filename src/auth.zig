@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const repo_name = @import("repo_name.zig");
+const ref_name = @import("ref_name.zig");
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -21,7 +22,11 @@ pub const Secret = [secret_len]u8;
 pub const token_prefix = "gitd_t_";
 pub const key_prefix = "gitd_k_";
 /// Longer tokens are rejected before decoding (R2.3).
-pub const max_token_len = 1024;
+pub const max_token_len = 2048;
+/// A token can limit writes to at most this many ref patterns (R2.2).
+pub const max_ref_patterns = 4;
+/// Total bytes of all ref patterns in one token.
+pub const max_ref_patterns_bytes = 600;
 /// Upper bound on a token's lifetime, in seconds.
 pub const max_ttl_seconds = 24 * 60 * 60;
 pub const default_ttl_seconds = 15 * 60;
@@ -73,9 +78,36 @@ pub const Claims = struct {
     scopes: Scopes,
     /// Unix seconds.
     expires_at: i64,
+    /// Ref patterns this token may write (see ref_name). None means any.
+    refs_buf: [max_ref_patterns_bytes]u8 = undefined,
+    refs_ends: [max_ref_patterns]u16 = undefined,
+    refs_count: usize = 0,
 
     pub fn repo(c: *const Claims) []const u8 {
         return c.repo_buf[0..c.repo_len];
+    }
+
+    pub fn refPattern(c: *const Claims, i: usize) []const u8 {
+        const start = if (i == 0) 0 else c.refs_ends[i - 1];
+        return c.refs_buf[start..c.refs_ends[i]];
+    }
+
+    /// Adds a write limit. Fails if the pattern is invalid or the limits
+    /// on count and size are reached.
+    pub fn addRefPattern(c: *Claims, pattern: []const u8) error{ InvalidRefPattern, TooManyRefPatterns }!void {
+        ref_name.validatePattern(pattern) catch return error.InvalidRefPattern;
+        const start: usize = if (c.refs_count == 0) 0 else c.refs_ends[c.refs_count - 1];
+        if (c.refs_count == max_ref_patterns or start + pattern.len > max_ref_patterns_bytes) return error.TooManyRefPatterns;
+        @memcpy(c.refs_buf[start..][0..pattern.len], pattern);
+        c.refs_ends[c.refs_count] = @intCast(start + pattern.len);
+        c.refs_count += 1;
+    }
+
+    /// Whether this token may create, move, or delete `ref`.
+    pub fn allowsRef(c: *const Claims, ref: []const u8) bool {
+        if (c.refs_count == 0) return true;
+        for (0..c.refs_count) |i| if (ref_name.matches(c.refPattern(i), ref)) return true;
+        return false;
     }
 
     pub fn init(name: []const u8, repo_id: []const u8, scopes: Scopes, expires_at: i64) error{InvalidRepoName}!Claims {
@@ -95,6 +127,7 @@ const Payload = struct {
     rid: []const u8,
     scopes: []const []const u8,
     exp: i64,
+    refs: []const []const u8 = &.{},
 };
 
 pub const VerifyError = error{ InvalidToken, ExpiredToken };
@@ -111,9 +144,18 @@ pub fn mint(secret: *const Secret, claims: *const Claims, out: *[max_token_len]u
         names[count] = "git:write";
         count += 1;
     }
-    const payload: Payload = .{ .v = 1, .repo = claims.repo(), .rid = &claims.repo_id, .scopes = names[0..count], .exp = claims.expires_at };
+    var refs: [max_ref_patterns][]const u8 = undefined;
+    for (0..claims.refs_count) |i| refs[i] = claims.refPattern(i);
+    const payload: Payload = .{
+        .v = 1,
+        .repo = claims.repo(),
+        .rid = &claims.repo_id,
+        .scopes = names[0..count],
+        .exp = claims.expires_at,
+        .refs = refs[0..claims.refs_count],
+    };
 
-    var json_buf: [512]u8 = undefined;
+    var json_buf: [1400]u8 = undefined;
     const json = std.mem.print(&json_buf, "{f}", .{std.json.fmt(payload, .{})}) catch return error.TokenTooLong;
 
     const encoded_len = b64.Encoder.calcSize(json.len);
@@ -155,7 +197,7 @@ pub fn verify(secret: *const Secret, token: []const u8, now: i64) VerifyError!Cl
     if (json_len > json_buf.len) return error.InvalidToken;
     b64.Decoder.decode(json_buf[0..json_len], payload_text) catch return error.InvalidToken;
 
-    var arena_buf: [4096]u8 = undefined;
+    var arena_buf: [8192]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&arena_buf);
     const payload = std.json.parseFromSliceLeaky(Payload, fba.allocator(), json_buf[0..json_len], .{}) catch
         return error.InvalidToken;
@@ -165,7 +207,8 @@ pub fn verify(secret: *const Secret, token: []const u8, now: i64) VerifyError!Cl
     for (payload.scopes) |name| {
         scopes = scopes.merge(Scopes.fromName(name) orelse return error.InvalidToken);
     }
-    const claims = Claims.init(payload.repo, payload.rid, scopes, payload.exp) catch return error.InvalidToken;
+    var claims = Claims.init(payload.repo, payload.rid, scopes, payload.exp) catch return error.InvalidToken;
+    for (payload.refs) |pattern| claims.addRefPattern(pattern) catch return error.InvalidToken;
     if (now >= claims.expires_at) return error.ExpiredToken;
     return claims;
 }
@@ -307,6 +350,33 @@ test "a validly signed payload with bad claims is rejected" {
         _ = b64.Encoder.encode(buf[end + 1 .. total], &mac);
         try std.testing.expectError(error.InvalidToken, verify(&test_secret, buf[0..total], 0));
     }
+}
+
+test "ref patterns survive mint and verify, and limit writes" {
+    var claims = try Claims.init("acme/web", test_rid, .{ .git_write = true }, 1000);
+    try std.testing.expect(claims.allowsRef("refs/heads/main"));
+    try claims.addRefPattern("refs/heads/agent/7/*");
+    try claims.addRefPattern("refs/tags/v1");
+    var buf: [max_token_len]u8 = undefined;
+    const got = try verify(&test_secret, try mint(&test_secret, &claims, &buf), 0);
+    try std.testing.expectEqual(@as(usize, 2), got.refs_count);
+    try std.testing.expect(got.allowsRef("refs/heads/agent/7/try"));
+    try std.testing.expect(got.allowsRef("refs/tags/v1"));
+    try std.testing.expect(!got.allowsRef("refs/heads/main"));
+    try std.testing.expect(!got.allowsRef("refs/heads/agent/70/x"));
+
+    try std.testing.expectError(error.InvalidRefPattern, claims.addRefPattern("main"));
+    try claims.addRefPattern("refs/heads/a");
+    try claims.addRefPattern("refs/heads/b");
+    try std.testing.expectError(error.TooManyRefPatterns, claims.addRefPattern("refs/heads/c"));
+
+    var big = try Claims.init("acme/web", test_rid, .{ .git_write = true }, 1000);
+    const long = "refs/heads/" ++ @as([240]u8, @splat('a'));
+    try big.addRefPattern(long);
+    try big.addRefPattern(long);
+    try std.testing.expectError(error.TooManyRefPatterns, big.addRefPattern(long));
+    // The largest allowed token still fits.
+    _ = try mint(&test_secret, &big, &buf);
 }
 
 test "admin keys hash stably and differ from the key" {
