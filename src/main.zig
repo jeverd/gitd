@@ -18,6 +18,8 @@ const usage =
     \\
     \\  env GITD_IDLE_TIMEOUT_SECONDS: drop a connection idle this long (default 60)
     \\  env GITD_HEAD_TIMEOUT_SECONDS: time allowed to send a request head (default 10)
+    \\  env GITD_WEBHOOK_BACKOFF_MS: webhook retry backoff unit (default 1000)
+    \\  env GITD_WEBHOOK_TIMEOUT_MS: webhook delivery timeout (default 10000)
     \\
 ;
 
@@ -85,6 +87,18 @@ fn secondsFromEnv(init: std.process.Init, name: []const u8, default: u32) ?u32 {
     return seconds;
 }
 
+/// Reads a duration in milliseconds from the environment, or returns
+/// `default`. Returns null, after logging, when the value is not 1-600000.
+fn msFromEnv(init: std.process.Init, name: []const u8, default: i64) ?i64 {
+    const text = init.environ_map.get(name) orelse return default;
+    const ms = std.fmt.parseInt(i64, text, 10) catch 0;
+    if (ms < 1 or ms > 600_000) {
+        std.log.err("{s} must be between 1 and 600000", .{name});
+        return null;
+    }
+    return ms;
+}
+
 fn createKey(init: std.process.Init, opts: Options) !u8 {
     const io = init.io;
     const data = try store.DataDir.prepare(io, init.arena.allocator(), opts.data_dir);
@@ -131,6 +145,8 @@ fn serve(init: std.process.Init, opts: Options) !u8 {
 
     const idle_timeout = secondsFromEnv(init, "GITD_IDLE_TIMEOUT_SECONDS", server.default_idle_timeout_seconds) orelse return 2;
     const head_timeout = secondsFromEnv(init, "GITD_HEAD_TIMEOUT_SECONDS", server.default_head_timeout_seconds) orelse return 2;
+    const backoff_ms = msFromEnv(init, "GITD_WEBHOOK_BACKOFF_MS", 1000) orelse return 2;
+    const hook_timeout_ms = msFromEnv(init, "GITD_WEBHOOK_TIMEOUT_MS", 10_000) orelse return 2;
 
     const data = try store.DataDir.prepare(io, arena, opts.data_dir);
     try data.clearTmp(io);
@@ -152,6 +168,8 @@ fn serve(init: std.process.Init, opts: Options) !u8 {
         .idle_timeout_seconds = idle_timeout,
         .head_timeout_seconds = head_timeout,
         .ui_enabled = opts.ui,
+        .webhook_backoff_ms = backoff_ms,
+        .webhook_timeout_ms = hook_timeout_ms,
     };
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
@@ -192,4 +210,5 @@ test {
     _ = @import("repo_path.zig");
     _ = @import("content.zig");
     _ = @import("expiry.zig");
+    _ = @import("webhooks.zig");
 }
