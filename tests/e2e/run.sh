@@ -733,6 +733,20 @@ sleep 4
 expect_eq "expiry survives a restart" gone "$(expires_of ttl/restart)"
 stop_server
 
+echo "== MVP scenario (tests/demo/agents.sh)"
+MVP_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+if GITD_BIN="$BIN" DEMO_PORT="$MVP_PORT" DEMO_DIR="$WORK/mvp" AGENT_TTL=3 "$(dirname "$0")/../demo/agents.sh" >"$WORK/mvp.out" 2>&1; then
+  grep -q "^MVP OK$" "$WORK/mvp.out" || fail "MVP scenario did not finish: $(tail -20 "$WORK/mvp.out")"
+else
+  fail "MVP scenario: $(tail -20 "$WORK/mvp.out")"
+fi
+pass "five agents, one blocked from main, winner merged, the rest expired, webhooks delivered"
+sleep 0.5
+pgrep -f "gitd serve --data $WORK/mvp" >/dev/null && fail "MVP server still running"
+pass "MVP scenario stopped its server"
+if grep -nE '^(error|warning)|panic|leak' "$WORK/mvp/server.log"; then fail "MVP server log has errors"; fi
+pass "MVP server log is clean"
+
 echo "== server log is clean"
 if grep -nE '^(error|warning)|panic|leak|Segmentation' "$LOG"; then fail "server log has errors, warnings, panics, or leaks"; fi
 pass "no errors, warnings, panics, or leaks in server log"
