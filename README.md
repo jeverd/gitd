@@ -44,6 +44,9 @@ All `/v1` routes need `Authorization: Bearer <admin key>`. Per-repo routes (`/v1
 | `GET /v1/repos/{ns}/{repo}/tree[/{path}]?ref=` | Directory listing |
 | `GET /v1/repos/{ns}/{repo}/log?ref=&limit=&path=` | Commits, newest first |
 | `GET /v1/repos/{ns}/{repo}/commits/{sha}` | One commit |
+| `POST /v1/repos/{ns}/{repo}/commits` | Commit file changes to a branch. Send `expected_head` (the commit you built on, or `null` for a new branch); if the branch moved, you get 409 with `current_head` |
+| `POST /v1/repos/{ns}/{repo}/branches` `{"name","from"}` | Create a branch (409 if it exists) |
+| `DELETE /v1/repos/{ns}/{repo}/branches/{name}?expected=` | Delete a branch, optionally only if it is at `expected` |
 | `GET /healthz` | Liveness, no auth |
 | `GET /ui` | Live activity page: repos, branches, and every push. Only with `gitd serve --ui`, only from this machine |
 | `/{ns}/{repo}.git/...` | git smart HTTP. The token goes in the password: `http://t:<token>@host/...` |
@@ -58,7 +61,7 @@ Repo names are `ns/repo`: lowercase letters, digits, `.`, `_`, `-`, up to 64 cha
   2. ✅ Git: `git clone` and `git push` work normally
   3. ✅ Tokens: short-lived, limited to ref patterns
   4. ✅ Read files, folders, history without cloning
-  5. Commit through the API, with a 409 when two agents race
+  5. ✅ Commit through the API, with a 409 when two agents race (TLA+ model in `tests/tla/commit_cas`)
   6. Diff and merge branches
   7. Branches that delete themselves after a set time
   8. Webhooks on push
@@ -73,7 +76,7 @@ Repo names are `ns/repo`: lowercase letters, digits, `.`, `_`, `-`, up to 64 cha
 ## Development
 
 ```sh
-scripts/verify.sh   # the full gate; must print VERIFY PASSED
+scripts/verify.sh   # the full gate; must print VERIFY PASSED (needs Java and tla2tools.jar, see tests/tla/commit_cas/check.sh)
 ```
 
 See `AGENTS.md` and `RULES.md`.

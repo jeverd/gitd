@@ -134,6 +134,10 @@ function describe(e) {
       if (e.detail === "deleted") return ["push", `${e.repo} ${ref} deleted`];
       return ["push", `${e.repo} ${ref} ${short(e.old)} → ${short(e.new)}`];
     case "push_rejected": return ["push REJECTED", `${e.repo} ${ref}: ${e.detail}`];
+    case "commit": return ["commit", `${e.repo} ${ref} ${short(e.old)} → ${short(e.new)} "${e.detail}"`];
+    case "commit_conflict": return ["commit CONFLICT", `${e.repo} ${ref}: built on ${short(e.old)}, branch is at ${short(e.new)} → 409`];
+    case "branch_created": return ["branch created", `${e.repo} ${ref} at ${short(e.new)}`];
+    case "branch_deleted": return ["branch deleted", `${e.repo} ${ref}`];
     default: return [e.kind.replace(/_/g, " "), `${e.repo} ${ref} ${e.detail}`.trim()];
   }
 }

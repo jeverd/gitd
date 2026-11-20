@@ -14,10 +14,16 @@ pub const max_json_body = 64 * 1024;
 pub const BodyError = error{ BodyTooLarge, InvalidJson, ReadFailed, OutOfMemory };
 
 pub fn readJson(comptime T: type, gpa: std.mem.Allocator, request: *http.Server.Request) BodyError!std.json.Parsed(T) {
+    return readJsonLimit(T, gpa, request, max_json_body);
+}
+
+/// Like `readJson` with a caller-chosen body limit, for bodies that carry
+/// file contents.
+pub fn readJsonLimit(comptime T: type, gpa: std.mem.Allocator, request: *http.Server.Request, limit: usize) BodyError!std.json.Parsed(T) {
     if (request.head.transfer_compression != .identity) return error.InvalidJson;
     var buf: [4096]u8 = undefined;
     const reader = request.readerExpectContinue(&buf) catch return error.ReadFailed;
-    const bytes = reader.allocRemaining(gpa, .limited(max_json_body)) catch |err| return switch (err) {
+    const bytes = reader.allocRemaining(gpa, .limited(limit)) catch |err| return switch (err) {
         error.StreamTooLong => error.BodyTooLarge,
         error.OutOfMemory => error.OutOfMemory,
         error.ReadFailed => error.ReadFailed,
@@ -34,7 +40,7 @@ pub fn readJson(comptime T: type, gpa: std.mem.Allocator, request: *http.Server.
 
 pub fn respondBodyError(request: *http.Server.Request, err: BodyError) HandleError!http.Status {
     return switch (err) {
-        error.BodyTooLarge => respondError(request, .payload_too_large, "too_large", "JSON bodies are limited to 64 KiB"),
+        error.BodyTooLarge => respondError(request, .payload_too_large, "too_large", "the JSON body is too large"),
         error.InvalidJson => respondError(request, .bad_request, "invalid_json", "the body does not match the expected JSON"),
         error.ReadFailed => error.WriteFailed,
         error.OutOfMemory => internal(request),

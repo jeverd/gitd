@@ -238,4 +238,103 @@ pub const Repo = struct {
         }
         return .{ .raw = raw, .items = try list.toOwnedSlice(r.gpa) };
     }
+
+    pub const Change = struct {
+        /// Validated repo path.
+        path: []const u8,
+        /// New contents, or null to delete the file.
+        content: ?[]const u8,
+    };
+
+    pub const Author = struct { name: []const u8, email: []const u8 };
+
+    /// Builds a commit from `parent` (null for a root commit) plus
+    /// `changes`, and writes its oid into `out`. Does not move any ref.
+    pub fn buildCommit(
+        r: *const Repo,
+        parent: ?[]const u8,
+        changes: []const Change,
+        message: []const u8,
+        author: Author,
+        out: *[64]u8,
+    ) git_cmd.Error![]const u8 {
+        // A private index, so concurrent commits never share one.
+        var random: [8]u8 = undefined;
+        r.io.random(&random);
+        var index_buf: [store_mod.Store.max_path_len]u8 = undefined;
+        const index_path = std.mem.print(&index_buf, "{s}/{x}.index", .{ r.store.tmp, random }) catch return error.GitFailed;
+        defer Io.Dir.cwd().deleteFile(r.io, index_path) catch {}; // may never have been created
+        const index_env = [_][2][]const u8{.{ "GIT_INDEX_FILE", index_path }};
+
+        if (parent) |p| {
+            r.gpa.free(try r.gitOutput(&.{ "read-tree", "--end-of-options", p }, .{ .env = &index_env }));
+        } else {
+            r.gpa.free(try r.gitOutput(&.{ "read-tree", "--empty" }, .{ .env = &index_env }));
+        }
+
+        var info: std.ArrayList(u8) = .empty;
+        defer info.deinit(r.gpa);
+        for (changes) |change| {
+            if (change.content) |data| {
+                const oid_raw = try r.gitOutput(&.{ "hash-object", "-w", "--stdin" }, .{ .stdin = data });
+                defer r.gpa.free(oid_raw);
+                const oid = std.mem.trimEnd(u8, oid_raw, "\n");
+                try info.print(r.gpa, "100644 {s}\t{s}\n", .{ oid, change.path });
+            } else {
+                // Mode 0 removes the path from the index.
+                try info.print(r.gpa, "0 0000000000000000000000000000000000000000\t{s}\n", .{change.path});
+            }
+        }
+        if (info.items.len > 0) {
+            r.gpa.free(try r.gitOutput(&.{ "update-index", "--index-info" }, .{ .env = &index_env, .stdin = info.items }));
+        }
+        const tree_raw = try r.gitOutput(&.{"write-tree"}, .{ .env = &index_env });
+        defer r.gpa.free(tree_raw);
+        const tree = std.mem.trimEnd(u8, tree_raw, "\n");
+
+        const ident_env = [_][2][]const u8{
+            .{ "GIT_AUTHOR_NAME", author.name },
+            .{ "GIT_AUTHOR_EMAIL", author.email },
+            .{ "GIT_COMMITTER_NAME", "gitd" },
+            .{ "GIT_COMMITTER_EMAIL", "gitd@localhost" },
+        };
+        const commit_raw = if (parent) |p|
+            try r.gitOutput(&.{ "commit-tree", tree, "-p", p, "-F", "-" }, .{ .env = &ident_env, .stdin = message })
+        else
+            try r.gitOutput(&.{ "commit-tree", tree, "-F", "-" }, .{ .env = &ident_env, .stdin = message });
+        defer r.gpa.free(commit_raw);
+        const sha = std.mem.trimEnd(u8, commit_raw, "\n");
+        if (sha.len > out.len) return error.GitFailed;
+        @memcpy(out[0..sha.len], sha);
+        return out[0..sha.len];
+    }
+
+    pub const RefUpdate = enum { updated, stale };
+
+    /// Atomically moves `ref` from `expected` to `new` (R3.2). `expected`
+    /// null means the ref must not exist yet, except when deleting (`new`
+    /// null), where it means delete whatever the ref points at.
+    /// Returns .stale when the ref was not at `expected`. git takes the
+    /// ref's lock and compares under it, so this is a compare-and-swap
+    /// against every other writer, pushes included. Modeled in
+    /// tests/tla/commit_cas/CommitCAS.tla (`NoLostUpdate`).
+    pub fn updateRef(r: *const Repo, ref: []const u8, new: ?[]const u8, expected: ?[]const u8) git_cmd.Error!RefUpdate {
+        const zero = "0000000000000000000000000000000000000000";
+        const old = expected orelse zero;
+        const result = if (new) |n|
+            try r.git(&.{ "update-ref", "-m", "gitd", "--no-deref", "--end-of-options", ref, n, old }, .{})
+        else if (expected) |e|
+            try r.git(&.{ "update-ref", "-m", "gitd", "--no-deref", "-d", "--end-of-options", ref, e }, .{})
+        else
+            try r.git(&.{ "update-ref", "-m", "gitd", "--no-deref", "-d", "--end-of-options", ref }, .{});
+        defer result.deinit(r.gpa);
+        if (result.code == 0) return .updated;
+        // Distinguish a lost race from a real failure by looking again.
+        var buf: [64]u8 = undefined;
+        const current = try r.refValue(ref, &buf);
+        const matches = if (expected) |e| (current != null and std.mem.eql(u8, current.?, e)) else current == null;
+        if (!matches) return .stale;
+        std.log.err("git update-ref {s} failed: {s}", .{ ref, std.mem.trimEnd(u8, result.stderr, "\n") });
+        return error.GitFailed;
+    }
 };
