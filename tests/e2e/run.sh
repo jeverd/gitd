@@ -864,6 +864,21 @@ expect_eq "sync rejects embedded credentials" 400 "$(admin -X POST "$BASE/v1/rep
 expect_eq "sync rejects bad direction" 400 "$(admin -X POST "$BASE/v1/repos/acme/mirror/sync" -d "$(sync_body clone "$BASE/acme/other.git" main)")"
 expect_eq "sync push missing branch" 404 "$(admin -X POST "$BASE/v1/repos/acme/mirror/sync" -d "$(sync_body push "$BASE/acme/other.git" no-such-branch "$UP_TOK")")"
 
+echo "== SDKs (TypeScript and Python)"
+ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+if GITD_URL="$BASE" GITD_KEY="$KEY" python3 -m unittest discover -s "$ROOT_DIR/sdk/python" -p "test_*.py" >"$WORK/py-sdk.out" 2>&1; then
+  pass "Python SDK end-to-end"
+else
+  fail "Python SDK: $(cat "$WORK/py-sdk.out")"
+fi
+if command -v node >/dev/null && node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)'; then
+  if GITD_URL="$BASE" GITD_KEY="$KEY" node --test "$ROOT_DIR/sdk/ts/test.ts" >"$WORK/ts-sdk.out" 2>&1; then
+    pass "TypeScript SDK end-to-end"
+  else
+    fail "TypeScript SDK: $(cat "$WORK/ts-sdk.out")"
+  fi
+fi
+
 echo "== restart keeps data and secret"
 REPOS_BEFORE="$(admin "$BASE/v1/repos" >/dev/null; json '["repos"].__len__()')"
 expect_eq "branch that expires across a restart" 201 "$(admin -X POST "$BASE/v1/repos/acme/other/branches" -d '{"name":"ttl/restart","from":"main","ttl_seconds":3}')"
