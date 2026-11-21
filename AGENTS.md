@@ -51,7 +51,7 @@ src/
   repo_git.zig      repo operations built on git plumbing (branches, refs, ...)
   ref_name.zig      ref name and ref pattern validation (pure)
   pktline.zig       git smart protocol pkt-line framing and side-band mux (pure)
-  receive_pack.zig  reads the ref update commands at the start of a push (pure)
+  receive_pack.zig  native git-receive-pack RPC handler and pkt-line command parser
   upload_pack.zig   native git smart HTTP ref discovery (/info/refs) and upload-pack
   repo_path.zig     file path validation (pure)
   content.zig       per-repo content API: branches, files, trees, log, commits, merges

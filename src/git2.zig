@@ -18,6 +18,26 @@ pub const Revwalk = opaque {};
 pub const Blob = opaque {};
 pub const Object = opaque {};
 pub const Odb = opaque {};
+pub const Indexer = opaque {};
+
+pub const IndexerProgress = extern struct {
+    total_objects: c_uint = 0,
+    indexed_objects: c_uint = 0,
+    received_objects: c_uint = 0,
+    local_objects: c_uint = 0,
+    total_deltas: c_uint = 0,
+    indexed_deltas: c_uint = 0,
+    received_bytes: usize = 0,
+};
+
+pub const IndexerProgressCb = ?*const fn (*const IndexerProgress, ?*anyopaque) callconv(.c) c_int;
+
+pub const IndexerOptions = extern struct {
+    version: c_uint = 1,
+    progress_cb: IndexerProgressCb = null,
+    progress_cb_payload: ?*anyopaque = null,
+    verify: u8 = 0,
+};
 
 pub const oid_raw_len = 20;
 pub const oid_hex_len = 40;
@@ -213,11 +233,49 @@ pub extern fn git_blob_create_from_buffer(
 ) c_int;
 
 pub extern fn git_odb_free(db: *Odb) void;
+pub extern fn git_odb_exists(db: *Odb, id: *const Oid) c_int;
+pub extern fn git_odb_refresh(db: *Odb) c_int;
 pub extern fn git_odb_read_header(
     len_out: *usize,
     type_out: *c_int,
     db: *Odb,
     id: *const Oid,
+) c_int;
+
+pub extern fn git_indexer_options_init(opts: *IndexerOptions, version: c_uint) c_int;
+pub extern fn git_indexer_new(
+    out: *?*Indexer,
+    path: [*:0]const u8,
+    mode: c_uint,
+    odb: ?*Odb,
+    opts: ?*IndexerOptions,
+) c_int;
+pub extern fn git_indexer_append(
+    idx: *Indexer,
+    data: *const anyopaque,
+    size: usize,
+    stats: *IndexerProgress,
+) c_int;
+pub extern fn git_indexer_commit(idx: *Indexer, stats: *IndexerProgress) c_int;
+pub extern fn git_indexer_free(idx: *Indexer) void;
+
+pub extern fn git_graph_ahead_behind(
+    ahead: *usize,
+    behind: *usize,
+    repo: *Repository,
+    local: *const Oid,
+    upstream: *const Oid,
+) c_int;
+pub extern fn git_graph_descendant_of(
+    repo: *Repository,
+    commit: *const Oid,
+    ancestor: *const Oid,
+) c_int;
+pub extern fn git_merge_base(
+    out: *Oid,
+    repo: *Repository,
+    one: *const Oid,
+    two: *const Oid,
 ) c_int;
 
 pub extern fn git_signature_new(
