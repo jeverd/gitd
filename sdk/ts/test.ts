@@ -127,6 +127,20 @@ test("TypeScript SDK end-to-end", async () => {
     assert.equal(attempts, 2);
     assert.equal(retried.parent, raced.sha);
 
+    // Surgical edits + patch commit via commitWithRetry
+    const patched = await agent.commitWithRetry(repoName, "agent/ts/work", () => ({
+      message: "Patch greeting surgically",
+      changes: [{ path: "src/app.ts", edits: [{ old: "greeting =", new: "const msg =" }] }],
+    }));
+    const patchedText = await agent.readTextFile(repoName, "src/app.ts", patched.sha);
+    assert.ok(patchedText.includes("const msg ="));
+    await agent.commit(repoName, {
+      branch: "agent/ts/work",
+      expected_head: patched.sha,
+      message: "Restore via edits",
+      changes: [{ path: "src/app.ts", edits: [{ old: "const msg =", new: "greeting =" }] }],
+    });
+
     // Grep & Archive
     const grepRes = await agent.grep(repoName, "greeting", { ref: "agent/ts/work" });
     assert.equal(grepRes.matches.length, 1);
@@ -144,7 +158,7 @@ test("TypeScript SDK end-to-end", async () => {
     assert.equal(dryOk.result, "fast_forward");
 
     const diff = await admin.compare(repoName, "main", "agent/ts/work");
-    assert.equal(diff.ahead, 3);
+    assert.equal(diff.ahead, 5);
     const merged = await admin.merge(repoName, { base: "main", head: "agent/ts/work" });
     assert.equal(merged.result, "fast_forward");
 

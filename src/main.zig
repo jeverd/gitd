@@ -275,4 +275,5 @@ test {
     _ = @import("merge_check.zig");
     _ = @import("maintenance.zig");
     _ = @import("checks.zig");
+    _ = @import("patch.zig");
 }

@@ -125,6 +125,24 @@ class GitdSdkTest(unittest.TestCase):
         self.assertEqual(attempts, 2)
         self.assertEqual(retried["parent"], raced["sha"])
 
+        # Surgical edit commit via commit_with_retry
+        patched = agent.commit_with_retry(
+            repo,
+            "agent/py/work",
+            lambda _: {
+                "message": "Surgical edit",
+                "changes": [{"path": "app.py", "edits": [{"old": "GREETING", "new": "MSG"}]}],
+            },
+        )
+        self.assertIn("MSG = ", agent.read_text_file(repo, "app.py", ref=patched["sha"]))
+        agent.commit(
+            repo,
+            branch="agent/py/work",
+            expected_head=patched["sha"],
+            message="Restore",
+            changes=[{"path": "app.py", "edits": [{"old": "MSG", "new": "GREETING"}]}],
+        )
+
         # Grep & Archive
         grep_res = agent.grep(repo, "GREETING", ref="agent/py/work")
         self.assertEqual(len(grep_res["matches"]), 1)
@@ -141,7 +159,7 @@ class GitdSdkTest(unittest.TestCase):
         self.assertEqual(dry_ok["result"], "fast_forward")
 
         diff = admin.compare(repo, "main", "agent/py/work")
-        self.assertEqual(diff["ahead"], 3)
+        self.assertEqual(diff["ahead"], 5)
         merged = admin.merge(repo, base="main", head="agent/py/work")
         self.assertEqual(merged["result"], "fast_forward")
 
