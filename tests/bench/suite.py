@@ -35,7 +35,7 @@ import common  # noqa: E402
 
 OSS_REPO_SPECS = {
     "small": {"name": "ripgrep", "url": "https://github.com/BurntSushi/ripgrep.git"},
-    "medium": {"name": "redis", "url": "https://github.com/redis/redis.git"},
+    "medium": {"name": "ruff", "url": "https://github.com/astral-sh/ruff.git"},
     "large": {"name": "zig", "url": "https://github.com/ziglang/zig.git"},
 }
 

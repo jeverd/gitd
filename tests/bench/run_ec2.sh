@@ -29,6 +29,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+export PATH="/opt/zig:$PATH"
 ZIG_VERSION="$(sed -n 's/.*\.minimum_zig_version = "\(.*\)".*/\1/p' build.zig.zon)"
 if ! command -v zig >/dev/null || [[ "$(zig version)" != "$ZIG_VERSION" ]]; then
   arch="$(uname -m)"
