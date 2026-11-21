@@ -735,7 +735,8 @@ for _ in $(seq 1 40); do [[ -z "$(leftover)" ]] && break; sleep 0.1; done
 [[ -z "$(leftover)" ]] || fail "git processes left after an interrupted clone: $(leftover)"
 pass "interrupted clone leaves no git processes"
 # A client that asks for a clone and never reads is dropped once writes
-# stall past the idle timeout (2s here), and its git processes go with it.
+# stall past the idle timeout (2s here), aborting native pack streaming cleanly.
+STALL_BEFORE="$(grep -c 'POST /acme/web.git/git-upload-pack: client went away (ResponseBroken)' "$LOG" || true)"
 python3 - "$PORT" "$RO" "$TIP" <<'PY' &
 import base64, socket, sys, time
 port, token, tip = int(sys.argv[1]), sys.argv[2], sys.argv[3]
@@ -745,16 +746,21 @@ s = socket.create_connection(("127.0.0.1", port))
 s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
 s.sendall((f"POST /acme/web.git/git-upload-pack HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {auth}\r\n"
            f"Content-Type: application/x-git-upload-pack-request\r\nContent-Length: {len(body)}\r\n\r\n").encode() + body)
-time.sleep(9)
+time.sleep(11)
 s.close()
 PY
 STALLED=$!
-sleep 1
-[[ -n "$(leftover)" ]] || fail "stalled-reader test: clone never started"
-for _ in $(seq 1 60); do [[ -z "$(leftover)" ]] && break; sleep 0.1; done
-[[ -z "$(leftover)" ]] || fail "git processes kept alive by a client that stopped reading: $(leftover)"
-pass "client that stops reading is dropped and its git processes killed"
-wait "$STALLED" || true
+STALL_DROPPED=0
+for _ in $(seq 1 100); do
+  NOW_STALL="$(grep -c 'POST /acme/web.git/git-upload-pack: client went away (ResponseBroken)' "$LOG" || true)"
+  if [[ "$NOW_STALL" -gt "$STALL_BEFORE" ]]; then STALL_DROPPED=1; break; fi
+  sleep 0.1
+done
+[[ "$STALL_DROPPED" -eq 1 ]] || fail "client that stopped reading was not dropped by idle write timeout"
+[[ -z "$(leftover)" ]] || fail "git processes spawned during native clone: $(leftover)"
+pass "client that stops reading is dropped by write timeout with zero git processes"
+kill "$STALLED" 2>/dev/null || true
+wait "$STALLED" 2>/dev/null || true
 expect_eq "server still serves after interrupted clone" 200 "$(status "$BASE/healthz")"
 
 echo "== hooks never run (R2.4)"
@@ -1400,6 +1406,68 @@ git -C "$SRC" push -q "$(url "$RW" acme/web)" HEAD:refs/heads/spill5m 2>"$WORK/e
 expect_eq "no temp files left after >4MiB push" 0 "$(find "$DATA/tmp" -type f | wc -l | tr -d ' ')"
 git --git-dir="$DATA/repos/acme/web.git" fsck --strict --full >/dev/null 2>"$WORK/err" || fail "fsck after native pushes: $(cat "$WORK/err")"
 pass "native receive-pack >4MiB file-spilled push passes git fsck --strict"
+
+echo "== native git-upload-pack (shallow, incremental fetch, v2 read_refs, gzip)"
+# Shallow clone (--depth=1) on both protocol v2 and v0
+SHALLOW_V2="$WORK/shallow-v2"
+git -c protocol.version=2 clone -q --depth=1 --branch main "$(url "$RW" acme/web)" "$SHALLOW_V2" 2>"$WORK/err" || fail "shallow clone v2: $(cat "$WORK/err")"
+expect_eq "shallow v2 clone has depth 1" 1 "$(git -C "$SHALLOW_V2" rev-list --count HEAD)"
+SHALLOW_V0="$WORK/shallow-v0"
+git -c protocol.version=0 clone -q --depth=1 --branch main "$(url "$RW" acme/web)" "$SHALLOW_V0" 2>"$WORK/err" || fail "shallow clone v0: $(cat "$WORK/err")"
+expect_eq "shallow v0 clone has depth 1" 1 "$(git -C "$SHALLOW_V0" rev-list --count HEAD)"
+pass "native upload-pack --depth=1 works on protocol v0 and v2"
+
+# Incremental fetch with `have` negotiation
+INCR="$WORK/incr-clone"
+git -c protocol.version=2 clone -q --branch atomic-target "$(url "$RW" acme/web)" "$INCR" 2>"$WORK/err" || fail "incr clone: $(cat "$WORK/err")"
+echo "incremental-update" >"$SRC/incr.txt"
+git -C "$SRC" add incr.txt
+git "${GIT_ID[@]}" -C "$SRC" commit -qm "incremental commit"
+git -C "$SRC" push -q "$(url "$RW" acme/web)" HEAD:refs/heads/atomic-target 2>"$WORK/err" || fail "push incremental: $(cat "$WORK/err")"
+git -c protocol.version=2 -C "$INCR" fetch -q origin atomic-target 2>"$WORK/err" || fail "incr fetch v2: $(cat "$WORK/err")"
+expect_eq "incremental fetch reached new tip" "$(git -C "$SRC" rev-parse HEAD)" "$(git -C "$INCR" rev-parse FETCH_HEAD)"
+pass "native upload-pack incremental fetch with have/want negotiation"
+
+# Protocol v2 read_refs isolation: restricted token gets v2 ls-refs filtered AND
+# raw v2 fetch for a hidden branch SHA (not reachable from main) is rejected with ERR not our ref.
+READ_ONLY_MAIN="$(admin -X POST "$BASE/v1/tokens" -d '{"repo":"acme/web","scopes":["git:read"],"read_refs":["refs/heads/main"]}' >/dev/null; json '["token"]')"
+HIDDEN_SHA="$(git ls-remote "$(url "$RW" acme/web)" refs/heads/spill5m | cut -f1)"
+git -c protocol.version=2 ls-remote "$(url "$READ_ONLY_MAIN" acme/web)" >"$WORK/ls-restricted-v2" 2>"$WORK/err" || fail "restricted v2 ls-remote: $(cat "$WORK/err")"
+if grep -q "spill5m" "$WORK/ls-restricted-v2"; then fail "restricted v2 ls-remote leaked hidden branch"; fi
+grep -q "refs/heads/main" "$WORK/ls-restricted-v2" || fail "restricted v2 ls-remote missing allowed branch"
+python3 - "$PORT" "$READ_ONLY_MAIN" "$HIDDEN_SHA" <<'PY' || fail "v2 hidden fetch was not rejected"
+import base64, gzip, sys, urllib.request
+port, tok, hidden = sys.argv[1], sys.argv[2], sys.argv[3]
+def pkt(s): return f"{len(s)+4:04x}".encode() + s
+body = pkt(b"command=fetch\n") + b"0001" + pkt(f"want {hidden}\n".encode()) + pkt(b"done\n") + b"0000"
+req = urllib.request.Request(
+    f"http://127.0.0.1:{port}/acme/web.git/git-upload-pack",
+    data=body,
+    headers={
+        "Authorization": "Basic " + base64.b64encode(f"t:{tok}".encode()).decode(),
+        "Content-Type": "application/x-git-upload-pack-request",
+        "Git-Protocol": "version=2",
+    },
+)
+resp = urllib.request.urlopen(req).read()
+assert b"ERR not our ref" in resp, resp
+
+# Also verify Content-Encoding: gzip on POST /git-upload-pack (ls-refs)
+ls_body = gzip.compress(pkt(b"command=ls-refs\n") + b"0001" + pkt(b"ref-prefix refs/heads/\n") + b"0000")
+req2 = urllib.request.Request(
+    f"http://127.0.0.1:{port}/acme/web.git/git-upload-pack",
+    data=ls_body,
+    headers={
+        "Authorization": "Basic " + base64.b64encode(f"t:{tok}".encode()).decode(),
+        "Content-Type": "application/x-git-upload-pack-request",
+        "Content-Encoding": "gzip",
+        "Git-Protocol": "version=2",
+    },
+)
+resp2 = urllib.request.urlopen(req2).read()
+assert b"refs/heads/main" in resp2 and b"spill5m" not in resp2, resp2
+PY
+pass "native upload-pack v2 enforces read_refs isolation and supports gzip bodies"
 
 # Stop while a slow clone is mid-transfer: gitd must still exit promptly and
 # take its git processes with it.

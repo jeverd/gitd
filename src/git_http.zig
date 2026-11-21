@@ -1,8 +1,4 @@
-//! Git's smart HTTP protocol, served by handing each request to
-//! `git http-backend` (a CGI program).
-//!
-//! This file has the pure parts: matching git URLs and parsing the CGI
-//! response head. `git_proxy.zig` runs the process.
+//! Git smart HTTP URL matching (pure).
 //!
 //! Only the smart protocol is served. Dumb-protocol paths such as
 //! `/objects/...` and `/HEAD` are rejected, so clients cannot read repo
@@ -83,61 +79,6 @@ fn serviceFromQuery(query: []const u8) ?Service {
     return Service.fromProgramName(query[prefix.len..]);
 }
 
-/// Response headers from the CGI that gitd forwards to the client.
-pub const forwarded_headers = [_][]const u8{ "Content-Type", "Cache-Control", "Expires", "Pragma" };
-
-pub const max_cgi_head_len = 8 * 1024;
-pub const max_cgi_headers = 16;
-
-pub const CgiHead = struct {
-    status: std.http.Status = .ok,
-    headers: [max_cgi_headers]std.http.Header = undefined,
-    header_count: usize = 0,
-    /// Bytes after the blank line, which start the body.
-    body_start: usize,
-
-    pub fn forwarded(h: *const CgiHead) []const std.http.Header {
-        return h.headers[0..h.header_count];
-    }
-};
-
-pub const CgiParseError = error{ CgiHeadIncomplete, CgiHeadInvalid };
-
-/// Parses the CGI response head in `bytes`. Header slices borrow `bytes`.
-/// Accepts `\n` or `\r\n` line endings, as CGI allows both.
-pub fn parseCgiHead(bytes: []const u8) CgiParseError!CgiHead {
-    var head: CgiHead = .{ .body_start = 0 };
-    var pos: usize = 0;
-    while (true) {
-        const nl = std.mem.findScalarPos(u8, bytes, pos, '\n') orelse return error.CgiHeadIncomplete;
-        var line = bytes[pos..nl];
-        pos = nl + 1;
-        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-        if (line.len == 0) {
-            head.body_start = pos;
-            return head;
-        }
-        const colon = std.mem.findScalar(u8, line, ':') orelse return error.CgiHeadInvalid;
-        const name = line[0..colon];
-        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        if (name.len == 0) return error.CgiHeadInvalid;
-
-        if (std.ascii.eqlIgnoreCase(name, "Status")) {
-            const code_end = std.mem.findScalar(u8, value, ' ') orelse value.len;
-            const code = std.fmt.parseInt(u10, value[0..code_end], 10) catch return error.CgiHeadInvalid;
-            if (code < 200 or code > 599) return error.CgiHeadInvalid;
-            head.status = @fromBackingInt(code);
-            continue;
-        }
-        for (forwarded_headers) |allowed| {
-            if (!std.ascii.eqlIgnoreCase(name, allowed)) continue;
-            if (head.header_count == max_cgi_headers) return error.CgiHeadInvalid;
-            head.headers[head.header_count] = .{ .name = allowed, .value = value };
-            head.header_count += 1;
-        }
-    }
-}
-
 const testing = std.testing;
 
 test "matches smart protocol URLs" {
@@ -174,35 +115,14 @@ test "rejects dumb protocol, traversal, and wrong methods" {
     try testing.expectError(error.MethodNotAllowed, match(.GET, "/acme/web.git/git-receive-pack", ""));
 }
 
-test "parses CGI heads" {
-    const crlf = try parseCgiHead("Status: 403 Forbidden\r\nContent-Type: text/plain\r\nX-Other: no\r\n\r\nbody");
-    try testing.expectEqual(std.http.Status.forbidden, crlf.status);
-    try testing.expectEqual(@as(usize, 1), crlf.forwarded().len);
-    try testing.expectEqualStrings("text/plain", crlf.forwarded()[0].value);
-
-    const bytes = "Content-Type: application/x-git-upload-pack-advertisement\nCache-Control: no-cache\n\nPACK";
-    const lf = try parseCgiHead(bytes);
-    try testing.expectEqual(std.http.Status.ok, lf.status);
-    try testing.expectEqualStrings("PACK", bytes[lf.body_start..]);
-
-    try testing.expectError(error.CgiHeadIncomplete, parseCgiHead("Content-Type: x\r\n"));
-    try testing.expectError(error.CgiHeadInvalid, parseCgiHead("garbage\r\n\r\n"));
-    try testing.expectError(error.CgiHeadInvalid, parseCgiHead("Status: 99 Low\r\n\r\n"));
-    try testing.expectError(error.CgiHeadInvalid, parseCgiHead("Status: abc\r\n\r\n"));
+test "fuzz match" {
+    try testing.fuzz({}, fuzzMatch, .{ .corpus = &.{ "/acme/web.git/info/refs", "/acme/web.git/git-upload-pack" } });
 }
 
-test "fuzz match and parseCgiHead" {
-    try testing.fuzz({}, fuzzParsers, .{ .corpus = &.{ "/acme/web.git/info/refs", "Status: 200 OK\r\n\r\n" } });
-}
-
-fn fuzzParsers(_: void, smith: *std.testing.Smith) anyerror!void {
+fn fuzzMatch(_: void, smith: *std.testing.Smith) anyerror!void {
     var buf: [512]u8 = undefined;
     const input = buf[0..smith.slice(&buf)];
     if (match(.GET, input, "service=git-upload-pack") catch null) |route| {
         try testing.expect(std.mem.find(u8, route.path_info, "..") == null);
     }
-    if (parseCgiHead(input)) |head| {
-        try testing.expect(head.body_start <= input.len);
-        try testing.expect(head.header_count <= max_cgi_headers);
-    } else |_| {}
 }
