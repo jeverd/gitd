@@ -280,7 +280,9 @@ test {
     _ = @import("git_cmd.zig");
     _ = @import("git2.zig");
     _ = @import("ref_name.zig");
+    _ = @import("pktline.zig");
     _ = @import("receive_pack.zig");
+    _ = @import("upload_pack.zig");
     _ = @import("repo_git.zig");
     _ = @import("events.zig");
     _ = @import("ui.zig");

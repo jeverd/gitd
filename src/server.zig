@@ -21,6 +21,7 @@ const Db = @import("db.zig").Db;
 const Store = @import("store.zig").Store;
 const timed = @import("timed_stream.zig");
 const receive_pack = @import("receive_pack.zig");
+const upload_pack = @import("upload_pack.zig");
 const repo_git = @import("repo_git.zig");
 const events = @import("events.zig");
 const ui = @import("ui.zig");
@@ -514,8 +515,14 @@ fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route,
 
     // The ref advertisement is a GET; a body there is never read, and std
     // would otherwise try to drain it after the response (R3.4).
-    if (git_route.kind == .info_refs and http_util.hasBody(request)) {
-        return respondError(request, .bad_request, "bad_git_request", "info/refs takes no request body");
+    if (git_route.kind == .info_refs) {
+        if (http_util.hasBody(request)) {
+            return respondError(request, .bad_request, "bad_git_request", "info/refs takes no request body");
+        }
+        var proto_buf: [128]u8 = undefined;
+        const git_proto = copyBounded(&proto_buf, findHeader(request, "git-protocol") orelse "") orelse
+            return respondError(request, .bad_request, "bad_git_request", "a git request header is too long");
+        return upload_pack.serveInfoRefs(app, request, git_route.repo, git_route.service, git_proto, &claims);
     }
 
     // Copy what the CGI needs before the body is read. Oversize values are

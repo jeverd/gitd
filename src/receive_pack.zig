@@ -8,6 +8,7 @@
 //! them, and their commands sit inside a signed block.
 
 const std = @import("std");
+const pktline = @import("pktline.zig");
 const ref_name = @import("ref_name.zig");
 
 pub const max_commands = 512;
@@ -98,35 +99,22 @@ pub fn hasCapability(caps: []const u8, name: []const u8) bool {
 pub fn writeRejection(w: *std.Io.Writer, caps: []const u8, commands: []const Command, reasons: []const []const u8, message: []const u8) std.Io.Writer.Error!void {
     var report_buf: [64 * 1024]u8 = undefined;
     var report: std.Io.Writer = .fixed(&report_buf);
-    writePkt(&report, "unpack ok\n") catch {};
+    pktline.write(&report, "unpack ok\n") catch {};
     for (commands, reasons) |cmd, reason| {
         var line_buf: [1024]u8 = undefined;
         const line = std.mem.print(&line_buf, "ng {s} {s}\n", .{ cmd.ref, reason }) catch continue;
-        writePkt(&report, line) catch break;
+        pktline.write(&report, line) catch break;
     }
-    report.writeAll("0000") catch {};
+    pktline.writeFlush(&report) catch {};
     const body = report.buffered();
 
-    const band_max: usize = if (hasCapability(caps, "side-band-64k")) 65515 else if (hasCapability(caps, "side-band")) 995 else 0;
+    const band_max: usize = if (hasCapability(caps, "side-band-64k")) pktline.sideband_64k_max else if (hasCapability(caps, "side-band")) pktline.sideband_max else 0;
     if (band_max == 0) return w.writeAll(body);
     var msg_buf: [1024]u8 = undefined;
-    const progress = std.mem.print(&msg_buf, "\x02{s}\n", .{message}) catch "";
-    if (progress.len > 0 and progress.len + 4 <= band_max) try writePkt(w, progress);
-    var rest = body;
-    while (rest.len > 0) {
-        const n = @min(rest.len, band_max - 1);
-        var chunk_buf: [65520]u8 = undefined;
-        chunk_buf[0] = 1;
-        @memcpy(chunk_buf[1..][0..n], rest[0..n]);
-        try writePkt(w, chunk_buf[0 .. n + 1]);
-        rest = rest[n..];
-    }
-    try w.writeAll("0000");
-}
-
-fn writePkt(w: *std.Io.Writer, payload: []const u8) std.Io.Writer.Error!void {
-    try w.print("{x:0>4}", .{payload.len + 4});
-    try w.writeAll(payload);
+    const progress = std.mem.print(&msg_buf, "{s}\n", .{message}) catch "";
+    if (progress.len > 0 and progress.len + 5 <= band_max) try pktline.writeSideband(w, .progress, progress, band_max);
+    try pktline.writeSideband(w, .pack, body, band_max);
+    try pktline.writeFlush(w);
 }
 
 pub fn isOid(text: []const u8) bool {

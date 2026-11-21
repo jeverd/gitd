@@ -1307,6 +1307,31 @@ fi
 echo "== restart keeps data and secret"
 REPOS_BEFORE="$(admin "$BASE/v1/repos" >/dev/null; json '["repos"].__len__()')"
 expect_eq "branch that expires across a restart" 201 "$(admin -X POST "$BASE/v1/repos/acme/other/branches" -d '{"name":"ttl/restart","from":"main","ttl_seconds":3}')"
+echo "== native smart HTTP info/refs"
+git "${GIT_ID[@]}" -C "$SRC" tag -a v1-e2e -m "annotated release" HEAD
+git -C "$SRC" push -q "$(url "$RW" acme/web)" refs/tags/v1-e2e 2>"$WORK/err" || fail "push annotated tag: $(cat "$WORK/err")"
+expect_eq "native v2 upload-pack info/refs" 200 "$(status -u "t:$RW" -H 'Git-Protocol: version=2' "$BASE/acme/web.git/info/refs?service=git-upload-pack")"
+grep -q "agent=gitd" "$WORK/body" || fail "v2 info/refs missing agent=gitd: $(cat "$WORK/body")"
+grep -q "version 2" "$WORK/body" || fail "v2 info/refs missing version 2: $(cat "$WORK/body")"
+pass "native v2 upload-pack info/refs served by gitd"
+
+expect_eq "native v1 upload-pack info/refs" 200 "$(status -u "t:$RW" "$BASE/acme/web.git/info/refs?service=git-upload-pack")"
+grep -q "agent=gitd" "$WORK/body" || fail "v1 info/refs missing agent=gitd"
+grep -q "symref=HEAD:refs/heads/main" "$WORK/body" || fail "v1 info/refs missing HEAD symref"
+grep -q 'refs/tags/v1-e2e\^{}' "$WORK/body" || fail "v1 info/refs missing peeled annotated tag"
+pass "native v1 upload-pack info/refs includes symref and peeled tags"
+
+expect_eq "native receive-pack info/refs" 200 "$(status -u "t:$RW" "$BASE/acme/web.git/info/refs?service=git-receive-pack")"
+grep -q "agent=gitd" "$WORK/body" || fail "receive-pack info/refs missing agent=gitd"
+grep -q "report-status-v2" "$WORK/body" || fail "receive-pack info/refs missing report-status-v2"
+pass "native receive-pack info/refs served by gitd"
+
+git -c protocol.version=0 ls-remote "$(url "$RW" acme/web)" >"$WORK/ls-v0" 2>"$WORK/err" || fail "ls-remote v0: $(cat "$WORK/err")"
+grep -q 'refs/tags/v1-e2e\^{}' "$WORK/ls-v0" || fail "ls-remote v0 missing peeled tag: $(cat "$WORK/ls-v0")"
+git -c protocol.version=2 ls-remote "$(url "$RW" acme/web)" >"$WORK/ls-v2" 2>"$WORK/err" || fail "ls-remote v2: $(cat "$WORK/err")"
+grep -q 'refs/tags/v1-e2e\^{}' "$WORK/ls-v2" || fail "ls-remote v2 missing peeled tag: $(cat "$WORK/ls-v2")"
+pass "real git ls-remote works on protocol v0 and v2 with peeled tags"
+
 # Stop while a slow clone is mid-transfer: gitd must still exit promptly and
 # take its git processes with it.
 head -c 4000000 /dev/urandom >"$SRC/big2.bin"
