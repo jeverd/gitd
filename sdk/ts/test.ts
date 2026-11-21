@@ -137,11 +137,40 @@ test("TypeScript SDK end-to-end", async () => {
     assert.equal(archiveBytes[0], 0x1f); // gzip magic
     assert.equal(archiveBytes[1], 0x8b);
 
-    // Compare & Merge
+    // Compare & Merge (including dry_run & conflict radar)
+    const dryOk = await agent.mergeDryRun(repoName, { base: "main", head: "agent/ts/work" });
+    assert.equal(dryOk.dry_run, true);
+    assert.equal(dryOk.mergeable, true);
+    assert.equal(dryOk.result, "fast_forward");
+
     const diff = await admin.compare(repoName, "main", "agent/ts/work");
     assert.equal(diff.ahead, 3);
     const merged = await admin.merge(repoName, { base: "main", head: "agent/ts/work" });
     assert.equal(merged.result, "fast_forward");
+
+    await admin.commit(repoName, {
+      branch: "agent/ts/c1",
+      expected_head: null,
+      from: "main",
+      message: "Edit README c1",
+      changes: [{ path: "README.md", content: "# C1\n" }],
+    });
+    await admin.commit(repoName, {
+      branch: "agent/ts/c2",
+      expected_head: null,
+      from: "main",
+      message: "Edit README c2",
+      changes: [{ path: "README.md", content: "# C2\n" }],
+    });
+    const radar = await agent.checkMergeConflicts(repoName, {
+      base: "main",
+      heads: ["agent/ts/c1", "agent/ts/c2"],
+      include_file_overlaps: true,
+    });
+    assert.equal(radar.branches.every((b) => b.mergeable), true);
+    assert.equal(radar.pair_conflicts.length, 1);
+    assert.deepEqual(radar.pair_conflicts[0].conflicts, ["README.md"]);
+    assert.equal(radar.file_overlaps.length, 1);
 
     // Branch lock visibility + protection rules
     await admin.lockBranch(repoName, "main", "freeze");

@@ -83,7 +83,8 @@ All `/v1` routes need `Authorization: Bearer <admin key>`. Per-repo routes (`/v1
 | `GET /v1/repos/{ns}/{repo}/grep?q=&ref=&path=&fixed=&ignore_case=&limit=` | Search text files at `ref` without cloning (returns matching paths, line numbers, lines) |
 | `GET /v1/repos/{ns}/{repo}/archive?ref=&format=&path=` | Download a `tar.gz` (default), `tar`, or `zip` archive of `ref` (or `path` within it) |
 | `POST /v1/repos/{ns}/{repo}/sync` `{"direction","url","branch","remote_branch","token","force"}` | Fetch a branch from or push a branch back to an upstream Git remote (admin key only; per-request token, never stored or logged) |
-| `POST /v1/repos/{ns}/{repo}/merges` `{"base","head","strategy"}` | Merge `head` into `base`: fast-forward when possible, else a merge commit (`merge`) or one squashed commit (`squash`). Conflicts give 409 with the paths |
+| `POST /v1/repos/{ns}/{repo}/merges` `{"base","head","strategy","dry_run"}` | Merge `head` into `base`: fast-forward when possible, else a merge commit (`merge`) or one squashed commit (`squash`). With `dry_run: true`, checks lock/rule/conflict status with only `git:read` and mutates nothing |
+| `POST /v1/repos/{ns}/{repo}/merges/check` `{"base","heads","include_file_overlaps"}` | Multi-branch conflict radar: check up to 16 heads vs `base` and pairwise in memory without mutating any ref (`git:read`) |
 | `POST /v1/repos/{ns}/{repo}/webhooks` `{"url"}` | Add a webhook (admin key only). The response has the signing `secret`, shown once |
 | `GET /v1/repos/{ns}/{repo}/webhooks` | List webhooks (no secrets) |
 | `DELETE /v1/repos/{ns}/{repo}/webhooks/{id}` | Remove a webhook and its queued deliveries |
