@@ -159,6 +159,157 @@ pub const Repo = struct {
         return .{ .raw = raw, .items = items };
     }
 
+    pub const RefInfo = struct {
+        /// Full ref name (e.g. `refs/heads/main`). Borrows `Refs.raw`.
+        name: []const u8,
+        oid: [git2.oid_hex_len]u8,
+        /// Peeled target oid for annotated tags (when requested), else null.
+        peeled: ?[git2.oid_hex_len]u8 = null,
+    };
+
+    pub const Refs = struct {
+        raw: []u8,
+        /// Target of `HEAD` when it is a symbolic ref (borrows `raw`), else null.
+        head_symref: ?[]const u8 = null,
+        /// Resolved commit/object oid of `HEAD`, or null if unborn.
+        head_oid: ?[git2.oid_hex_len]u8 = null,
+        items: []RefInfo,
+
+        pub fn deinit(refs: Refs, gpa: std.mem.Allocator) void {
+            gpa.free(refs.items);
+            gpa.free(refs.raw);
+        }
+    };
+
+    /// Lists all refs under `refs/` sorted lexicographically by name, plus `HEAD` metadata.
+    /// When `include_peeled` is true, annotated tags include their peeled target oid.
+    pub fn listRefs(r: *const Repo, include_peeled: bool) git_cmd.Error!Refs {
+        const repo = try r.openBare();
+        defer git2.git_repository_free(repo);
+
+        var raw_buf: std.ArrayList(u8) = .empty;
+        errdefer raw_buf.deinit(r.gpa);
+
+        var head_symref_off: ?usize = null;
+        var head_symref_len: usize = 0;
+        var head_oid: ?[git2.oid_hex_len]u8 = null;
+
+        var head_ref: ?*git2.Reference = null;
+        if (git2.git_reference_lookup(&head_ref, repo, "HEAD") == git2.ok) {
+            defer git2.git_reference_free(head_ref.?);
+            if (git2.git_reference_type(head_ref.?) == git2.ref_symbolic) {
+                if (git2.git_reference_symbolic_target(head_ref.?)) |sym| {
+                    const target = std.mem.span(sym);
+                    head_symref_off = raw_buf.items.len;
+                    head_symref_len = target.len;
+                    try raw_buf.appendSlice(r.gpa, target);
+                }
+                var resolved: ?*git2.Reference = null;
+                if (git2.git_reference_resolve(&resolved, head_ref.?) == git2.ok) {
+                    defer git2.git_reference_free(resolved.?);
+                    if (git2.git_reference_target(resolved.?)) |oid| {
+                        var hex: [git2.oid_hex_len]u8 = undefined;
+                        _ = git2.formatOid(oid, &hex);
+                        head_oid = hex;
+                    }
+                }
+            } else if (git2.git_reference_target(head_ref.?)) |oid| {
+                var hex: [git2.oid_hex_len]u8 = undefined;
+                _ = git2.formatOid(oid, &hex);
+                head_oid = hex;
+            }
+        }
+
+        var iter: ?*git2.ReferenceIterator = null;
+        if (git2.git_reference_iterator_glob_new(&iter, repo, "refs/*") != git2.ok) {
+            std.log.err("git2 ref iterator: {s}", .{git2.lastErrorMessage()});
+            return error.GitFailed;
+        }
+        defer git2.git_reference_iterator_free(iter.?);
+
+        const Meta = struct {
+            name_off: usize,
+            name_len: usize,
+            oid: [git2.oid_hex_len]u8,
+            peeled: ?[git2.oid_hex_len]u8,
+        };
+        var metas: std.ArrayList(Meta) = .empty;
+        defer metas.deinit(r.gpa);
+
+        while (true) {
+            var ref: ?*git2.Reference = null;
+            const rc = git2.git_reference_next(&ref, iter.?);
+            if (rc == git2.err_iter_over) break;
+            if (rc != git2.ok) {
+                std.log.err("git2 ref iter next: {s}", .{git2.lastErrorMessage()});
+                return error.GitFailed;
+            }
+            defer git2.git_reference_free(ref.?);
+
+            const full_name = std.mem.span(git2.git_reference_name(ref.?));
+            var resolved: ?*git2.Reference = null;
+            defer if (resolved) |res| git2.git_reference_free(res);
+            const direct: *const git2.Reference = if (git2.git_reference_type(ref.?) == git2.ref_direct)
+                ref.?
+            else blk: {
+                if (git2.git_reference_resolve(&resolved, ref.?) != git2.ok) continue;
+                break :blk resolved.?;
+            };
+            const oid = git2.git_reference_target(direct) orelse continue;
+
+            var hex: [git2.oid_hex_len]u8 = undefined;
+            _ = git2.formatOid(oid, &hex);
+
+            var peeled_hex: ?[git2.oid_hex_len]u8 = null;
+            if (include_peeled) {
+                var obj: ?*git2.Object = null;
+                if (git2.git_object_lookup(&obj, repo, oid, git2.obj_any) == git2.ok) {
+                    defer git2.git_object_free(obj.?);
+                    if (git2.git_object_type(obj.?) == git2.obj_tag) {
+                        var peeled_obj: ?*git2.Object = null;
+                        if (git2.git_object_peel(&peeled_obj, obj.?, git2.obj_any) == git2.ok) {
+                            defer git2.git_object_free(peeled_obj.?);
+                            var p_hex: [git2.oid_hex_len]u8 = undefined;
+                            _ = git2.formatOid(git2.git_object_id(peeled_obj.?), &p_hex);
+                            peeled_hex = p_hex;
+                        }
+                    }
+                }
+            }
+
+            const name_off = raw_buf.items.len;
+            try raw_buf.appendSlice(r.gpa, full_name);
+            try metas.append(r.gpa, .{
+                .name_off = name_off,
+                .name_len = full_name.len,
+                .oid = hex,
+                .peeled = peeled_hex,
+            });
+        }
+
+        const raw = try raw_buf.toOwnedSlice(r.gpa);
+        errdefer r.gpa.free(raw);
+        const items = try r.gpa.alloc(RefInfo, metas.items.len);
+        for (metas.items, items) |m, *out| {
+            out.* = .{
+                .name = raw[m.name_off..][0..m.name_len],
+                .oid = m.oid,
+                .peeled = m.peeled,
+            };
+        }
+        std.mem.sort(RefInfo, items, {}, struct {
+            fn lessThan(_: void, a: RefInfo, b: RefInfo) bool {
+                return std.mem.order(u8, a.name, b.name) == .lt;
+            }
+        }.lessThan);
+        return .{
+            .raw = raw,
+            .head_symref = if (head_symref_off) |off| raw[off..][0..head_symref_len] else null,
+            .head_oid = head_oid,
+            .items = items,
+        };
+    }
+
     /// The commit a full ref name points at, or null if it does not exist.
     /// Writes the oid into `out`.
     pub fn refValue(r: *const Repo, ref: []const u8, out: *[64]u8) git_cmd.Error!?[]const u8 {

@@ -126,6 +126,7 @@ pub extern fn git_reference_set_target(
 ) c_int;
 pub extern fn git_reference_resolve(out: *?*Reference, ref: *const Reference) c_int;
 pub extern fn git_reference_target(ref: *const Reference) ?*const Oid;
+pub extern fn git_reference_symbolic_target(ref: *const Reference) ?[*:0]const u8;
 pub extern fn git_reference_type(ref: *const Reference) c_int;
 pub extern fn git_reference_name(ref: *const Reference) [*:0]const u8;
 pub extern fn git_reference_delete(ref: *Reference) c_int;
@@ -141,6 +142,7 @@ pub extern fn git_reference_iterator_free(iter: *ReferenceIterator) void;
 
 pub extern fn git_revparse_single(out: *?*Object, repo: *Repository, spec: [*:0]const u8) c_int;
 pub extern fn git_object_lookup(object: *?*Object, repo: *Repository, id: *const Oid, obj_type: c_int) c_int;
+pub extern fn git_object_type(obj: *const Object) c_int;
 pub extern fn git_object_peel(peeled: *?*Object, object: *const Object, target_type: c_int) c_int;
 pub extern fn git_object_id(obj: *const Object) *const Oid;
 pub extern fn git_object_free(object: *Object) void;
