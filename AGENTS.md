@@ -58,6 +58,7 @@ src/
   rules.zig         declarative branch protection rules API and evaluation
   merge_check.zig   multi-branch conflict radar (`POST /merges/check`)
   maintenance.zig   per-repo quotas, storage stats, and safe garbage collection
+  checks.zig        commit status checks API and required-check validation
 tests/e2e/run.sh    end-to-end test
 tests/demo/demo.sh  drives a UI-enabled gitd for demos and recordings
 tests/demo/agents.sh  the full MVP scenario with checks (e2e runs it)

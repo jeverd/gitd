@@ -146,6 +146,7 @@ class GitdClient:
         allow_force_push: bool = True,
         allow_delete: bool = True,
         required_merge_strategy: str | None = None,
+        required_checks: list[str] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "pattern": pattern,
@@ -155,6 +156,8 @@ class GitdClient:
         }
         if required_merge_strategy is not None:
             body["required_merge_strategy"] = required_merge_strategy
+        if required_checks is not None:
+            body["required_checks"] = required_checks
         return self._json("POST", f"/v1/repos/{repo}/rules", body)
 
     def list_rules(self, repo: str) -> list[dict[str, Any]]:
@@ -192,6 +195,26 @@ class GitdClient:
 
     def get_commit(self, repo: str, sha: str) -> dict[str, Any]:
         return self._json("GET", f"/v1/repos/{repo}/commits/{urllib.parse.quote(sha, safe='')}")
+
+    def post_check(
+        self,
+        repo: str,
+        sha: str,
+        *,
+        name: str,
+        status: str,
+        summary: str | None = None,
+        url: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"name": name, "status": status}
+        if summary is not None:
+            body["summary"] = summary
+        if url is not None:
+            body["url"] = url
+        return self._json("POST", f"/v1/repos/{repo}/commits/{urllib.parse.quote(sha, safe='')}/checks", body)
+
+    def list_checks(self, repo: str, sha: str) -> dict[str, Any]:
+        return self._json("GET", f"/v1/repos/{repo}/commits/{urllib.parse.quote(sha, safe='')}/checks")
 
     # ---- Commits, Compare, Merge ----
 

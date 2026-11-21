@@ -16,6 +16,7 @@ const ref_name = @import("ref_name.zig");
 const content = @import("content.zig");
 const http_util = @import("http_util.zig");
 const events = @import("events.zig");
+const checks = @import("checks.zig");
 const Db = @import("db.zig").Db;
 
 pub const max_rules_per_repo = 64;
@@ -56,6 +57,29 @@ pub fn mergeAllowed(eff: Effective, strategy_name: []const u8) bool {
     return std.mem.eql(u8, req, strategy_name);
 }
 
+/// Deduplicated union of required check names across all rules matching `ref`.
+/// Slices borrow `rules`; caller frees the returned slice.
+pub fn collectRequiredChecks(gpa: std.mem.Allocator, rules_list: []const Db.BranchRule, ref: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (rules_list) |r| {
+        if (r.required_checks.len == 0 or !ref_name.matches(r.pattern, ref)) continue;
+        var it = std.mem.splitScalar(u8, r.required_checks, ',');
+        while (it.next()) |name| {
+            if (name.len == 0) continue;
+            var seen = false;
+            for (out.items) |prev| {
+                if (std.mem.eql(u8, prev, name)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) try out.append(gpa, name);
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 pub fn validStrategy(text: []const u8) bool {
     return std.mem.eql(u8, text, "merge") or
         std.mem.eql(u8, text, "squash") or
@@ -69,10 +93,11 @@ const RuleJson = struct {
     allow_force_push: bool,
     allow_delete: bool,
     required_merge_strategy: ?[]const u8,
+    required_checks: []const []const u8,
     created_at: i64,
 };
 
-fn toJson(r: Db.BranchRule) RuleJson {
+fn toJson(gpa: std.mem.Allocator, r: Db.BranchRule) !RuleJson {
     return .{
         .id = r.id,
         .pattern = r.pattern,
@@ -80,6 +105,7 @@ fn toJson(r: Db.BranchRule) RuleJson {
         .allow_force_push = r.allow_force_push,
         .allow_delete = r.allow_delete,
         .required_merge_strategy = if (r.required_merge_strategy.len > 0) r.required_merge_strategy else null,
+        .required_checks = try checks.splitRequired(gpa, r.required_checks),
         .created_at = r.created_at,
     };
 }
@@ -129,6 +155,7 @@ fn create(app: *server.App, request: *http.Server.Request, name: repo_name.Name)
         allow_force_push: bool = true,
         allow_delete: bool = true,
         required_merge_strategy: ?[]const u8 = null,
+        required_checks: []const []const u8 = &.{},
     };
     var parsed = api.readJson(Body, app.gpa, request) catch |err| return api.respondBodyError(request, err);
     defer parsed.deinit();
@@ -140,6 +167,13 @@ fn create(app: *server.App, request: *http.Server.Request, name: repo_name.Name)
     if (strategy.len > 0 and !validStrategy(strategy)) {
         return api.respondError(request, .bad_request, "invalid_strategy", "required_merge_strategy must be merge, squash, or fast-forward");
     }
+    const req_checks_csv = checks.joinRequired(app.gpa, body.required_checks) catch |err| return switch (err) {
+        error.TooManyChecks => api.respondError(request, .bad_request, "invalid_checks", "at most 16 required_checks per rule"),
+        error.DuplicateCheck => api.respondError(request, .bad_request, "invalid_checks", "required_checks must not contain duplicates"),
+        error.InvalidCheckName => api.respondError(request, .bad_request, "invalid_checks", "each check name must be 1-64 characters from [A-Za-z0-9._/-]"),
+        error.OutOfMemory => api.internal(request),
+    };
+    defer app.gpa.free(req_checks_csv);
 
     const existing = app.db.listBranchRules(app.io, app.gpa, name.full) catch return api.internal(request);
     defer Db.freeBranchRules(app.gpa, existing);
@@ -156,13 +190,14 @@ fn create(app: *server.App, request: *http.Server.Request, name: repo_name.Name)
         body.allow_force_push,
         body.allow_delete,
         strategy,
+        req_checks_csv,
         now,
     ) catch return api.internal(request);
     events.record(app, .{
         .repo = name.full,
         .kind = "rule_created",
         .ref = body.pattern,
-        .detail = if (strategy.len > 0) strategy else "protection rule",
+        .detail = if (strategy.len > 0) strategy else if (req_checks_csv.len > 0) req_checks_csv else "protection rule",
         .created_at = now,
     });
     return api.respondJson(app.gpa, request, .created, RuleJson{
@@ -172,6 +207,7 @@ fn create(app: *server.App, request: *http.Server.Request, name: repo_name.Name)
         .allow_force_push = body.allow_force_push,
         .allow_delete = body.allow_delete,
         .required_merge_strategy = if (strategy.len > 0) strategy else null,
+        .required_checks = body.required_checks,
         .created_at = now,
     });
 }
@@ -179,9 +215,11 @@ fn create(app: *server.App, request: *http.Server.Request, name: repo_name.Name)
 fn list(app: *server.App, request: *http.Server.Request, name: repo_name.Name) api.HandleError!http.Status {
     const rows = app.db.listBranchRules(app.io, app.gpa, name.full) catch return api.internal(request);
     defer Db.freeBranchRules(app.gpa, rows);
-    const items = app.gpa.alloc(RuleJson, rows.len) catch return api.internal(request);
-    defer app.gpa.free(items);
-    for (rows, items) |r, *out| out.* = toJson(r);
+    var arena_state: std.heap.ArenaAllocator = .init(app.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const items = arena.alloc(RuleJson, rows.len) catch return api.internal(request);
+    for (rows, items) |r, *out| out.* = toJson(arena, r) catch return api.internal(request);
     return api.respondJson(app.gpa, request, .ok, .{ .rules = items });
 }
 
@@ -242,6 +280,16 @@ test "evaluate combines matching rules with deny-wins and strategy checks" {
     try testing.expect(both.strategy_conflict);
     try testing.expect(!mergeAllowed(both, "squash"));
     try testing.expect(!mergeAllowed(both, "merge"));
+
+    const check_rules = [_]Db.BranchRule{
+        .{ .id = 1, .pattern = "refs/heads/*", .allow_direct_push = true, .allow_force_push = true, .allow_delete = true, .required_merge_strategy = "", .required_checks = "lint", .created_at = 1 },
+        .{ .id = 2, .pattern = "refs/heads/main", .allow_direct_push = true, .allow_force_push = true, .allow_delete = true, .required_merge_strategy = "", .required_checks = "tests,lint", .created_at = 2 },
+    };
+    const req = try collectRequiredChecks(testing.allocator, &check_rules, "refs/heads/main");
+    defer testing.allocator.free(req);
+    try testing.expectEqual(@as(usize, 2), req.len);
+    try testing.expectEqualStrings("lint", req[0]);
+    try testing.expectEqualStrings("tests", req[1]);
 }
 
 test "fuzz evaluate rules" {

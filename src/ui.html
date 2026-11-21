@@ -171,6 +171,7 @@ function describe(e) {
     case "rule_rejected": return ["rule REJECTED", `${e.repo} ${ref}: ${e.detail}`];
     case "quota_exceeded": return ["quota EXCEEDED", `${e.repo} ${ref}: ${e.detail}`.trim()];
     case "gc_completed": return ["gc completed", `${e.repo} (${e.detail})`.trim()];
+    case "check_updated": return ["check updated", `${e.repo} ${short(e.new)} ${e.detail}`.trim()];
     default: return [e.kind.replace(/_/g, " "), `${e.repo} ${ref} ${e.detail}`.trim()];
   }
 }
@@ -179,7 +180,7 @@ function renderEvents(list) {
   const ol = $("events");
   for (const e of list) {
     const [kind, what] = describe(e);
-    const li = el("li", /rejected|conflict|failed|exceeded/.test(e.kind) ? "reject" : "");
+    const li = el("li", /rejected|conflict|failed|exceeded/.test(e.kind) || (e.kind === "check_updated" && /: failed\b/.test(e.detail)) ? "reject" : "");
     li.dataset.kind = e.kind;
     li.append(el("span", "when", clock(e.created_at)));
     const w = el("span", "what");
@@ -234,6 +235,12 @@ function renderRepos(state) {
         if (b.locked) {
           const badge = el("span", "oid", " [LOCKED]");
           badge.title = b.lock_reason || "locked";
+          nameCell.append(badge);
+        }
+        for (const chk of b.checks || []) {
+          const glyph = chk.status === "passed" ? "✓" : chk.status === "failed" ? "✗" : "…";
+          const badge = el("span", "oid", ` [${glyph} ${chk.name}]`);
+          badge.title = `${chk.name}: ${chk.status}`;
           nameCell.append(badge);
         }
         const when = el("td", "", ago(b.committed_at, state.now));

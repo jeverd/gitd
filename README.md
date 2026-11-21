@@ -64,16 +64,18 @@ All `/v1` routes need `Authorization: Bearer <admin key>`. Per-repo routes (`/v1
 | `GET /v1/repos` | List repos |
 | `GET /v1/repos/{ns}/{repo}` | Get one repo |
 | `DELETE /v1/repos/{ns}/{repo}` | Delete a repo and its files. Its tokens stop working |
-| `POST /v1/tokens` `{"repo","scopes","ttl_seconds","refs","read_refs","paths","branch_ttl_seconds"}` | Mint a repo token (returns `token`, `jti`, `expires_at`). `refs` limits writes, `read_refs` limits reads & `git clone`/`ls-remote` visibility, `paths` (e.g. `["docs/*","README.md"]`) limits API reads/writes to matching files. With `branch_ttl_seconds`, branches it creates expire after that long |
+| `POST /v1/tokens` `{"repo","scopes","ttl_seconds","refs","read_refs","paths","branch_ttl_seconds"}` | Mint a repo token (scopes: `git:read`, `git:write`, `checks:write`; returns `token`, `jti`, `expires_at`). `refs` limits writes, `read_refs` limits reads & `git clone`/`ls-remote` visibility, `paths` limits API reads/writes to matching files. With `branch_ttl_seconds`, branches it creates expire after that long |
 | `POST /v1/tokens/{jti}/revoke` | Immediately revoke a minted token by its `jti` (admin key only) |
 | `GET /v1/repos/{ns}/{repo}/branches` | Branches with their commits, expiry, and `locked` / `lock_reason` |
-| `POST /v1/repos/{ns}/{repo}/rules` `{"pattern","allow_direct_push","allow_force_push","allow_delete","required_merge_strategy"}` | Create a branch protection rule (admin key only; denies matching pushes, force pushes, deletes, or disallowed merge strategies) |
+| `POST /v1/repos/{ns}/{repo}/rules` `{"pattern","allow_direct_push","allow_force_push","allow_delete","required_merge_strategy","required_checks"}` | Create a branch protection rule (admin key only; denies matching pushes, force pushes, deletes, disallowed merge strategies, or merges missing passing `required_checks`) |
 | `GET /v1/repos/{ns}/{repo}/rules` | List branch protection rules (admin key only) |
 | `DELETE /v1/repos/{ns}/{repo}/rules/{id}` | Delete a branch protection rule (admin key only) |
 | `GET /v1/repos/{ns}/{repo}/files/{path}?ref=` | Raw file contents (up to 10 MiB) |
 | `GET /v1/repos/{ns}/{repo}/tree[/{path}]?ref=` | Directory listing |
 | `GET /v1/repos/{ns}/{repo}/log?ref=&limit=&path=` | Commits, newest first |
 | `GET /v1/repos/{ns}/{repo}/commits/{sha}` | One commit |
+| `POST /v1/repos/{ns}/{repo}/commits/{sha}/checks` `{"name","status","summary","url"}` | Post or update a commit check (`pending`, `running`, `passed`, `failed`; admin key or `checks:write` scope) |
+| `GET /v1/repos/{ns}/{repo}/commits/{sha}/checks` | List checks and overall rollup for a commit (`git:read`) |
 | `POST /v1/repos/{ns}/{repo}/commits` | Commit file changes to a branch. Send `expected_head` (the commit you built on, or `null` for a new branch); if the branch moved, you get 409 with `current_head` |
 | `POST /v1/repos/{ns}/{repo}/branches` `{"name","from","ttl_seconds"}` | Create a branch (409 if it exists); with `ttl_seconds` it is deleted after that long. Commits that create a branch take `ttl_seconds` too |
 | `DELETE /v1/repos/{ns}/{repo}/branches/{name}?expected=` | Delete a branch, optionally only if it is at `expected` |

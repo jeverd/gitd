@@ -185,9 +185,26 @@ test("TypeScript SDK end-to-end", async () => {
       allow_force_push: false,
       allow_delete: false,
       required_merge_strategy: "squash",
+      required_checks: ["tests"],
     });
     assert.equal(rule.required_merge_strategy, "squash");
+    assert.deepEqual(rule.required_checks, ["tests"]);
     assert.equal((await admin.listRules(repoName)).length, 1);
+
+    const { token: chkToken } = await admin.createToken({
+      repo: repoName,
+      scopes: ["git:read", "checks:write"],
+    });
+    const checker = admin.withToken(chkToken);
+    const c1Info = (await admin.listBranches(repoName)).find((b) => b.name === "agent/ts/c1")!;
+    const dryBlocked = await agent.mergeDryRun(repoName, { base: "main", head: "agent/ts/c1", strategy: "squash" });
+    assert.equal(dryBlocked.mergeable, false);
+    assert.equal(dryBlocked.blocked_by, "missing_required_check");
+    assert.deepEqual(dryBlocked.missing_checks, ["tests"]);
+    await checker.postCheck(repoName, c1Info.commit, { name: "tests", status: "passed", summary: "all green" });
+    const chkList = await agent.listChecks(repoName, c1Info.commit);
+    assert.equal(chkList.rollup, "passed");
+    assert.equal(chkList.checks[0].name, "tests");
     await admin.deleteRule(repoName, rule.id);
 
     // Upstream sync (fetch from repoName into mirrorName)

@@ -113,9 +113,21 @@ const schema =
     \\  allow_force_push INTEGER NOT NULL DEFAULT 1,
     \\  allow_delete INTEGER NOT NULL DEFAULT 1,
     \\  required_merge_strategy TEXT NOT NULL DEFAULT '',
+    \\  required_checks TEXT NOT NULL DEFAULT '',
     \\  created_at INTEGER NOT NULL
     \\) STRICT;
     \\CREATE INDEX IF NOT EXISTS branch_rules_repo ON branch_rules (repo);
+    \\CREATE TABLE IF NOT EXISTS commit_checks (
+    \\  repo TEXT NOT NULL,
+    \\  sha TEXT NOT NULL,
+    \\  name TEXT NOT NULL,
+    \\  status TEXT NOT NULL,
+    \\  summary TEXT NOT NULL DEFAULT '',
+    \\  url TEXT NOT NULL DEFAULT '',
+    \\  updated_at INTEGER NOT NULL,
+    \\  PRIMARY KEY (repo, sha, name)
+    \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS commit_checks_repo_sha ON commit_checks (repo, sha);
     \\CREATE TABLE IF NOT EXISTS repo_quotas (
     \\  repo TEXT PRIMARY KEY,
     \\  max_branches INTEGER NOT NULL DEFAULT 0,
@@ -152,7 +164,26 @@ pub const Db = struct {
             std.log.err("sqlite schema: {s}", .{errmsg orelse "unknown error"});
             return error.DatabaseError;
         }
+        try db.ensureBranchRuleColumns();
         return db;
+    }
+
+    fn ensureBranchRuleColumns(db: *Db) Error!void {
+        const stmt = try db.prepare("PRAGMA table_info(branch_rules)");
+        defer _ = sqlite3_finalize(stmt);
+        var has_required_checks = false;
+        while (true) switch (sqlite3_step(stmt)) {
+            SQLITE_ROW => {
+                const len: usize = @intCast(sqlite3_column_bytes(stmt, 1));
+                const ptr = sqlite3_column_text(stmt, 1) orelse continue;
+                if (std.mem.eql(u8, ptr[0..len], "required_checks")) has_required_checks = true;
+            },
+            SQLITE_DONE => break,
+            else => return db.fail("inspect branch_rules columns"),
+        };
+        if (!has_required_checks) {
+            try db.exec("ALTER TABLE branch_rules ADD COLUMN required_checks TEXT NOT NULL DEFAULT ''");
+        }
     }
 
     pub fn close(db: *Db) void {
@@ -718,11 +749,13 @@ pub const Db = struct {
         allow_force_push: bool,
         allow_delete: bool,
         required_merge_strategy: []const u8,
+        required_checks: []const u8 = "",
         created_at: i64,
 
         pub fn deinit(r: BranchRule, gpa: std.mem.Allocator) void {
             gpa.free(r.pattern);
             gpa.free(r.required_merge_strategy);
+            gpa.free(r.required_checks);
         }
     };
 
@@ -735,13 +768,14 @@ pub const Db = struct {
         allow_force_push: bool,
         allow_delete: bool,
         required_merge_strategy: []const u8,
+        required_checks: []const u8,
         created_at: i64,
     ) Error!i64 {
         db.mutex.lockUncancelable(io);
         defer db.mutex.unlock(io);
         const stmt = try db.prepare(
-            \\INSERT INTO branch_rules (repo, pattern, allow_direct_push, allow_force_push, allow_delete, required_merge_strategy, created_at)
-            \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            \\INSERT INTO branch_rules (repo, pattern, allow_direct_push, allow_force_push, allow_delete, required_merge_strategy, required_checks, created_at)
+            \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         );
         defer _ = sqlite3_finalize(stmt);
         try db.bindText(stmt, 1, repo);
@@ -750,7 +784,8 @@ pub const Db = struct {
         try db.check(sqlite3_bind_int64(stmt, 4, @intFromBool(allow_force_push)));
         try db.check(sqlite3_bind_int64(stmt, 5, @intFromBool(allow_delete)));
         try db.bindText(stmt, 6, required_merge_strategy);
-        try db.check(sqlite3_bind_int64(stmt, 7, created_at));
+        try db.bindText(stmt, 7, required_checks);
+        try db.check(sqlite3_bind_int64(stmt, 8, created_at));
         if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("insert branch rule");
         return sqlite3_last_insert_rowid(db.handle);
     }
@@ -760,7 +795,7 @@ pub const Db = struct {
         db.mutex.lockUncancelable(io);
         defer db.mutex.unlock(io);
         const stmt = try db.prepare(
-            \\SELECT id, pattern, allow_direct_push, allow_force_push, allow_delete, required_merge_strategy, created_at
+            \\SELECT id, pattern, allow_direct_push, allow_force_push, allow_delete, required_merge_strategy, required_checks, created_at
             \\FROM branch_rules WHERE repo = ?1 ORDER BY id
         );
         defer _ = sqlite3_finalize(stmt);
@@ -776,6 +811,8 @@ pub const Db = struct {
                 errdefer gpa.free(pattern);
                 const strat = try columnText(stmt, 5, gpa);
                 errdefer gpa.free(strat);
+                const req_checks = try columnText(stmt, 6, gpa);
+                errdefer gpa.free(req_checks);
                 try list.append(gpa, .{
                     .id = sqlite3_column_int64(stmt, 0),
                     .pattern = pattern,
@@ -783,7 +820,8 @@ pub const Db = struct {
                     .allow_force_push = sqlite3_column_int64(stmt, 3) != 0,
                     .allow_delete = sqlite3_column_int64(stmt, 4) != 0,
                     .required_merge_strategy = strat,
-                    .created_at = sqlite3_column_int64(stmt, 6),
+                    .required_checks = req_checks,
+                    .created_at = sqlite3_column_int64(stmt, 7),
                 });
             },
             SQLITE_DONE => break,
@@ -815,6 +853,155 @@ pub const Db = struct {
         defer _ = sqlite3_finalize(stmt);
         try db.bindText(stmt, 1, repo);
         if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("delete repo branch rules");
+    }
+
+    pub const CommitCheck = struct {
+        name: []const u8,
+        status: []const u8,
+        summary: []const u8,
+        url: []const u8,
+        updated_at: i64,
+
+        pub fn deinit(c: CommitCheck, gpa: std.mem.Allocator) void {
+            gpa.free(c.name);
+            gpa.free(c.status);
+            gpa.free(c.summary);
+            gpa.free(c.url);
+        }
+    };
+
+    pub fn freeCommitChecks(gpa: std.mem.Allocator, list: []const CommitCheck) void {
+        for (list) |c| c.deinit(gpa);
+        gpa.free(list);
+    }
+
+    pub const RepoCommitCheck = struct {
+        sha: []const u8,
+        name: []const u8,
+        status: []const u8,
+
+        pub fn deinit(c: RepoCommitCheck, gpa: std.mem.Allocator) void {
+            gpa.free(c.sha);
+            gpa.free(c.name);
+            gpa.free(c.status);
+        }
+    };
+
+    pub fn freeRepoCommitChecks(gpa: std.mem.Allocator, list: []const RepoCommitCheck) void {
+        for (list) |c| c.deinit(gpa);
+        gpa.free(list);
+    }
+
+    pub fn upsertCommitCheck(
+        db: *Db,
+        io: Io,
+        repo: []const u8,
+        sha: []const u8,
+        name: []const u8,
+        status: []const u8,
+        summary: []const u8,
+        url: []const u8,
+        updated_at: i64,
+    ) Error!void {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare(
+            \\INSERT INTO commit_checks (repo, sha, name, status, summary, url, updated_at)
+            \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            \\ON CONFLICT (repo, sha, name) DO UPDATE SET
+            \\  status = excluded.status,
+            \\  summary = excluded.summary,
+            \\  url = excluded.url,
+            \\  updated_at = excluded.updated_at
+        );
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        try db.bindText(stmt, 2, sha);
+        try db.bindText(stmt, 3, name);
+        try db.bindText(stmt, 4, status);
+        try db.bindText(stmt, 5, summary);
+        try db.bindText(stmt, 6, url);
+        try db.check(sqlite3_bind_int64(stmt, 7, updated_at));
+        if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("upsert commit check");
+    }
+
+    /// Checks on `sha` in `repo`, sorted by name. Free with `freeCommitChecks`.
+    pub fn listCommitChecks(db: *Db, io: Io, gpa: std.mem.Allocator, repo: []const u8, sha: []const u8) Error![]CommitCheck {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare(
+            \\SELECT name, status, summary, url, updated_at
+            \\FROM commit_checks WHERE repo = ?1 AND sha = ?2 ORDER BY name
+        );
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        try db.bindText(stmt, 2, sha);
+        var list: std.ArrayList(CommitCheck) = .empty;
+        errdefer {
+            for (list.items) |c| c.deinit(gpa);
+            list.deinit(gpa);
+        }
+        while (true) switch (sqlite3_step(stmt)) {
+            SQLITE_ROW => {
+                const name = try columnText(stmt, 0, gpa);
+                errdefer gpa.free(name);
+                const status = try columnText(stmt, 1, gpa);
+                errdefer gpa.free(status);
+                const summary = try columnText(stmt, 2, gpa);
+                errdefer gpa.free(summary);
+                const url = try columnText(stmt, 3, gpa);
+                errdefer gpa.free(url);
+                try list.append(gpa, .{
+                    .name = name,
+                    .status = status,
+                    .summary = summary,
+                    .url = url,
+                    .updated_at = sqlite3_column_int64(stmt, 4),
+                });
+            },
+            SQLITE_DONE => break,
+            else => return db.fail("list commit checks"),
+        };
+        return list.toOwnedSlice(gpa);
+    }
+
+    /// Summary check statuses across commits in `repo`, for UI rendering. Free with `freeRepoCommitChecks`.
+    pub fn listRepoCommitChecks(db: *Db, io: Io, gpa: std.mem.Allocator, repo: []const u8) Error![]RepoCommitCheck {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare(
+            \\SELECT sha, name, status FROM commit_checks WHERE repo = ?1 ORDER BY sha, name
+        );
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        var list: std.ArrayList(RepoCommitCheck) = .empty;
+        errdefer {
+            for (list.items) |c| c.deinit(gpa);
+            list.deinit(gpa);
+        }
+        while (true) switch (sqlite3_step(stmt)) {
+            SQLITE_ROW => {
+                const sha = try columnText(stmt, 0, gpa);
+                errdefer gpa.free(sha);
+                const name = try columnText(stmt, 1, gpa);
+                errdefer gpa.free(name);
+                const status = try columnText(stmt, 2, gpa);
+                errdefer gpa.free(status);
+                try list.append(gpa, .{ .sha = sha, .name = name, .status = status });
+            },
+            SQLITE_DONE => break,
+            else => return db.fail("list repo commit checks"),
+        };
+        return list.toOwnedSlice(gpa);
+    }
+
+    pub fn deleteRepoChecks(db: *Db, io: Io, repo: []const u8) Error!void {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare("DELETE FROM commit_checks WHERE repo = ?1");
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("delete repo checks");
     }
 
     pub const RepoQuota = struct {
@@ -1246,9 +1433,9 @@ test "branch locks and branch rules round-trip" {
     try std.testing.expectEqualStrings("release freeze", locks[0].reason);
     try std.testing.checkAllAllocationFailures(gpa, listLocksAndFree, .{ &db, io });
 
-    const r1 = try db.insertBranchRule(io, "a/b", "refs/heads/main", false, false, false, "squash", 10);
-    const r2 = try db.insertBranchRule(io, "a/b", "refs/heads/release/*", true, false, false, "", 11);
-    _ = try db.insertBranchRule(io, "a/c", "refs/heads/main", false, false, false, "merge", 12);
+    const r1 = try db.insertBranchRule(io, "a/b", "refs/heads/main", false, false, false, "squash", "tests,lint", 10);
+    const r2 = try db.insertBranchRule(io, "a/b", "refs/heads/release/*", true, false, false, "", "", 11);
+    _ = try db.insertBranchRule(io, "a/c", "refs/heads/main", false, false, false, "merge", "", 12);
 
     const rules = try db.listBranchRules(io, gpa, "a/b");
     defer Db.freeBranchRules(gpa, rules);
@@ -1258,6 +1445,7 @@ test "branch locks and branch rules round-trip" {
     try std.testing.expect(!rules[0].allow_force_push);
     try std.testing.expect(!rules[0].allow_delete);
     try std.testing.expectEqualStrings("squash", rules[0].required_merge_strategy);
+    try std.testing.expectEqualStrings("tests,lint", rules[0].required_checks);
     try std.testing.expectEqual(r2, rules[1].id);
     try std.testing.expect(rules[1].allow_direct_push);
 
@@ -1318,4 +1506,40 @@ test "repo quotas and maintenance round-trip" {
 
 fn listDueAndFree(gpa: std.mem.Allocator, db: *Db, io: Io) !void {
     Db.freeRepoMaints(gpa, try db.listReposDueForGc(io, gpa, 1, 10));
+}
+
+test "commit checks round-trip and branch_rules schema upgrade" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var db: Db = try .open(":memory:");
+    defer db.close();
+
+    try db.upsertCommitCheck(io, "a/b", "sha1", "tests", "running", "started", "https://ci.example/1", 10);
+    try db.upsertCommitCheck(io, "a/b", "sha1", "tests", "passed", "12 ok", "https://ci.example/1", 12);
+    try db.upsertCommitCheck(io, "a/b", "sha1", "lint", "failed", "1 err", "", 11);
+    const list = try db.listCommitChecks(io, gpa, "a/b", "sha1");
+    defer Db.freeCommitChecks(gpa, list);
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+    try std.testing.expectEqualStrings("lint", list[0].name);
+    try std.testing.expectEqualStrings("failed", list[0].status);
+    try std.testing.expectEqualStrings("tests", list[1].name);
+    try std.testing.expectEqualStrings("passed", list[1].status);
+    try std.testing.expectEqualStrings("12 ok", list[1].summary);
+
+    const repo_checks = try db.listRepoCommitChecks(io, gpa, "a/b");
+    defer Db.freeRepoCommitChecks(gpa, repo_checks);
+    try std.testing.expectEqual(@as(usize, 2), repo_checks.len);
+
+    try std.testing.checkAllAllocationFailures(gpa, listChecksAndFree, .{ &db, io });
+    try db.deleteRepoChecks(io, "a/b");
+    const cleared = try db.listCommitChecks(io, gpa, "a/b", "sha1");
+    defer Db.freeCommitChecks(gpa, cleared);
+    try std.testing.expectEqual(@as(usize, 0), cleared.len);
+
+    // Ensure idempotent column check succeeds repeatedly.
+    try db.ensureBranchRuleColumns();
+}
+
+fn listChecksAndFree(gpa: std.mem.Allocator, db: *Db, io: Io) !void {
+    Db.freeCommitChecks(gpa, try db.listCommitChecks(io, gpa, "a/b", "sha1"));
 }

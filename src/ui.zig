@@ -46,9 +46,25 @@ pub fn serve(app: *server.App, request: *http.Server.Request, path: []const u8, 
     return api.respondError(request, .not_found, "not_found", "no such UI route");
 }
 
+const UiCheckJson = struct {
+    name: []const u8,
+    status: []const u8,
+};
+
+const UiBranchJson = struct {
+    name: []const u8,
+    commit: []const u8,
+    committed_at: i64,
+    subject: []const u8,
+    expires_at: ?i64,
+    locked: bool = false,
+    lock_reason: ?[]const u8 = null,
+    checks: []const UiCheckJson = &.{},
+};
+
 const RepoJson = struct {
     name: []const u8,
-    branches: []const content.BranchJson,
+    branches: []const UiBranchJson,
 };
 
 fn state(app: *server.App, request: *http.Server.Request) api.HandleError!http.Status {
@@ -69,8 +85,28 @@ fn state(app: *server.App, request: *http.Server.Request) api.HandleError!http.S
         };
         const ttls = app.db.listBranchTtls(app.io, arena, repo.name, 0, 10_000) catch return api.internal(request);
         const locks = app.db.listBranchLocks(app.io, arena, repo.name) catch return api.internal(request);
+        const checks_all = app.db.listRepoCommitChecks(app.io, arena, repo.name) catch return api.internal(request);
         const items = content.branchesWithMeta(arena, branches, ttls, locks) catch return api.internal(request);
-        item.* = .{ .name = repo.name, .branches = items };
+        const ui_branches = arena.alloc(UiBranchJson, items.len) catch return api.internal(request);
+        for (items, ui_branches) |b, *ub| {
+            var b_checks: std.ArrayList(UiCheckJson) = .empty;
+            for (checks_all) |chk| {
+                if (std.mem.eql(u8, chk.sha, b.commit)) {
+                    b_checks.append(arena, .{ .name = chk.name, .status = chk.status }) catch return api.internal(request);
+                }
+            }
+            ub.* = .{
+                .name = b.name,
+                .commit = b.commit,
+                .committed_at = b.committed_at,
+                .subject = b.subject,
+                .expires_at = b.expires_at,
+                .locked = b.locked,
+                .lock_reason = b.lock_reason,
+                .checks = b_checks.items,
+            };
+        }
+        item.* = .{ .name = repo.name, .branches = ui_branches };
     }
     return api.respondJson(app.gpa, request, .ok, .{ .now = api.unixNow(app.io), .repos = out });
 }
