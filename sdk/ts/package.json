@@ -1,0 +1,12 @@
+{
+  "name": "@gitd/sdk",
+  "version": "0.1.0",
+  "description": "Zero-dependency TypeScript SDK for gitd",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "test": "node --test test.ts"
+  }
+}

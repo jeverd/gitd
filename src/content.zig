@@ -102,6 +102,9 @@ pub fn serve(
     if (std.mem.eql(u8, rest, "webhooks") or std.mem.startsWith(u8, rest, "webhooks/")) {
         return @import("webhooks.zig").serveApi(app, request, name, rest, query, access);
     }
+    if (std.mem.eql(u8, rest, "sync")) {
+        return @import("sync.zig").serveApi(app, request, name, access);
+    }
     const repo = repo_git.Repo.open(app.io, app.gpa, app.store, name) catch return api.internal(request);
 
     if (method == .GET) {

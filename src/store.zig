@@ -162,6 +162,8 @@ const forced_config = [_][2][]const u8{
     .{ "maintenance.auto", "false" },
 };
 
+pub const forced_config_count = forced_config.len;
+
 /// A minimal environment for running `git`: our `PATH`, no system or
 /// global config, no prompts, and `forced_config`. The caller owns it.
 pub fn gitEnv(gpa: std.mem.Allocator, path_env: []const u8) std.mem.Allocator.Error!std.process.Environ.Map {

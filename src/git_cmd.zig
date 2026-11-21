@@ -18,6 +18,9 @@ pub const Options = struct {
     stdin: []const u8 = "",
     /// Extra environment, such as GIT_INDEX_FILE or author identity.
     env: []const [2][]const u8 = &.{},
+    /// Extra git config entries appended after `store.forced_config` via
+    /// GIT_CONFIG_KEY_N / GIT_CONFIG_VALUE_N (invisible in argv and on disk).
+    git_config: []const [2][]const u8 = &.{},
     max_output: usize = default_max_output,
     /// The command is killed if it has not finished by then (R3.4): a
     /// request's git work never outlives the request by much.
@@ -61,6 +64,18 @@ pub fn run(
     try env.put("GIT_DIR", git_dir);
     // Paths are literal: no `:(glob)` or other pathspec magic from callers.
     try env.put("GIT_LITERAL_PATHSPECS", "1");
+    if (options.git_config.len > 0) {
+        var count_buf: [16]u8 = undefined;
+        const total = store_mod.forced_config_count + options.git_config.len;
+        try env.put("GIT_CONFIG_COUNT", std.mem.print(&count_buf, "{d}", .{total}) catch return error.GitFailed);
+        for (options.git_config, 0..) |kv, offset| {
+            const idx = store_mod.forced_config_count + offset;
+            var key_buf: [32]u8 = undefined;
+            var val_buf: [32]u8 = undefined;
+            try env.put(std.mem.print(&key_buf, "GIT_CONFIG_KEY_{d}", .{idx}) catch return error.GitFailed, kv[0]);
+            try env.put(std.mem.print(&val_buf, "GIT_CONFIG_VALUE_{d}", .{idx}) catch return error.GitFailed, kv[1]);
+        }
+    }
     for (options.env) |kv| try env.put(kv[0], kv[1]);
 
     var stdin_file: ?Io.File = null;

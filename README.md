@@ -76,6 +76,7 @@ All `/v1` routes need `Authorization: Bearer <admin key>`. Per-repo routes (`/v1
 | `GET /v1/repos/{ns}/{repo}/compare/{base}...{head}` | Ahead/behind, changed files, and the patch (up to 1 MiB) |
 | `GET /v1/repos/{ns}/{repo}/grep?q=&ref=&path=&fixed=&ignore_case=&limit=` | Search text files at `ref` without cloning (returns matching paths, line numbers, lines) |
 | `GET /v1/repos/{ns}/{repo}/archive?ref=&format=&path=` | Download a `tar.gz` (default), `tar`, or `zip` archive of `ref` (or `path` within it) |
+| `POST /v1/repos/{ns}/{repo}/sync` `{"direction","url","branch","remote_branch","token","force"}` | Fetch a branch from or push a branch back to an upstream Git remote (admin key only; per-request token, never stored or logged) |
 | `POST /v1/repos/{ns}/{repo}/merges` `{"base","head","strategy"}` | Merge `head` into `base`: fast-forward when possible, else a merge commit (`merge`) or one squashed commit (`squash`). Conflicts give 409 with the paths |
 | `POST /v1/repos/{ns}/{repo}/webhooks` `{"url"}` | Add a webhook (admin key only). The response has the signing `secret`, shown once |
 | `GET /v1/repos/{ns}/{repo}/webhooks` | List webhooks (no secrets) |
@@ -88,6 +89,41 @@ All `/v1` routes need `Authorization: Bearer <admin key>`. Per-repo routes (`/v1
 Repo names are `ns/repo`: lowercase letters, digits, `.`, `_`, `-`, up to 64 characters per part.
 
 Webhook deliveries are `POST`s of `{"delivery": id, "event": {...}}` with `x-gitd-event`, `x-gitd-delivery`, and `x-gitd-signature: sha256=<hex HMAC-SHA256 of the body>`. A 2xx answer counts; anything else is retried after 1, 2, 4, and 8 seconds, then marked failed.
+
+## SDKs
+
+Zero-dependency clients live in [`sdk/ts`](sdk/ts) (Node 22+ / native `fetch`) and [`sdk/python`](sdk/python) (Python 3.10+ / stdlib `urllib`), covering the full `/v1` API plus automatic 409 compare-and-swap retry (`commitWithRetry` / `commit_with_retry`):
+
+```ts
+import { GitdClient } from "./sdk/ts/index.ts";
+
+const admin = new GitdClient({ baseUrl: "http://127.0.0.1:8080", token: process.env.GITD_KEY! });
+await admin.createRepo("acme/web");
+const { token } = await admin.createToken({
+  repo: "acme/web",
+  scopes: ["git:read", "git:write"],
+  refs: ["refs/heads/agent/1/*"],
+});
+const agent = admin.withToken(token);
+const hits = await agent.grep("acme/web", "TODO", { ref: "main" });
+await agent.commitWithRetry("acme/web", "agent/1/work", () => ({
+  message: "Update file",
+  changes: [{ path: "notes.md", content: "done\n" }],
+}));
+```
+
+```python
+from gitd import GitdClient
+
+admin = GitdClient("http://127.0.0.1:8080", key)
+tok = admin.create_token("acme/web", ["git:read", "git:write"], refs=["refs/heads/agent/1/*"])["token"]
+agent = admin.with_token(tok)
+hits = agent.grep("acme/web", "TODO", ref="main")
+agent.commit_with_retry("acme/web", "agent/1/work", lambda head: {
+    "message": "Update file",
+    "changes": [{"path": "notes.md", "content": "done\n"}],
+})
+```
 
 ## MVP
 
