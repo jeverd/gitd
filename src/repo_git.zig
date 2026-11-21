@@ -1295,7 +1295,11 @@ pub const Repo = struct {
 
         var opts: git2.IndexerOptions = .{};
         if (git2.git_indexer_options_init(&opts, 1) != git2.ok) return error.GitFailed;
-        opts.verify = 1;
+        // `git_indexer` still verifies pack structure, delta resolution, strict
+        // object/hash integrity, and trailing SHA-1 checksum. libgit2's `verify=1`
+        // connectivity walk falsely rejects valid repos with 160000 submodule
+        // gitlink entries (and shallow boundaries), so keep it 0.
+        opts.verify = 0;
 
         var idx: ?*git2.Indexer = null;
         if (git2.git_indexer_new(&idx, pack_dir.ptr, 0, odb.?, &opts) != git2.ok) {
@@ -1344,7 +1348,11 @@ pub const Repo = struct {
 
         var opts: git2.IndexerOptions = .{};
         if (git2.git_indexer_options_init(&opts, 1) != git2.ok) return error.GitFailed;
-        opts.verify = 1;
+        // `git_indexer` still verifies pack structure, delta resolution, strict
+        // object/hash integrity, and trailing SHA-1 checksum. libgit2's `verify=1`
+        // connectivity walk falsely rejects valid repos with 160000 submodule
+        // gitlink entries (and shallow boundaries), so keep it 0.
+        opts.verify = 0;
 
         var idx: ?*git2.Indexer = null;
         if (git2.git_indexer_new(&idx, pack_dir.ptr, 0, odb.?, &opts) != git2.ok) {
@@ -1946,4 +1954,50 @@ test "libgit2 buildCommit, lsTree, readBlob, log, listBranches, updateRef, and g
     // Real git fsck verifies every tree/blob/commit created in-process is 100% valid.
     const fsck_out = try repo.gitOutput(&.{ "fsck", "--strict", "--full" }, .{});
     gpa.free(fsck_out);
+}
+
+test "indexPackSlice accepts valid pack containing a 160000 submodule gitlink" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "repos");
+    try tmp.dir.createDirPath(io, "tmp");
+    const base = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(base);
+    const repos_dir = try std.mem.concat(gpa, u8, &.{ base, "/repos" });
+    defer gpa.free(repos_dir);
+    const tmp_dir = try std.mem.concat(gpa, u8, &.{ base, "/tmp" });
+    defer gpa.free(tmp_dir);
+
+    const store: store_mod.Store = .{
+        .root = repos_dir,
+        .tmp = tmp_dir,
+        .path_env = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+    };
+    const src_name = try repo_name.parse("acme/sub-src");
+    const dst_name = try repo_name.parse("acme/sub-dst");
+    try store.create(io, gpa, src_name);
+    try store.create(io, gpa, dst_name);
+    const src_repo = try Repo.open(io, gpa, &store, src_name);
+    const dst_repo = try Repo.open(io, gpa, &store, dst_name);
+
+    // Create a tree containing a 160000 submodule gitlink pointing to an external commit OID
+    // not present in the repo, commit it, and pack it with `git pack-objects --stdout`.
+    const tree_raw = try src_repo.gitOutput(&.{"mktree"}, .{
+        .stdin = "160000 commit 1111111111111111111111111111111111111111\tsubmod\n",
+    });
+    defer gpa.free(tree_raw);
+    const tree_sha = std.mem.trimEnd(u8, tree_raw, "\n");
+    var c_buf: [64]u8 = undefined;
+    const c_sha = try src_repo.commitTree(tree_sha, &.{}, "add submodule", .{ .name = "A", .email = "a@b" }, &c_buf);
+
+    var stdin_buf: [128]u8 = undefined;
+    const pack_in = std.mem.print(&stdin_buf, "{s}\n{s}\n", .{ c_sha, tree_sha }) catch unreachable;
+    const pack_bytes = try src_repo.gitOutput(&.{ "pack-objects", "--stdout", "--quiet" }, .{ .stdin = pack_in });
+    defer gpa.free(pack_bytes);
+
+    try dst_repo.indexPackSlice(pack_bytes);
+    try std.testing.expect(try dst_repo.verifyPushedTarget(c_sha, true));
 }
