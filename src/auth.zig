@@ -22,7 +22,7 @@ pub const Secret = [secret_len]u8;
 pub const token_prefix = "gitd_t_";
 pub const key_prefix = "gitd_k_";
 /// Longer tokens are rejected before decoding (R2.3).
-pub const max_token_len = 2048;
+pub const max_token_len = 4096;
 /// A token can limit writes to at most this many ref patterns (R2.2).
 pub const max_ref_patterns = 4;
 /// Total bytes of all ref patterns in one token.
@@ -82,6 +82,10 @@ pub const Claims = struct {
     refs_buf: [max_ref_patterns_bytes]u8 = undefined,
     refs_ends: [max_ref_patterns]u16 = undefined,
     refs_count: usize = 0,
+    /// Ref patterns this token may read (see ref_name). None means any.
+    read_refs_buf: [max_ref_patterns_bytes]u8 = undefined,
+    read_refs_ends: [max_ref_patterns]u16 = undefined,
+    read_refs_count: usize = 0,
     /// Seconds a branch created by a push with this token lives before
     /// gitd deletes it. Zero means such branches do not expire.
     branch_ttl: u32 = 0,
@@ -95,6 +99,11 @@ pub const Claims = struct {
         return c.refs_buf[start..c.refs_ends[i]];
     }
 
+    pub fn readRefPattern(c: *const Claims, i: usize) []const u8 {
+        const start = if (i == 0) 0 else c.read_refs_ends[i - 1];
+        return c.read_refs_buf[start..c.read_refs_ends[i]];
+    }
+
     /// Adds a write limit. Fails if the pattern is invalid or the limits
     /// on count and size are reached.
     pub fn addRefPattern(c: *Claims, pattern: []const u8) error{ InvalidRefPattern, TooManyRefPatterns }!void {
@@ -106,11 +115,33 @@ pub const Claims = struct {
         c.refs_count += 1;
     }
 
+    /// Adds a read limit. Fails if the pattern is invalid or the limits
+    /// on count and size are reached.
+    pub fn addReadRefPattern(c: *Claims, pattern: []const u8) error{ InvalidRefPattern, TooManyRefPatterns }!void {
+        ref_name.validatePattern(pattern) catch return error.InvalidRefPattern;
+        const start: usize = if (c.read_refs_count == 0) 0 else c.read_refs_ends[c.read_refs_count - 1];
+        if (c.read_refs_count == max_ref_patterns or start + pattern.len > max_ref_patterns_bytes) return error.TooManyRefPatterns;
+        @memcpy(c.read_refs_buf[start..][0..pattern.len], pattern);
+        c.read_refs_ends[c.read_refs_count] = @intCast(start + pattern.len);
+        c.read_refs_count += 1;
+    }
+
     /// Whether this token may create, move, or delete `ref`.
     pub fn allowsRef(c: *const Claims, ref: []const u8) bool {
         if (c.refs_count == 0) return true;
         for (0..c.refs_count) |i| if (ref_name.matches(c.refPattern(i), ref)) return true;
         return false;
+    }
+
+    /// Whether this token may read `ref`.
+    pub fn allowsReadRef(c: *const Claims, ref: []const u8) bool {
+        if (c.read_refs_count == 0) return true;
+        for (0..c.read_refs_count) |i| if (ref_name.matches(c.readRefPattern(i), ref)) return true;
+        return false;
+    }
+
+    pub fn isReadRefRestricted(c: *const Claims) bool {
+        return c.read_refs_count > 0;
     }
 
     pub fn init(name: []const u8, repo_id: []const u8, scopes: Scopes, expires_at: i64) error{InvalidRepoName}!Claims {
@@ -131,6 +162,7 @@ const Payload = struct {
     scopes: []const []const u8,
     exp: i64,
     refs: []const []const u8 = &.{},
+    rrefs: []const []const u8 = &.{},
     bttl: u32 = 0,
 };
 
@@ -150,6 +182,8 @@ pub fn mint(secret: *const Secret, claims: *const Claims, out: *[max_token_len]u
     }
     var refs: [max_ref_patterns][]const u8 = undefined;
     for (0..claims.refs_count) |i| refs[i] = claims.refPattern(i);
+    var rrefs: [max_ref_patterns][]const u8 = undefined;
+    for (0..claims.read_refs_count) |i| rrefs[i] = claims.readRefPattern(i);
     const payload: Payload = .{
         .v = 1,
         .repo = claims.repo(),
@@ -157,10 +191,11 @@ pub fn mint(secret: *const Secret, claims: *const Claims, out: *[max_token_len]u
         .scopes = names[0..count],
         .exp = claims.expires_at,
         .refs = refs[0..claims.refs_count],
+        .rrefs = rrefs[0..claims.read_refs_count],
         .bttl = claims.branch_ttl,
     };
 
-    var json_buf: [1400]u8 = undefined;
+    var json_buf: [2800]u8 = undefined;
     const json = std.mem.print(&json_buf, "{f}", .{std.json.fmt(payload, .{})}) catch return error.TokenTooLong;
 
     const encoded_len = b64.Encoder.calcSize(json.len);
@@ -214,6 +249,7 @@ pub fn verify(secret: *const Secret, token: []const u8, now: i64) VerifyError!Cl
     }
     var claims = Claims.init(payload.repo, payload.rid, scopes, payload.exp) catch return error.InvalidToken;
     for (payload.refs) |pattern| claims.addRefPattern(pattern) catch return error.InvalidToken;
+    for (payload.rrefs) |pattern| claims.addReadRefPattern(pattern) catch return error.InvalidToken;
     claims.branch_ttl = payload.bttl;
     if (now >= claims.expires_at) return error.ExpiredToken;
     return claims;
@@ -398,6 +434,22 @@ test "ref patterns survive mint and verify, and limit writes" {
     try std.testing.expectError(error.TooManyRefPatterns, big.addRefPattern(long));
     // The largest allowed token still fits.
     _ = try mint(&test_secret, &big, &buf);
+}
+
+test "read_refs patterns survive mint and verify, and limit reads" {
+    var claims = try Claims.init("acme/web", test_rid, .{ .git_read = true }, 1000);
+    try std.testing.expect(!claims.isReadRefRestricted());
+    try std.testing.expect(claims.allowsReadRef("refs/heads/secret"));
+    try claims.addReadRefPattern("refs/heads/main");
+    try claims.addReadRefPattern("refs/heads/agent/7/*");
+    var buf: [max_token_len]u8 = undefined;
+    const got = try verify(&test_secret, try mint(&test_secret, &claims, &buf), 0);
+    try std.testing.expect(got.isReadRefRestricted());
+    try std.testing.expectEqual(@as(usize, 2), got.read_refs_count);
+    try std.testing.expect(got.allowsReadRef("refs/heads/main"));
+    try std.testing.expect(got.allowsReadRef("refs/heads/agent/7/work"));
+    try std.testing.expect(!got.allowsReadRef("refs/heads/secret"));
+    try std.testing.expect(!got.allowsReadRef("refs/heads/agent/8/work"));
 }
 
 test "admin keys hash stably and differ from the key" {

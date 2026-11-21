@@ -377,6 +377,9 @@ fn createToken(app: *App, request: *http.Server.Request) HandleError!http.Status
         /// Ref patterns the token may write, like "refs/heads/agent/7/*".
         /// Omitted means any ref.
         refs: []const []const u8 = &.{},
+        /// Ref patterns the token may read, like "refs/heads/main".
+        /// Omitted means any ref.
+        read_refs: []const []const u8 = &.{},
         /// Branches this token creates by push expire after this long.
         branch_ttl_seconds: i64 = 0,
     };
@@ -405,6 +408,10 @@ fn createToken(app: *App, request: *http.Server.Request) HandleError!http.Status
     for (body.refs) |pattern| claims.addRefPattern(pattern) catch |err| return switch (err) {
         error.InvalidRefPattern => respondError(request, .bad_request, "invalid_ref_pattern", "ref patterns are full ref names, optionally ending in /*, like refs/heads/agent/7/*"),
         error.TooManyRefPatterns => respondError(request, .bad_request, "invalid_ref_pattern", "at most 4 ref patterns, 600 bytes in total"),
+    };
+    for (body.read_refs) |pattern| claims.addReadRefPattern(pattern) catch |err| return switch (err) {
+        error.InvalidRefPattern => respondError(request, .bad_request, "invalid_ref_pattern", "read_refs patterns are full ref names, optionally ending in /*, like refs/heads/agent/7/*"),
+        error.TooManyRefPatterns => respondError(request, .bad_request, "invalid_ref_pattern", "at most 4 read_refs patterns, 600 bytes in total"),
     };
     if (body.branch_ttl_seconds < 0 or body.branch_ttl_seconds > expiry.max_ttl_seconds) {
         return respondError(request, .bad_request, "invalid_ttl", "branch_ttl_seconds must be 0-604800");
@@ -504,9 +511,49 @@ fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route,
         if (!push.?.allowedBy(&claims)) return rejectPush(app, request, &push.?, &claims, repo_copy);
     }
 
+    // Enforce read_refs on git smart HTTP via transfer.hideRefs (R2.1).
+    var hide_buf: [auth.max_ref_patterns_bytes * 2 + 64]u8 = undefined;
+    var hide_pos: usize = 0;
+    var git_cfg_buf: [16][2][]const u8 = undefined;
+    var git_cfg_n: usize = 0;
+    if (claims.isReadRefRestricted()) {
+        git_cfg_buf[git_cfg_n] = .{ "uploadpack.allowAnySHA1InWant", "false" };
+        git_cfg_n += 1;
+        git_cfg_buf[git_cfg_n] = .{ "uploadpack.allowReachableSHA1InWant", "false" };
+        git_cfg_n += 1;
+        git_cfg_buf[git_cfg_n] = .{ "transfer.hideRefs", "refs/" };
+        git_cfg_n += 1;
+        if (!claims.allowsReadRef("refs/heads/main")) {
+            git_cfg_buf[git_cfg_n] = .{ "transfer.hideRefs", "HEAD" };
+            git_cfg_n += 1;
+        }
+        for (0..claims.read_refs_count) |i| {
+            const pat = claims.readRefPattern(i);
+            if (std.mem.endsWith(u8, pat, "/*")) {
+                const prefix = pat[0 .. pat.len - 1]; // keeps trailing '/'
+                const val = std.mem.print(hide_buf[hide_pos..], "!{s}", .{prefix}) catch return internal(request);
+                hide_pos += val.len;
+                git_cfg_buf[git_cfg_n] = .{ "transfer.hideRefs", val };
+                git_cfg_n += 1;
+            } else {
+                const allow = std.mem.print(hide_buf[hide_pos..], "!{s}", .{pat}) catch return internal(request);
+                hide_pos += allow.len;
+                git_cfg_buf[git_cfg_n] = .{ "transfer.hideRefs", allow };
+                git_cfg_n += 1;
+            }
+        }
+    }
+
+    var input_with_cfg = input;
+    input_with_cfg.git_config = git_cfg_buf[0..git_cfg_n];
+    // Git protocol v2 allows fetching hidden ref tips by raw SHA even with
+    // allowAnySHA1InWant=false; falling back to v0/v1 enforces strict
+    // rejection of unadvertised objects (R2.1).
+    if (claims.isReadRefRestricted()) input_with_cfg.git_protocol = "";
+
     var recorder: Push.Recorder = .{ .app = app, .push = if (push) |*p| p else null, .repo = repo_copy, .repo_id = claims.repo_id, .branch_ttl = claims.branch_ttl };
     const after: ?git_proxy.After = if (push != null) .{ .ctx = &recorder, .run = Push.Recorder.run } else null;
-    return git_proxy.serve(app.io, app.gpa, app.store, request, git_route, input, body, after) catch |err|
+    return git_proxy.serve(app.io, app.gpa, app.store, request, git_route, input_with_cfg, body, after) catch |err|
         proxyError(request, err);
 }
 

@@ -864,6 +864,33 @@ expect_eq "sync rejects embedded credentials" 400 "$(admin -X POST "$BASE/v1/rep
 expect_eq "sync rejects bad direction" 400 "$(admin -X POST "$BASE/v1/repos/acme/mirror/sync" -d "$(sync_body clone "$BASE/acme/other.git" main)")"
 expect_eq "sync push missing branch" 404 "$(admin -X POST "$BASE/v1/repos/acme/mirror/sync" -d "$(sync_body push "$BASE/acme/other.git" no-such-branch "$UP_TOK")")"
 
+echo "== private branches (read_refs)"
+expect_eq "secret branch commit" 201 "$(admin -X POST "$CB/commits" -d '{"branch":"secret/internal","expected_head":null,"from":"main","message":"top secret","changes":[{"path":"secret.txt","content":"classified\n"}]}')"
+SECRET_SHA="$(json '["sha"]')"
+PRIV_TOK="$(admin -X POST "$BASE/v1/tokens" -d '{"repo":"acme/other","scopes":["git:read","git:write"],"refs":["refs/heads/agent/7/*"],"read_refs":["refs/heads/main","refs/heads/agent/7/*"],"ttl_seconds":300}' >/dev/null; json '["token"]')"
+expect_eq "read_refs branches list" 200 "$(status -H "authorization: Bearer $PRIV_TOK" "$CB/branches")"
+expect_eq "secret branch hidden from /branches" "0" "$(python3 -c 'import json; print(sum(1 for b in json.load(open("'"$WORK"'/body"))["branches"] if b["name"]=="secret/internal"))')"
+expect_eq "main visible in /branches" "1" "$(python3 -c 'import json; print(sum(1 for b in json.load(open("'"$WORK"'/body"))["branches"] if b["name"]=="main"))')"
+expect_eq "read_refs allows reading main file" 200 "$(status -H "authorization: Bearer $PRIV_TOK" "$CB/files/notes/a.md?ref=main")"
+expect_eq "read_refs blocks hidden branch file" 403 "$(status -H "authorization: Bearer $PRIV_TOK" "$CB/files/secret.txt?ref=secret/internal")"
+expect_eq "read_refs blocks hidden branch grep" 403 "$(status -H "authorization: Bearer $PRIV_TOK" "$CB/grep?ref=secret/internal&q=classified")"
+expect_eq "read_refs blocks hidden branch archive" 403 "$(status -H "authorization: Bearer $PRIV_TOK" "$CB/archive?ref=secret/internal")"
+expect_eq "read_refs blocks hidden branch compare" 403 "$(status -H "authorization: Bearer $PRIV_TOK" "$CB/compare/main...secret/internal")"
+expect_eq "read_refs blocks raw SHA commit lookup" 403 "$(status -H "authorization: Bearer $PRIV_TOK" "$CB/commits/$SECRET_SHA")"
+expect_eq "read_refs blocks raw SHA ref param" 403 "$(status -H "authorization: Bearer $PRIV_TOK" "$CB/files/secret.txt?ref=$SECRET_SHA")"
+expect_eq "read_refs blocks branching from hidden ref" 403 "$(status -H "authorization: Bearer $PRIV_TOK" -X POST "$CB/branches" -d '{"name":"agent/7/leak","from":"secret/internal"}')"
+expect_eq "read_refs blocks merging from hidden ref" 403 "$(status -H "authorization: Bearer $PRIV_TOK" -X POST "$CB/merges" -d '{"base":"agent/7/api","head":"secret/internal"}')"
+# Real git client checks (R5.2)
+LS_OUT="$(git ls-remote "$(url "$PRIV_TOK" acme/other)" 2>"$WORK/err")" || fail "git ls-remote with read_refs: $(cat "$WORK/err")"
+echo "$LS_OUT" | grep -q "refs/heads/main" || fail "git ls-remote missing allowed main"
+echo "$LS_OUT" | grep -q "secret/internal" && fail "git ls-remote leaked hidden branch"
+pass "git ls-remote hides private branches"
+PRIV_CLONE="$WORK/priv-clone"
+git clone -q "$(url "$PRIV_TOK" acme/other)" "$PRIV_CLONE" 2>"$WORK/err" || fail "git clone with read_refs: $(cat "$WORK/err")"
+if git -C "$PRIV_CLONE" fetch -q origin refs/heads/secret/internal 2>/dev/null; then fail "git fetch retrieved hidden branch"; fi
+if git -C "$PRIV_CLONE" fetch -q origin "$SECRET_SHA" 2>/dev/null; then fail "git fetch retrieved hidden SHA"; fi
+pass "git fetch cannot retrieve hidden branch or SHA"
+
 echo "== SDKs (TypeScript and Python)"
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 if GITD_URL="$BASE" GITD_KEY="$KEY" python3 -m unittest discover -s "$ROOT_DIR/sdk/python" -p "test_*.py" >"$WORK/py-sdk.out" 2>&1; then
