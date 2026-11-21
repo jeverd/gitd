@@ -42,17 +42,38 @@ on start.
 
 ## Speed
 
-`python3 tests/bench/bench.py http://127.0.0.1:8080 "$KEY"` against the Docker image
-(Docker Desktop, 4 CPUs, arm64):
+Measured on AWS EC2 `c7i.2xlarge` (Ubuntu 24.04, 8 vCPU, 15.3 GiB RAM, `ReleaseSafe`) using [`tests/bench/run_ec2.sh`](tests/bench/run_ec2.sh):
 
-| call | p50 | p95 |
-|---|---|---|
-| commit through the API | 6.7 ms | 7.3 ms |
-| commit, 16 agents at once (≈380 commits/s) | 41.6 ms | 56.5 ms |
-| git clone | 87.9 ms | 88.6 ms |
-| git push, one commit | 37.3 ms | 39.3 ms |
-| compare | 6.8 ms | 7.6 ms |
-| merge | 10.6 ms | 14.2 ms |
+| Operation | p50 | p95 | Notes |
+|---|---|---|---|
+| Read file via API (`GET /files/...`) | 0.4 ms | — | in-process libgit2 |
+| Commit 1 file via API (`POST /commits`) | 0.8 ms | 1.0 ms | in-process libgit2 + CAS |
+| Commit 100 files via API (`POST /commits`) | 5.5 ms | 5.8 ms | 0.1 ms/file |
+| 64 agents committing concurrently | 18.6 ms | 37.4 ms | **2,867 commits/s** |
+| 32 agents racing on `main` (CAS storm) | 4.1 ms | — | **228 landed/s**, 0 lost updates |
+| `git clone` (Smart HTTP) | 61.3 ms | — | 35.5 ms faster than bare `git http-backend` (96.8 ms) |
+| `git push`, 10 KiB commit | 12.2 ms | — | **5.5x faster** than bare `git http-backend` (66.8 ms) |
+| `git push`, 250 KiB commit | 31.1 ms | — | **2.9x faster** than bare `git http-backend` (89.7 ms) |
+| Compare (`GET /compare/...`) | 9.0 ms | — | 10.1 ms at 64 agents |
+| Merge (`POST /merges`) | 1.4 ms | — | 1.3 ms at 64 agents |
+
+**Zero-clone API loop vs. `git clone` → edit → `git push` on real OSS repos:**
+
+| Repo | API p50 | Shallow clone p50 | Full clone p50 | Speedup (vs. Shallow / Full) |
+|---|---|---|---|---|
+| `ripgrep` (227 files) | 9.8 ms | 249.0 ms | 1.12 s | **25.5x / 114.9x** |
+| `ruff` (11,338 files) | 269.2 ms | 3.37 s | 15.72 s | **12.5x / 58.4x** |
+| `zig` (20,545 files) | 359.9 ms | 5.00 s | 27.24 s | **13.9x / 75.7x** |
+
+**Container comparison (`--cpus=4 --memory=4g`, [`tests/bench/compare_forges.py`](tests/bench/compare_forges.py)):**
+
+| Target | Image | Cold start | Idle / Peak RSS | Seq commit p50 | Concurrent commits (rate) |
+|---|---|---|---|---|---|
+| **gitd** | 63.6 MiB | **158 ms** | **5.1 / 20.4 MiB** | **1.0 ms** | **4.7 ms (1,820/s)** |
+| Gitea | 64.7 MiB | 2.71 s | 103.6 / 479.0 MiB | 260.9 ms | 2.02 s (7.9/s) |
+| Forgejo | 64.9 MiB | 2.22 s | 105.8 / 546.7 MiB | 270.4 ms | 2.15 s (7.3/s) |
+
+> Scope note: Gitea and Forgejo are full human Git forges (web UI, PRs, issues, SQLite ORM); `gitd` is a purpose-built minimal git storage server for AI agents. See [`tests/bench/README.md`](tests/bench/README.md) to reproduce.
 
 ## API
 
@@ -141,7 +162,7 @@ agent.commit_with_retry("acme/web", "agent/1/work", lambda head: {
 
 ## MVP
 
-- **Stack:** Zig, SQLite, and git plumbing commands (no libgit2 needed so far). One server, repos on a persistent disk.
+- **Stack:** Zig, SQLite, in-process `libgit2` + native Zig Git Smart HTTP server (with `git` for diff, merge-tree, grep, archive, and GC). One server, repos on a persistent disk.
 - **Features:**
   1. ✅ Repos: create, list, delete over an API
   2. ✅ Git: `git clone` and `git push` work normally
@@ -161,8 +182,8 @@ agent.commit_with_retry("acme/web", "agent/1/work", lambda head: {
 ## After the MVP
 
 1. Repos in S3, metadata in Postgres
-2. Our own git protocol server in Zig
-3. SDK and web UI
+2. ✅ Native Zig Git Smart HTTP protocol server + in-process `libgit2`
+3. ✅ Zero-dependency TypeScript & Python SDKs and read-only `/ui`
 
 ## Development
 
