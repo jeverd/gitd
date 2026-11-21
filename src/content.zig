@@ -91,6 +91,26 @@ pub const Access = struct {
         return c.scopes.git_read and c.allowsReadRef(ref);
     }
 
+    pub fn isPathRestricted(a: Access) bool {
+        const c = a.claims orelse return false;
+        return c.isPathRestricted();
+    }
+
+    pub fn canAccessPath(a: Access, path: []const u8) bool {
+        const c = a.claims orelse return true;
+        return c.allowsPath(path);
+    }
+
+    pub fn canAccessDir(a: Access, dir: []const u8) bool {
+        const c = a.claims orelse return true;
+        return c.allowsDir(dir);
+    }
+
+    pub fn coversWholeDir(a: Access, dir: []const u8) bool {
+        const c = a.claims orelse return true;
+        return c.coversWholeDir(dir);
+    }
+
     /// Whether `ref` (a full ref name) may be created, moved, or deleted.
     pub fn canWrite(a: Access, ref: []const u8) bool {
         if (a.read_only) return false;
@@ -269,6 +289,7 @@ fn setTtl(app: *server.App, name: repo_name.Name, repo_id: []const u8, ref: []co
 fn readFile(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, raw_path: []const u8, query: []const u8, access: Access) Error!http.Status {
     var path_buf: [repo_path.max_len]u8 = undefined;
     const path = (try pathFromUrl(request, raw_path, &path_buf)) orelse return .bad_request;
+    if (!access.canAccessPath(path)) return api.respondError(request, .forbidden, "forbidden", "this token may not access that path");
     var oid_buf: [64]u8 = undefined;
     const commit = (try commitFromQuery(app, request, repo, query, access, &oid_buf)) orelse return .not_found;
 
@@ -295,6 +316,9 @@ fn readFile(app: *server.App, request: *http.Server.Request, repo: *const repo_g
 fn readTree(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, raw_path: ?[]const u8, query: []const u8, access: Access) Error!http.Status {
     var path_buf: [repo_path.max_len]u8 = undefined;
     const dir: ?[]const u8 = if (raw_path) |p| ((try pathFromUrl(request, p, &path_buf)) orelse return .bad_request) else null;
+    if (dir) |d| {
+        if (!access.canAccessDir(d)) return api.respondError(request, .forbidden, "forbidden", "this token may not access that path");
+    }
     var oid_buf: [64]u8 = undefined;
     const commit = (try commitFromQuery(app, request, repo, query, access, &oid_buf)) orelse return .not_found;
 
@@ -309,17 +333,21 @@ fn readTree(app: *server.App, request: *http.Server.Request, repo: *const repo_g
     const entries = repo.lsTree(commit, dir, false) catch |err| return gitError(request, err);
     defer entries.deinit(app.gpa);
     const Item = struct { name: []const u8, path: []const u8, type: []const u8, mode: []const u8, oid: []const u8, size: ?u64 };
-    const items = app.gpa.alloc(Item, entries.items.len) catch return api.internal(request);
-    defer app.gpa.free(items);
-    for (entries.items, items) |e, *i| i.* = .{
-        .name = std.Io.Dir.path.basename(e.path),
-        .path = e.path,
-        .type = @tagName(e.kind),
-        .mode = e.mode,
-        .oid = e.oid,
-        .size = e.size,
-    };
-    return api.respondJson(app.gpa, request, .ok, .{ .commit = commit, .path = dir orelse "", .entries = items });
+    var items: std.ArrayList(Item) = .empty;
+    defer items.deinit(app.gpa);
+    for (entries.items) |e| {
+        const visible = if (e.kind == .tree) access.canAccessDir(e.path) else access.canAccessPath(e.path);
+        if (!visible) continue;
+        items.append(app.gpa, .{
+            .name = std.Io.Dir.path.basename(e.path),
+            .path = e.path,
+            .type = @tagName(e.kind),
+            .mode = e.mode,
+            .oid = e.oid,
+            .size = e.size,
+        }) catch return api.internal(request);
+    }
+    return api.respondJson(app.gpa, request, .ok, .{ .commit = commit, .path = dir orelse "", .entries = items.items });
 }
 
 const CommitJson = struct {
@@ -359,7 +387,12 @@ fn readLog(app: *server.App, request: *http.Server.Request, repo: *const repo_gi
     if (std.mem.find(u8, query, "path=") != null) {
         const p = api.queryValue(&path_buf, query, "path") orelse return api.respondError(request, .bad_request, "invalid_path", "the path is not valid");
         repo_path.validate(p) catch return api.respondError(request, .bad_request, "invalid_path", "the path is not valid");
+        if (!access.canAccessPath(p) and !access.canAccessDir(p)) {
+            return api.respondError(request, .forbidden, "forbidden", "this token may not access that path");
+        }
         path = p;
+    } else if (access.isPathRestricted()) {
+        return api.respondError(request, .forbidden, "forbidden", "path-scoped tokens must pass an allowed path to log");
     }
     const log = repo.log(commit, @intCast(limit_raw), path, false) catch |err| return gitError(request, err);
     defer log.deinit(app.gpa);
@@ -415,6 +448,9 @@ fn grepRepo(app: *server.App, request: *http.Server.Request, repo: *const repo_g
             return api.respondError(request, .bad_request, "invalid_path", "the path is not valid");
         repo_path.validate(p) catch
             return api.respondError(request, .bad_request, "invalid_path", "the path is not valid");
+        if (!access.canAccessPath(p) and !access.canAccessDir(p)) {
+            return api.respondError(request, .forbidden, "forbidden", "this token may not access that path");
+        }
         path = p;
     }
     var oid_buf: [64]u8 = undefined;
@@ -429,9 +465,21 @@ fn grepRepo(app: *server.App, request: *http.Server.Request, repo: *const repo_g
         else => |e| return gitError(request, e),
     };
     defer res.deinit(app.gpa);
+    if (!access.isPathRestricted()) {
+        return api.respondJson(app.gpa, request, .ok, .{
+            .commit = commit,
+            .matches = res.items,
+            .truncated = res.truncated,
+        });
+    }
+    var filtered: std.ArrayList(repo_git.Repo.GrepMatch) = .empty;
+    defer filtered.deinit(app.gpa);
+    for (res.items) |m| {
+        if (access.canAccessPath(m.path)) filtered.append(app.gpa, m) catch return api.internal(request);
+    }
     return api.respondJson(app.gpa, request, .ok, .{
         .commit = commit,
-        .matches = res.items,
+        .matches = filtered.items,
         .truncated = res.truncated,
     });
 }
@@ -452,7 +500,12 @@ fn readArchive(app: *server.App, request: *http.Server.Request, repo: *const rep
             return api.respondError(request, .bad_request, "invalid_path", "the path is not valid");
         repo_path.validate(p) catch
             return api.respondError(request, .bad_request, "invalid_path", "the path is not valid");
+        if (access.isPathRestricted() and !access.canAccessPath(p) and !access.coversWholeDir(p)) {
+            return api.respondError(request, .forbidden, "forbidden", "this token may not archive that path");
+        }
         path = p;
+    } else if (access.isPathRestricted()) {
+        return api.respondError(request, .forbidden, "forbidden", "path-scoped tokens must specify an allowed path for archive");
     }
     var oid_buf: [64]u8 = undefined;
     const commit = (try commitFromQuery(app, request, repo, query, access, &oid_buf)) orelse return .not_found;
@@ -544,6 +597,7 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
     const changes = arena.alloc(repo_git.Repo.Change, body.changes.len) catch return api.internal(request);
     for (body.changes, changes) |c, *out| {
         repo_path.validate(c.path) catch return api.respondError(request, .bad_request, "invalid_path", "a change has an invalid path");
+        if (!access.canAccessPath(c.path)) return api.respondError(request, .forbidden, "forbidden", "this token may not modify that path");
         const given = @as(u8, @intFromBool(c.content != null)) + @intFromBool(c.content_base64 != null) + @intFromBool(c.delete);
         if (given != 1) return api.respondError(request, .bad_request, "invalid_changes", "each change needs exactly one of content, content_base64, or delete");
         const data: ?[]const u8 = if (c.content) |t| t else if (c.content_base64) |b64| blk: {
@@ -694,20 +748,23 @@ fn compare(app: *server.App, request: *http.Server.Request, repo: *const repo_gi
     const from = merge_base orelse base;
     const files = repo.diffFiles(from, head) catch |err| return gitError(request, err);
     defer files.deinit(app.gpa);
-    const patch = repo.diffPatch(from, head, max_patch_bytes) catch |err| return gitError(request, err);
+    const patch = if (access.isPathRestricted()) null else (repo.diffPatch(from, head, max_patch_bytes) catch |err| return gitError(request, err));
     defer if (patch) |p| app.gpa.free(p);
 
     const FileJson = struct { path: []const u8, status: []const u8, additions: ?u64, deletions: ?u64 };
-    const items = app.gpa.alloc(FileJson, files.items.len) catch return api.internal(request);
-    defer app.gpa.free(items);
-    for (files.items, items) |f, *i| i.* = .{ .path = f.path, .status = f.status, .additions = f.additions, .deletions = f.deletions };
+    var items: std.ArrayList(FileJson) = .empty;
+    defer items.deinit(app.gpa);
+    for (files.items) |f| {
+        if (!access.canAccessPath(f.path)) continue;
+        items.append(app.gpa, .{ .path = f.path, .status = f.status, .additions = f.additions, .deletions = f.deletions }) catch return api.internal(request);
+    }
     return api.respondJson(app.gpa, request, .ok, .{
         .base = base,
         .head = head,
         .merge_base = merge_base,
         .ahead = counts.ahead,
         .behind = counts.behind,
-        .files = items,
+        .files = items.items,
         .patch = patch orelse "",
         .patch_truncated = patch == null,
     });
@@ -750,6 +807,17 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
 
     if (repo.isAncestor(head, base) catch |err| return gitError(request, err)) {
         return api.respondJson(app.gpa, request, .ok, .{ .result = "up_to_date", .sha = base });
+    }
+    if (access.isPathRestricted()) {
+        var mb_buf: [64]u8 = undefined;
+        const mb = repo.mergeBase(base, head, &mb_buf) catch |err| return gitError(request, err);
+        const diff = repo.diffFiles(mb orelse base, head) catch |err| return gitError(request, err);
+        defer diff.deinit(app.gpa);
+        for (diff.items) |f| {
+            if (!access.canAccessPath(f.path)) {
+                return api.respondError(request, .forbidden, "forbidden", "merge touches files outside this token's allowed paths");
+            }
+        }
     }
     const can_ff = repo.isAncestor(base, head) catch |err| return gitError(request, err);
     if (body.strategy == .@"fast-forward" or (can_ff and body.strategy == .merge)) {

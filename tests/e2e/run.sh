@@ -891,6 +891,26 @@ if git -C "$PRIV_CLONE" fetch -q origin refs/heads/secret/internal 2>/dev/null; 
 if git -C "$PRIV_CLONE" fetch -q origin "$SECRET_SHA" 2>/dev/null; then fail "git fetch retrieved hidden SHA"; fi
 pass "git fetch cannot retrieve hidden branch or SHA"
 
+echo "== path-scoped permissions (paths)"
+expect_eq "seed docs and secrets" 201 "$(admin -X POST "$CB/commits" -d '{"branch":"path/test","expected_head":null,"from":"main","message":"seed paths","changes":[{"path":"docs/guide.md","content":"public doc token-word\n"},{"path":"secrets/prod.env","content":"SECRET=topsecret token-word\n"}]}')"
+PATH_BASE="$(json '["sha"]')"
+PATH_TOK="$(admin -X POST "$BASE/v1/tokens" -d '{"repo":"acme/other","scopes":["git:read","git:write"],"refs":["refs/heads/path/*"],"paths":["docs/*"],"ttl_seconds":300}' >/dev/null; json '["token"]')"
+expect_eq "paths allows reading docs/guide.md" 200 "$(status -H "authorization: Bearer $PATH_TOK" "$CB/files/docs/guide.md?ref=path/test")"
+expect_eq "paths blocks reading secrets/prod.env" 403 "$(status -H "authorization: Bearer $PATH_TOK" "$CB/files/secrets/prod.env?ref=path/test")"
+expect_eq "paths root tree hides secrets dir" 200 "$(status -H "authorization: Bearer $PATH_TOK" "$CB/tree?ref=path/test")"
+expect_eq "paths root tree only shows docs" "docs" "$(python3 -c 'import json; print(" ".join(e["name"] for e in json.load(open("'"$WORK"'/body"))["entries"]))')"
+expect_eq "paths blocks secrets tree" 403 "$(status -H "authorization: Bearer $PATH_TOK" "$CB/tree/secrets?ref=path/test")"
+expect_eq "paths grep filters out secrets" 200 "$(status -H "authorization: Bearer $PATH_TOK" "$CB/grep?ref=path/test&q=token-word")"
+expect_eq "paths grep only hits docs/guide.md" "1 docs/guide.md" "$(json '["matches"].__len__()') $(json '["matches"][0]["path"]')"
+expect_eq "paths archive requires allowed path" 403 "$(status -H "authorization: Bearer $PATH_TOK" "$CB/archive?ref=path/test")"
+expect_eq "paths archive allows docs" 200 "$(status -H "authorization: Bearer $PATH_TOK" "$CB/archive?ref=path/test&path=docs&format=tar")"
+expect_eq "paths archive only contains docs/guide.md" "docs/guide.md" "$(tar -tf "$WORK/body" | grep -v '/$' | tr '\n' ' ' | sed 's/ $//')"
+expect_eq "paths blocks raw git clone" 403 "$(status -u "t:$PATH_TOK" "$BASE/acme/other.git/info/refs?service=git-upload-pack")"
+expect_eq "paths blocks commit touching secrets" 403 "$(status -H "authorization: Bearer $PATH_TOK" -X POST "$CB/commits" -d "$(commit_body path/test "\"$PATH_BASE\"" bad '[{"path":"secrets/prod.env","content":"pwned"}]')")"
+expect_eq "paths allows commit touching docs" 201 "$(status -H "authorization: Bearer $PATH_TOK" -X POST "$CB/commits" -d "$(commit_body path/test "\"$PATH_BASE\"" "update doc" '[{"path":"docs/guide.md","content":"updated doc\n"}]')")"
+expect_eq "hidden file preserved intact after path-scoped commit" 200 "$(admin "$CB/files/secrets/prod.env?ref=path/test")"
+expect_eq "hidden file content unchanged" "SECRET=topsecret token-word" "$(cat "$WORK/body")"
+
 echo "== SDKs (TypeScript and Python)"
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 if GITD_URL="$BASE" GITD_KEY="$KEY" python3 -m unittest discover -s "$ROOT_DIR/sdk/python" -p "test_*.py" >"$WORK/py-sdk.out" 2>&1; then

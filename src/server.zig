@@ -380,6 +380,9 @@ fn createToken(app: *App, request: *http.Server.Request) HandleError!http.Status
         /// Ref patterns the token may read, like "refs/heads/main".
         /// Omitted means any ref.
         read_refs: []const []const u8 = &.{},
+        /// Path patterns the token may read or write, like "docs/*" or "README.md".
+        /// Omitted means any path.
+        paths: []const []const u8 = &.{},
         /// Branches this token creates by push expire after this long.
         branch_ttl_seconds: i64 = 0,
     };
@@ -412,6 +415,10 @@ fn createToken(app: *App, request: *http.Server.Request) HandleError!http.Status
     for (body.read_refs) |pattern| claims.addReadRefPattern(pattern) catch |err| return switch (err) {
         error.InvalidRefPattern => respondError(request, .bad_request, "invalid_ref_pattern", "read_refs patterns are full ref names, optionally ending in /*, like refs/heads/agent/7/*"),
         error.TooManyRefPatterns => respondError(request, .bad_request, "invalid_ref_pattern", "at most 4 read_refs patterns, 600 bytes in total"),
+    };
+    for (body.paths) |pattern| claims.addPathPattern(pattern) catch |err| return switch (err) {
+        error.InvalidPathPattern => respondError(request, .bad_request, "invalid_path_pattern", "paths are valid repo paths, optionally ending in /*, like docs/*"),
+        error.TooManyPathPatterns => respondError(request, .bad_request, "invalid_path_pattern", "at most 4 path patterns, 600 bytes in total"),
     };
     if (body.branch_ttl_seconds < 0 or body.branch_ttl_seconds > expiry.max_ttl_seconds) {
         return respondError(request, .bad_request, "invalid_ttl", "branch_ttl_seconds must be 0-604800");
@@ -452,6 +459,9 @@ fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route,
         .receive_pack => claims.scopes.git_write,
     };
     if (!allowed) return respondError(request, .forbidden, "forbidden", "this token lacks the scope for this operation");
+    if (claims.isPathRestricted()) {
+        return respondError(request, .forbidden, "forbidden", "path-scoped tokens must use the HTTP API, not raw git clone/push");
+    }
 
     // The ref advertisement is a GET; a body there is never read, and std
     // would otherwise try to drain it after the response (R3.4).
