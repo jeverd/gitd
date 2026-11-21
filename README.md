@@ -64,7 +64,8 @@ All `/v1` routes need `Authorization: Bearer <admin key>`. Per-repo routes (`/v1
 | `GET /v1/repos` | List repos |
 | `GET /v1/repos/{ns}/{repo}` | Get one repo |
 | `DELETE /v1/repos/{ns}/{repo}` | Delete a repo and its files. Its tokens stop working |
-| `POST /v1/tokens` `{"repo","scopes","ttl_seconds","refs","read_refs","paths","branch_ttl_seconds"}` | Mint a repo token. `refs` limits writes, `read_refs` limits reads & `git clone`/`ls-remote` visibility, `paths` (e.g. `["docs/*","README.md"]`) limits API reads/writes to matching files (path-scoped tokens use the HTTP API rather than raw `git clone`). With `branch_ttl_seconds`, branches it creates expire after that long |
+| `POST /v1/tokens` `{"repo","scopes","ttl_seconds","refs","read_refs","paths","branch_ttl_seconds"}` | Mint a repo token (returns `token`, `jti`, `expires_at`). `refs` limits writes, `read_refs` limits reads & `git clone`/`ls-remote` visibility, `paths` (e.g. `["docs/*","README.md"]`) limits API reads/writes to matching files. With `branch_ttl_seconds`, branches it creates expire after that long |
+| `POST /v1/tokens/{jti}/revoke` | Immediately revoke a minted token by its `jti` (admin key only) |
 | `GET /v1/repos/{ns}/{repo}/branches` | Branches with their commits |
 | `GET /v1/repos/{ns}/{repo}/files/{path}?ref=` | Raw file contents (up to 10 MiB) |
 | `GET /v1/repos/{ns}/{repo}/tree[/{path}]?ref=` | Directory listing |
@@ -73,6 +74,8 @@ All `/v1` routes need `Authorization: Bearer <admin key>`. Per-repo routes (`/v1
 | `POST /v1/repos/{ns}/{repo}/commits` | Commit file changes to a branch. Send `expected_head` (the commit you built on, or `null` for a new branch); if the branch moved, you get 409 with `current_head` |
 | `POST /v1/repos/{ns}/{repo}/branches` `{"name","from","ttl_seconds"}` | Create a branch (409 if it exists); with `ttl_seconds` it is deleted after that long. Commits that create a branch take `ttl_seconds` too |
 | `DELETE /v1/repos/{ns}/{repo}/branches/{name}?expected=` | Delete a branch, optionally only if it is at `expected` |
+| `PUT /v1/repos/{ns}/{repo}/branches/{name}/lock` `{"reason"}` | Lock a branch against commits, merges, deletes, and `git push` (admin key only; blocked writes return 423) |
+| `DELETE /v1/repos/{ns}/{repo}/branches/{name}/lock` | Unlock a locked branch (admin key only) |
 | `GET /v1/repos/{ns}/{repo}/compare/{base}...{head}` | Ahead/behind, changed files, and the patch (up to 1 MiB) |
 | `GET /v1/repos/{ns}/{repo}/grep?q=&ref=&path=&fixed=&ignore_case=&limit=` | Search text files at `ref` without cloning (returns matching paths, line numbers, lines) |
 | `GET /v1/repos/{ns}/{repo}/archive?ref=&format=&path=` | Download a `tar.gz` (default), `tar`, or `zip` archive of `ref` (or `path` within it) |

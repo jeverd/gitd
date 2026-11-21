@@ -911,6 +911,37 @@ expect_eq "paths allows commit touching docs" 201 "$(status -H "authorization: B
 expect_eq "hidden file preserved intact after path-scoped commit" 200 "$(admin "$CB/files/secrets/prod.env?ref=path/test")"
 expect_eq "hidden file content unchanged" "SECRET=topsecret token-word" "$(cat "$WORK/body")"
 
+echo "== token revocation and branch locks"
+expect_eq "mint revocable token" 201 "$(admin -X POST "$BASE/v1/tokens" -d '{"repo":"acme/other","scopes":["git:read","git:write"],"ttl_seconds":300}')"
+REV_TOK="$(json '["token"]')"
+REV_JTI="$(json '["jti"]')"
+expect_eq "token works before revoke" 200 "$(status -H "authorization: Bearer $REV_TOK" "$CB/branches")"
+git ls-remote "$(url "$REV_TOK" acme/other)" >/dev/null 2>"$WORK/err" || fail "git ls-remote before revoke"
+expect_eq "revoke token" 204 "$(admin -X POST "$BASE/v1/tokens/$REV_JTI/revoke")"
+expect_eq "revoked token rejected on API" 401 "$(status -H "authorization: Bearer $REV_TOK" "$CB/branches")"
+if git ls-remote "$(url "$REV_TOK" acme/other)" >/dev/null 2>&1; then fail "revoked token still worked for git"; fi
+pass "revoked token rejected on git smart HTTP"
+expect_eq "lock branch requires admin key" 403 "$(status -H "authorization: Bearer $FULL_OTHER" -X PUT "$CB/branches/path/test/lock" -d '{"reason":"freeze"}')"
+expect_eq "lock branch" 200 "$(admin -X PUT "$CB/branches/path/test/lock" -d '{"reason":"release freeze"}')"
+LOCK_HEAD="$(head_of path/test)"
+expect_eq "locked branch blocks API commit" 423 "$(admin -X POST "$CB/commits" -d "$(commit_body path/test "\"$LOCK_HEAD\"" blocked '[{"path":"docs/x.md","content":"x"}]')")"
+expect_eq "locked branch blocks API delete" 423 "$(admin -X DELETE "$CB/branches/path/test")"
+# Real git push to locked branch is rejected (R5.2)
+LOCK_CLONE="$WORK/lock-clone"
+git clone -q "$(url "$FULL_OTHER" acme/other)" "$LOCK_CLONE" 2>"$WORK/err" || fail "clone for lock test"
+git -C "$LOCK_CLONE" checkout -q -B path/test origin/path/test
+echo locked >>"$LOCK_CLONE/docs/guide.md"
+git -C "$LOCK_CLONE" add -A
+git "${GIT_ID[@]}" -C "$LOCK_CLONE" commit -qm "try locked push"
+if git -C "$LOCK_CLONE" push -q origin path/test 2>"$WORK/lock.err"; then fail "git push succeeded on locked branch"; fi
+grep -q "branch is locked" "$WORK/lock.err" || fail "missing lock message: $(cat "$WORK/lock.err")"
+pass "git push rejected on locked branch"
+expect_eq "unlock branch" 204 "$(admin -X DELETE "$CB/branches/path/test/lock")"
+expect_eq "unlock again is 404" 404 "$(admin -X DELETE "$CB/branches/path/test/lock")"
+git -C "$LOCK_CLONE" push -q origin path/test 2>"$WORK/err" || fail "git push after unlock: $(cat "$WORK/err")"
+pass "git push succeeds after unlock"
+expect_eq "lock events logged" "1 1" "$(count_events kind=branch_locked repo=acme/other) $(count_events kind=branch_unlocked repo=acme/other)"
+
 echo "== SDKs (TypeScript and Python)"
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 if GITD_URL="$BASE" GITD_KEY="$KEY" python3 -m unittest discover -s "$ROOT_DIR/sdk/python" -p "test_*.py" >"$WORK/py-sdk.out" 2>&1; then

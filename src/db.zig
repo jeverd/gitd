@@ -93,6 +93,18 @@ const schema =
     \\  key_hash TEXT NOT NULL UNIQUE,
     \\  created_at INTEGER NOT NULL
     \\) STRICT;
+    \\CREATE TABLE IF NOT EXISTS revoked_tokens (
+    \\  jti TEXT PRIMARY KEY,
+    \\  expires_at INTEGER NOT NULL
+    \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS revoked_tokens_exp ON revoked_tokens (expires_at);
+    \\CREATE TABLE IF NOT EXISTS branch_locks (
+    \\  repo TEXT NOT NULL,
+    \\  ref TEXT NOT NULL,
+    \\  reason TEXT NOT NULL DEFAULT '',
+    \\  locked_at INTEGER NOT NULL,
+    \\  PRIMARY KEY (repo, ref)
+    \\) STRICT;
 ;
 
 pub const Db = struct {
@@ -558,6 +570,77 @@ pub const Db = struct {
         try db.bindText(stmt, 1, repo);
         try db.bindText(stmt, 2, ref);
         if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("clear branch ttl");
+    }
+
+    pub fn revokeToken(db: *Db, io: Io, jti: []const u8, expires_at: i64) Error!void {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare("INSERT OR REPLACE INTO revoked_tokens (jti, expires_at) VALUES (?1, ?2)");
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, jti);
+        try db.check(sqlite3_bind_int64(stmt, 2, expires_at));
+        if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("revoke token");
+    }
+
+    pub fn isTokenRevoked(db: *Db, io: Io, jti: []const u8) Error!bool {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare("SELECT 1 FROM revoked_tokens WHERE jti = ?1");
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, jti);
+        return switch (sqlite3_step(stmt)) {
+            SQLITE_ROW => true,
+            SQLITE_DONE => false,
+            else => db.fail("check revoked token"),
+        };
+    }
+
+    pub fn pruneRevokedTokens(db: *Db, io: Io, now: i64) Error!void {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare("DELETE FROM revoked_tokens WHERE expires_at <= ?1");
+        defer _ = sqlite3_finalize(stmt);
+        try db.check(sqlite3_bind_int64(stmt, 1, now));
+        if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("prune revoked tokens");
+    }
+
+    pub fn lockBranch(db: *Db, io: Io, repo: []const u8, ref: []const u8, reason: []const u8, locked_at: i64) Error!void {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare("INSERT OR REPLACE INTO branch_locks (repo, ref, reason, locked_at) VALUES (?1, ?2, ?3, ?4)");
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        try db.bindText(stmt, 2, ref);
+        try db.bindText(stmt, 3, reason);
+        try db.check(sqlite3_bind_int64(stmt, 4, locked_at));
+        if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("lock branch");
+    }
+
+    /// Removes a branch lock (or every lock in `repo` when `ref` is empty).
+    /// Returns true if any lock was removed.
+    pub fn unlockBranch(db: *Db, io: Io, repo: []const u8, ref: []const u8) Error!bool {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare("DELETE FROM branch_locks WHERE repo = ?1 AND (?2 = '' OR ref = ?2)");
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        try db.bindText(stmt, 2, ref);
+        if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("unlock branch");
+        return sqlite3_changes(db.handle) > 0;
+    }
+
+    pub fn isBranchLocked(db: *Db, io: Io, repo: []const u8, ref: []const u8) Error!bool {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare("SELECT 1 FROM branch_locks WHERE repo = ?1 AND ref = ?2");
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        try db.bindText(stmt, 2, ref);
+        return switch (sqlite3_step(stmt)) {
+            SQLITE_ROW => true,
+            SQLITE_DONE => false,
+            else => db.fail("check branch lock"),
+        };
     }
 
     pub const BranchTtl = struct {

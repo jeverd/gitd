@@ -23,6 +23,7 @@ export interface TokenOptions {
 
 export interface TokenResponse {
   token: string;
+  jti: string;
   expires_at: number;
 }
 
@@ -292,6 +293,10 @@ export class GitdClient {
     return this.#json("POST", "/v1/tokens", opts);
   }
 
+  async revokeToken(jti: string): Promise<void> {
+    await this.#request("POST", `/v1/tokens/${encodeURIComponent(jti)}/revoke`);
+  }
+
   // ---- Branches ----
 
   async listBranches(repo: string): Promise<Branch[]> {
@@ -309,6 +314,14 @@ export class GitdClient {
   async deleteBranch(repo: string, name: string, expected?: string): Promise<void> {
     const q = expected ? `?expected=${encodeURIComponent(expected)}` : "";
     await this.#request("DELETE", `/v1/repos/${repo}/branches/${encodePath(name)}${q}`);
+  }
+
+  lockBranch(repo: string, name: string, reason = ""): Promise<{ branch: string; locked: boolean; reason: string }> {
+    return this.#json("PUT", `/v1/repos/${repo}/branches/${encodePath(name)}/lock`, { reason });
+  }
+
+  async unlockBranch(repo: string, name: string): Promise<void> {
+    await this.#request("DELETE", `/v1/repos/${repo}/branches/${encodePath(name)}/lock`);
   }
 
   // ---- Files, Trees, History ----

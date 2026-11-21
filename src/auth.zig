@@ -62,12 +62,23 @@ pub const Scopes = packed struct(u8) {
 
 pub const repo_id_len = 32;
 pub const RepoId = [repo_id_len]u8;
+pub const jti_len = 32;
+pub const Jti = [jti_len]u8;
 
 /// A new random repo id: 32 lowercase hex characters.
 pub fn newRepoId(io: std.Io) std.Io.RandomSecureError!RepoId {
     var bytes: [repo_id_len / 2]u8 = undefined;
     try io.randomSecure(&bytes);
     return std.fmt.bytesToHex(bytes, .lower);
+}
+
+/// A new random token id (jti): 32 lowercase hex characters.
+pub fn newJti(io: std.Io) std.Io.RandomSecureError!Jti {
+    return newRepoId(io);
+}
+
+pub fn isJti(text: []const u8) bool {
+    return isRepoId(text);
 }
 
 fn isRepoId(text: []const u8) bool {
@@ -95,6 +106,8 @@ pub const Claims = struct {
     paths_buf: [max_path_patterns_bytes]u8 = undefined,
     paths_ends: [max_path_patterns]u16 = undefined,
     paths_count: usize = 0,
+    /// Unique token id for instant revocation. Null for legacy tokens without jti.
+    jti: ?Jti = null,
     /// Seconds a branch created by a push with this token lives before
     /// gitd deletes it. Zero means such branches do not expire.
     branch_ttl: u32 = 0,
@@ -209,6 +222,7 @@ const Payload = struct {
     refs: []const []const u8 = &.{},
     rrefs: []const []const u8 = &.{},
     paths: []const []const u8 = &.{},
+    jti: []const u8 = "",
     bttl: u32 = 0,
 };
 
@@ -241,6 +255,7 @@ pub fn mint(secret: *const Secret, claims: *const Claims, out: *[max_token_len]u
         .refs = refs[0..claims.refs_count],
         .rrefs = rrefs[0..claims.read_refs_count],
         .paths = paths[0..claims.paths_count],
+        .jti = if (claims.jti) |*j| j else "",
         .bttl = claims.branch_ttl,
     };
 
@@ -300,6 +315,10 @@ pub fn verify(secret: *const Secret, token: []const u8, now: i64) VerifyError!Cl
     for (payload.refs) |pattern| claims.addRefPattern(pattern) catch return error.InvalidToken;
     for (payload.rrefs) |pattern| claims.addReadRefPattern(pattern) catch return error.InvalidToken;
     for (payload.paths) |pattern| claims.addPathPattern(pattern) catch return error.InvalidToken;
+    if (payload.jti.len > 0) {
+        if (!isJti(payload.jti)) return error.InvalidToken;
+        claims.jti = payload.jti[0..jti_len].*;
+    }
     claims.branch_ttl = payload.bttl;
     if (now >= claims.expires_at) return error.ExpiredToken;
     return claims;
