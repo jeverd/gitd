@@ -365,3 +365,24 @@ class GitdClient:
     def list_webhook_deliveries(self, repo: str, *, limit: int | None = None) -> list[dict[str, Any]]:
         q = f"?limit={limit}" if limit is not None else ""
         return self._json("GET", f"/v1/repos/{repo}/webhooks/deliveries{q}")["deliveries"]
+
+    # ---- Quotas, Stats & Maintenance ----
+
+    def get_quotas(self, repo: str) -> dict[str, Any]:
+        return self._json("GET", f"/v1/repos/{repo}/quotas")
+
+    def set_quotas(
+        self, repo: str, *, max_branches: int = 0, max_repo_bytes: int = 0
+    ) -> dict[str, Any]:
+        return self._json(
+            "PUT",
+            f"/v1/repos/{repo}/quotas",
+            {"max_branches": max_branches, "max_repo_bytes": max_repo_bytes},
+        )
+
+    def get_stats(self, repo: str) -> dict[str, Any]:
+        return self._json("GET", f"/v1/repos/{repo}/stats")
+
+    def gc(self, repo: str, *, prune_seconds: int | None = None) -> dict[str, Any]:
+        body = {"prune_seconds": prune_seconds} if prune_seconds is not None else None
+        return self._json("POST", f"/v1/repos/{repo}/gc", body)

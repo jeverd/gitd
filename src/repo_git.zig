@@ -615,7 +615,53 @@ pub const Repo = struct {
         }
         return r.gitOutput(&.{ "archive", format.formatFlag(), commit }, .{ .max_output = max });
     }
+
+    pub const ObjectStats = struct {
+        objects_loose: u64 = 0,
+        size_loose_kb: u64 = 0,
+        objects_packed: u64 = 0,
+        size_pack_kb: u64 = 0,
+    };
+
+    pub fn countObjects(r: *const Repo) git_cmd.Error!ObjectStats {
+        const raw = try r.gitOutput(&.{ "count-objects", "-v" }, .{});
+        defer r.gpa.free(raw);
+        return parseCountObjects(raw);
+    }
+
+    /// Runs `git gc --quiet` with the configured prune grace period
+    /// (0 = prune immediately). Inherits hooks-off and no-detach from gitEnv (R2.4, R3.4).
+    pub fn gc(r: *const Repo, prune_seconds: u32) git_cmd.Error!void {
+        var arg_buf: [40]u8 = undefined;
+        const prune_arg = if (prune_seconds == 0)
+            "--prune=now"
+        else
+            std.mem.print(&arg_buf, "--prune={d}.seconds.ago", .{prune_seconds}) catch unreachable;
+        r.gpa.free(try r.gitOutput(&.{ "gc", "--quiet", prune_arg }, .{ .timeout_ms = 120_000 }));
+    }
 };
+
+/// Parses `git count-objects -v` key/value output.
+pub fn parseCountObjects(raw: []const u8) Repo.ObjectStats {
+    var out: Repo.ObjectStats = .{};
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        const key = std.mem.trim(u8, line[0..colon], " \t\r");
+        const val_str = std.mem.trim(u8, line[colon + 1 ..], " \t\r");
+        const val = std.fmt.parseInt(u64, val_str, 10) catch continue;
+        if (std.mem.eql(u8, key, "count")) {
+            out.objects_loose = val;
+        } else if (std.mem.eql(u8, key, "size")) {
+            out.size_loose_kb = val;
+        } else if (std.mem.eql(u8, key, "in-pack")) {
+            out.objects_packed = val;
+        } else if (std.mem.eql(u8, key, "size-pack")) {
+            out.size_pack_kb = val;
+        }
+    }
+    return out;
+}
 
 /// Parses `git grep -n -z` output (`<commit>:<path>\0<line>\0<text>\n`).
 /// Takes ownership of `raw` and frees it on error.
@@ -678,4 +724,37 @@ fn fuzzParseGrep(_: void, smith: *std.testing.Smith) anyerror!void {
     const res = try parseGrepMatches(gpa, raw, "abcd", 16);
     defer res.deinit(gpa);
     try std.testing.expect(res.items.len <= 16);
+}
+
+test "parseCountObjects extracts loose and packed stats" {
+    const sample =
+        \\count: 14
+        \\size: 56
+        \\in-pack: 420
+        \\packs: 1
+        \\size-pack: 1280
+        \\prune-packable: 0
+        \\garbage: 0
+        \\
+    ;
+    const stats = parseCountObjects(sample);
+    try std.testing.expectEqual(@as(u64, 14), stats.objects_loose);
+    try std.testing.expectEqual(@as(u64, 56), stats.size_loose_kb);
+    try std.testing.expectEqual(@as(u64, 420), stats.objects_packed);
+    try std.testing.expectEqual(@as(u64, 1280), stats.size_pack_kb);
+}
+
+test "fuzz parse count-objects" {
+    try std.testing.fuzz({}, fuzzParseCountObjects, .{
+        .corpus = &.{
+            "count: 1\nsize: 4\nin-pack: 10\nsize-pack: 8\n",
+            "garbage line without colon\ncount: notanumber\n",
+        },
+    });
+}
+
+fn fuzzParseCountObjects(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [512]u8 = undefined;
+    const input = buf[0..smith.slice(&buf)];
+    _ = parseCountObjects(input);
 }

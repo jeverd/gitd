@@ -204,6 +204,14 @@ test("TypeScript SDK end-to-end", async () => {
     assert.equal(fetched.direction, "fetch");
     assert.equal(fetched.new_sha, merged.sha);
 
+    // Quotas, stats & GC
+    const quotas = await admin.setQuotas(repoName, { max_branches: 10, max_repo_bytes: 5_000_000 });
+    assert.equal(quotas.effective_max_branches, 10);
+    const stats = await admin.getStats(repoName);
+    assert.ok(stats.branches >= 1 && stats.disk_bytes > 0);
+    const gcRes = await admin.gc(repoName, { prune_seconds: 0 });
+    assert.ok(gcRes.after_bytes > 0);
+
     await admin.deleteRepo(mirrorName);
     await admin.deleteRepo(repoName);
   } finally {

@@ -126,11 +126,37 @@ pub const Store = struct {
     }
 
     pub const DeleteError = error{ NameTooLong, StorageError } || Io.Cancelable;
+    pub const UsageError = DeleteError || std.mem.Allocator.Error;
 
     pub fn delete(s: *const Store, io: Io, name: repo_name.Name) DeleteError!void {
         var buf: [max_path_len]u8 = undefined;
         const path = try s.repoPath(&buf, name);
         Io.Dir.cwd().deleteTree(io, path) catch |err| return storageError("deleting", path, err);
+    }
+
+    /// Sums regular file sizes under `<root>/<ns>/<repo>.git` (R1.2, R3.4).
+    /// Concurrent deletions of loose/temp files are skipped cleanly.
+    pub fn repoDiskUsage(s: *const Store, io: Io, gpa: std.mem.Allocator, name: repo_name.Name) UsageError!u64 {
+        var buf: [max_path_len]u8 = undefined;
+        const path = try s.repoPath(&buf, name);
+        var dir = Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| return storageError("opening", path, err);
+        defer dir.close(io);
+        var walker = try dir.walk(gpa);
+        defer walker.deinit();
+        var total: u64 = 0;
+        var entries: usize = 0;
+        const max_entries = 200_000;
+        while (walker.next(io) catch |err| return storageError("walking", path, err)) |entry| {
+            entries += 1;
+            if (entries > max_entries) break;
+            if (entry.kind != .file) continue;
+            const st = entry.dir.statFile(io, entry.basename, .{}) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return storageError("sizing", entry.path, err),
+            };
+            total +|= st.size;
+        }
+        return total;
     }
 };
 
@@ -202,4 +228,19 @@ test "repoPath joins root and name" {
     var buf: [Store.max_path_len]u8 = undefined;
     const name = try repo_name.parse("acme/web");
     try std.testing.expectEqualStrings("/data/repos/acme/web.git", try s.repoPath(&buf, name));
+}
+
+test "repoDiskUsage sums regular files in bare repo dir" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "acme/web.git/objects");
+    try tmp.dir.writeFile(io, .{ .sub_path = "acme/web.git/HEAD", .data = "1234567" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "acme/web.git/objects/pack.idx", .data = "0123456789" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const s: Store = .{ .root = root, .tmp = root, .path_env = "" };
+    const name = try repo_name.parse("acme/web");
+    try std.testing.expectEqual(@as(u64, 17), try s.repoDiskUsage(io, gpa, name));
 }

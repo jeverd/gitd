@@ -21,6 +21,11 @@ const usage =
     \\  env GITD_HEAD_TIMEOUT_SECONDS: time allowed to send a request head (default 10)
     \\  env GITD_WEBHOOK_BACKOFF_MS: webhook retry backoff unit (default 1000)
     \\  env GITD_WEBHOOK_TIMEOUT_MS: webhook delivery timeout (default 10000)
+    \\  env GITD_DEFAULT_MAX_BRANCHES: default per-repo branch quota, 0 = unlimited
+    \\  env GITD_DEFAULT_MAX_REPO_BYTES: default per-repo byte quota, 0 = unlimited
+    \\  env GITD_GC_INTERVAL_SECONDS: background GC check interval, 0 = off (default 300)
+    \\  env GITD_GC_PRUNE_SECONDS: unreferenced object grace period (default 300)
+    \\  env GITD_GC_EXPIRED_THRESHOLD: expired branches before auto GC (default 20)
     \\
 ;
 
@@ -101,6 +106,19 @@ fn msFromEnv(init: std.process.Init, name: []const u8, default: i64) ?i64 {
     return ms;
 }
 
+fn boundedU64FromEnv(init: std.process.Init, name: []const u8, default: u64, max: u64) ?u64 {
+    const text = init.environ_map.get(name) orelse return default;
+    const val = std.fmt.parseInt(u64, text, 10) catch {
+        std.log.err("{s} must be between 0 and {d}", .{ name, max });
+        return null;
+    };
+    if (val > max) {
+        std.log.err("{s} must be between 0 and {d}", .{ name, max });
+        return null;
+    }
+    return val;
+}
+
 fn createKey(init: std.process.Init, opts: Options) !u8 {
     const io = init.io;
     const data = try store.DataDir.prepare(io, init.arena.allocator(), opts.data_dir);
@@ -177,6 +195,11 @@ fn serve(init: std.process.Init, opts: Options) !u8 {
     const head_timeout = secondsFromEnv(init, "GITD_HEAD_TIMEOUT_SECONDS", server.default_head_timeout_seconds) orelse return 2;
     const backoff_ms = msFromEnv(init, "GITD_WEBHOOK_BACKOFF_MS", 1000) orelse return 2;
     const hook_timeout_ms = msFromEnv(init, "GITD_WEBHOOK_TIMEOUT_MS", 10_000) orelse return 2;
+    const default_max_branches = boundedU64FromEnv(init, "GITD_DEFAULT_MAX_BRANCHES", 0, 1_000_000) orelse return 2;
+    const default_max_repo_bytes = boundedU64FromEnv(init, "GITD_DEFAULT_MAX_REPO_BYTES", 0, 1024 * 1024 * 1024 * 1024) orelse return 2;
+    const gc_interval_seconds: u32 = @intCast(boundedU64FromEnv(init, "GITD_GC_INTERVAL_SECONDS", 300, 86_400) orelse return 2);
+    const gc_prune_seconds: u32 = @intCast(boundedU64FromEnv(init, "GITD_GC_PRUNE_SECONDS", 300, 604_800) orelse return 2);
+    const gc_expired_threshold: u32 = @intCast(boundedU64FromEnv(init, "GITD_GC_EXPIRED_THRESHOLD", 20, 100_000) orelse return 2);
 
     const data = try store.DataDir.prepare(io, arena, opts.data_dir);
     try data.clearTmp(io);
@@ -200,6 +223,11 @@ fn serve(init: std.process.Init, opts: Options) !u8 {
         .ui_enabled = opts.ui,
         .webhook_backoff_ms = backoff_ms,
         .webhook_timeout_ms = hook_timeout_ms,
+        .default_max_branches = default_max_branches,
+        .default_max_repo_bytes = default_max_repo_bytes,
+        .gc_interval_seconds = gc_interval_seconds,
+        .gc_prune_seconds = gc_prune_seconds,
+        .gc_expired_threshold = gc_expired_threshold,
     };
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
@@ -213,6 +241,7 @@ fn serve(init: std.process.Init, opts: Options) !u8 {
         std.log.err("sigwait failed", .{});
     }
     std.log.info("stopping (signal {d})", .{signal});
+    defer app.maint.deinit(init.gpa);
     defer app.peers.deinit(init.gpa);
     // The loop only ends by cancellation, so its result is always
     // error.Canceled and carries nothing to report.
@@ -244,4 +273,5 @@ test {
     _ = @import("sync.zig");
     _ = @import("rules.zig");
     _ = @import("merge_check.zig");
+    _ = @import("maintenance.zig");
 }

@@ -85,6 +85,7 @@ fn reapOne(app: *server.App, ttl: Db.BranchTtl, now: i64) Io.Cancelable!void {
         // A push moved it in between: keep the expiry and try next round.
         if (outcome == .stale) return;
         events.record(app, .{ .repo = ttl.repo, .kind = "branch_expired", .ref = ttl.ref, .old = oid, .detail = "lifetime ended", .created_at = now });
+        app.db.recordBranchExpired(io, ttl.repo) catch |err| std.log.err("recording expired count of {s}: {t}", .{ ttl.repo, err });
     }
     forget(app, ttl);
 }

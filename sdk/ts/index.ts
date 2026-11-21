@@ -11,6 +11,33 @@ export interface Repo {
   created_at: number;
 }
 
+export interface RepoQuotas {
+  max_branches: number;
+  max_repo_bytes: number;
+  effective_max_branches: number;
+  effective_max_repo_bytes: number;
+  updated_at: number | null;
+}
+
+export interface RepoStats {
+  branches: number;
+  disk_bytes: number;
+  objects_loose: number;
+  size_loose_kb: number;
+  objects_packed: number;
+  size_pack_kb: number;
+  last_gc_at: number | null;
+  expired_since_gc: number;
+  quotas: { max_branches: number; max_repo_bytes: number };
+}
+
+export interface GcResult {
+  before_bytes: number;
+  after_bytes: number;
+  reclaimed_bytes: number;
+  duration_ms: number;
+}
+
 export interface TokenOptions {
   repo: string;
   scopes: Scope[];
@@ -533,5 +560,26 @@ export class GitdClient {
     const q = limit !== undefined ? `?limit=${limit}` : "";
     const res = await this.#json<{ deliveries: unknown[] }>("GET", `/v1/repos/${repo}/webhooks/deliveries${q}`);
     return res.deliveries;
+  }
+
+  // ---- Quotas, Stats & Maintenance ----
+
+  getQuotas(repo: string): Promise<RepoQuotas> {
+    return this.#json("GET", `/v1/repos/${repo}/quotas`);
+  }
+
+  setQuotas(repo: string, opts: { max_branches?: number; max_repo_bytes?: number }): Promise<RepoQuotas> {
+    return this.#json("PUT", `/v1/repos/${repo}/quotas`, {
+      max_branches: opts.max_branches ?? 0,
+      max_repo_bytes: opts.max_repo_bytes ?? 0,
+    });
+  }
+
+  getStats(repo: string): Promise<RepoStats> {
+    return this.#json("GET", `/v1/repos/${repo}/stats`);
+  }
+
+  gc(repo: string, opts: { prune_seconds?: number } = {}): Promise<GcResult> {
+    return this.#json("POST", `/v1/repos/${repo}/gc`, opts.prune_seconds !== undefined ? opts : undefined);
   }
 }

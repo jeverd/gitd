@@ -141,6 +141,9 @@ pub fn serve(
         return rules.serveApi(app, request, name, rest, access);
     }
     const repo = repo_git.Repo.open(app.io, app.gpa, app.store, name) catch return api.internal(request);
+    if (std.mem.eql(u8, rest, "quotas") or std.mem.eql(u8, rest, "stats") or std.mem.eql(u8, rest, "gc")) {
+        return @import("maintenance.zig").serveApi(app, request, &repo, name, rest, access);
+    }
 
     if (method == .GET) {
         if (!access.canRead()) return api.respondError(request, .forbidden, "forbidden", "this token lacks git:read");
@@ -676,6 +679,7 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const changes = arena.alloc(repo_git.Repo.Change, body.changes.len) catch return api.internal(request);
+    var incoming_bytes: u64 = 0;
     for (body.changes, changes) |c, *out| {
         repo_path.validate(c.path) catch return api.respondError(request, .bad_request, "invalid_path", "a change has an invalid path");
         if (!access.canAccessPath(c.path)) return api.respondError(request, .forbidden, "forbidden", "this token may not modify that path");
@@ -688,7 +692,23 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
             dec.decode(buf, b64) catch return api.respondError(request, .bad_request, "invalid_changes", "content_base64 is not valid base64");
             break :blk buf;
         } else null;
+        if (data) |d| incoming_bytes +|= d.len;
         out.* = .{ .path = c.path, .content = data };
+    }
+
+    const maint = @import("maintenance.zig");
+    if (body.expected_head == null) {
+        const bq = maint.checkBranchQuota(app, repo, name, 1, ref) catch |err| return gitError(request, err);
+        if (bq == .exceeded) {
+            return api.respondError(request, .too_many_requests, "quota_exceeded", "branch quota exceeded for this repo");
+        }
+    }
+    const dq = maint.checkDiskQuota(app, name, incoming_bytes, ref) catch |err| return switch (err) {
+        error.Canceled => error.Canceled,
+        else => api.internal(request),
+    };
+    if (dq == .exceeded) {
+        return api.respondError(request, .payload_too_large, "quota_exceeded", "disk quota exceeded for this repo");
     }
 
     var parent_buf: [64]u8 = undefined;
@@ -754,6 +774,10 @@ fn createBranch(app: *server.App, request: *http.Server.Request, repo: *const re
         return api.respondError(request, .bad_request, "invalid_branch", "name must be a valid branch name like agent/3/try-2");
     if (!access.canWrite(ref)) return forbiddenRef(request, ref);
     if (try checkWriteGate(app, request, name, ref, .direct_write)) |status| return status;
+    const bq = @import("maintenance.zig").checkBranchQuota(app, repo, name, 1, ref) catch |err| return gitError(request, err);
+    if (bq == .exceeded) {
+        return api.respondError(request, .too_many_requests, "quota_exceeded", "branch quota exceeded for this repo");
+    }
     if (ttlInvalid(parsed.value.ttl_seconds)) return api.respondError(request, .bad_request, "invalid_ttl", "ttl_seconds must be 1-604800");
     var full: [ref_name.max_len]u8 = undefined;
     const rev = revFromName(parsed.value.from, &full) orelse return api.respondError(request, .bad_request, "invalid_ref", "from must be a branch name, a full ref, or a commit oid");

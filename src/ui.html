@@ -169,6 +169,8 @@ function describe(e) {
     case "rule_created": return ["rule created", `${e.repo} ${ref} (${e.detail})`.trim()];
     case "rule_deleted": return ["rule deleted", `${e.repo} ${e.detail}`.trim()];
     case "rule_rejected": return ["rule REJECTED", `${e.repo} ${ref}: ${e.detail}`];
+    case "quota_exceeded": return ["quota EXCEEDED", `${e.repo} ${ref}: ${e.detail}`.trim()];
+    case "gc_completed": return ["gc completed", `${e.repo} (${e.detail})`.trim()];
     default: return [e.kind.replace(/_/g, " "), `${e.repo} ${ref} ${e.detail}`.trim()];
   }
 }
