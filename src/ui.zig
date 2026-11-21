@@ -68,7 +68,8 @@ fn state(app: *server.App, request: *http.Server.Request) api.HandleError!http.S
             else => repo_git.Repo.Branches{ .raw = &.{}, .items = &.{} },
         };
         const ttls = app.db.listBranchTtls(app.io, arena, repo.name, 0, 10_000) catch return api.internal(request);
-        const items = content.branchesWithExpiry(arena, branches, ttls) catch return api.internal(request);
+        const locks = app.db.listBranchLocks(app.io, arena, repo.name) catch return api.internal(request);
+        const items = content.branchesWithMeta(arena, branches, ttls, locks) catch return api.internal(request);
         item.* = .{ .name = repo.name, .branches = items };
     }
     return api.respondJson(app.gpa, request, .ok, .{ .now = api.unixNow(app.io), .repos = out });

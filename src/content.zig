@@ -38,6 +38,7 @@ const receive_pack = @import("receive_pack.zig");
 const events = @import("events.zig");
 const http_util = @import("http_util.zig");
 const expiry = @import("expiry.zig");
+const rules = @import("rules.zig");
 const Db = @import("db.zig").Db;
 
 const max_file_bytes = 10 * 1024 * 1024;
@@ -135,6 +136,9 @@ pub fn serve(
     }
     if (std.mem.eql(u8, rest, "sync")) {
         return @import("sync.zig").serveApi(app, request, name, access);
+    }
+    if (std.mem.eql(u8, rest, "rules") or std.mem.startsWith(u8, rest, "rules/")) {
+        return rules.serveApi(app, request, name, rest, access);
     }
     const repo = repo_git.Repo.open(app.io, app.gpa, app.store, name) catch return api.internal(request);
 
@@ -245,18 +249,47 @@ fn gitError(request: *http.Server.Request, err: anyerror) Error!http.Status {
 
 // ---- Reads ----
 
-pub const BranchJson = struct { name: []const u8, commit: []const u8, committed_at: i64, subject: []const u8, expires_at: ?i64 };
+pub const BranchJson = struct {
+    name: []const u8,
+    commit: []const u8,
+    committed_at: i64,
+    subject: []const u8,
+    expires_at: ?i64,
+    locked: bool = false,
+    lock_reason: ?[]const u8 = null,
+};
 
-/// Every branch in `repo` with its expiry, if any. Strings borrow
-/// `branches` and `ttls`; the caller frees the result.
-pub fn branchesWithExpiry(gpa: std.mem.Allocator, branches: repo_git.Repo.Branches, ttls: []const Db.BranchTtl) ![]BranchJson {
+/// Every branch in `repo` with its expiry and lock status, if any.
+/// Strings borrow `branches`, `ttls`, and `locks`; the caller frees the result.
+pub fn branchesWithMeta(
+    gpa: std.mem.Allocator,
+    branches: repo_git.Repo.Branches,
+    ttls: []const Db.BranchTtl,
+    locks: []const Db.BranchLock,
+) ![]BranchJson {
     const items = try gpa.alloc(BranchJson, branches.items.len);
     for (branches.items, items) |b, *i| {
         var expires_at: ?i64 = null;
         for (ttls) |t| {
             if (std.mem.startsWith(u8, t.ref, "refs/heads/") and std.mem.eql(u8, t.ref["refs/heads/".len..], b.name)) expires_at = t.expires_at;
         }
-        i.* = .{ .name = b.name, .commit = b.commit, .committed_at = b.committed_at, .subject = b.subject, .expires_at = expires_at };
+        var locked = false;
+        var lock_reason: ?[]const u8 = null;
+        for (locks) |l| {
+            if (std.mem.startsWith(u8, l.ref, "refs/heads/") and std.mem.eql(u8, l.ref["refs/heads/".len..], b.name)) {
+                locked = true;
+                lock_reason = l.reason;
+            }
+        }
+        i.* = .{
+            .name = b.name,
+            .commit = b.commit,
+            .committed_at = b.committed_at,
+            .subject = b.subject,
+            .expires_at = expires_at,
+            .locked = locked,
+            .lock_reason = lock_reason,
+        };
     }
     return items;
 }
@@ -266,7 +299,9 @@ fn listBranches(app: *server.App, request: *http.Server.Request, repo: *const re
     defer branches.deinit(app.gpa);
     const ttls = app.db.listBranchTtls(app.io, app.gpa, name.full, 0, 10_000) catch return api.internal(request);
     defer Db.freeBranchTtls(app.gpa, ttls);
-    const all = branchesWithExpiry(app.gpa, branches, ttls) catch return api.internal(request);
+    const locks = app.db.listBranchLocks(app.io, app.gpa, name.full) catch return api.internal(request);
+    defer Db.freeBranchLocks(app.gpa, locks);
+    const all = branchesWithMeta(app.gpa, branches, ttls, locks) catch return api.internal(request);
     defer app.gpa.free(all);
     if (!access.isReadRefRestricted()) {
         return api.respondJson(app.gpa, request, .ok, .{ .branches = all });
@@ -557,6 +592,44 @@ fn forbiddenRef(request: *http.Server.Request, ref: []const u8) Error!http.Statu
     return api.respondError(request, .forbidden, "forbidden", msg);
 }
 
+fn checkWriteGate(
+    app: *server.App,
+    request: *http.Server.Request,
+    name: repo_name.Name,
+    ref: []const u8,
+    op: enum { direct_write, delete },
+) Error!?http.Status {
+    const is_locked = app.db.isBranchLocked(app.io, name.full, ref) catch return try api.internal(request);
+    if (is_locked) return try api.respondError(request, .locked, "branch_locked", "this branch is locked");
+
+    const repo_rules = app.db.listBranchRules(app.io, app.gpa, name.full) catch return try api.internal(request);
+    defer Db.freeBranchRules(app.gpa, repo_rules);
+    const eff = rules.evaluate(repo_rules, ref);
+    switch (op) {
+        .direct_write => if (!eff.allow_direct_push) {
+            events.record(app, .{
+                .repo = name.full,
+                .kind = "rule_rejected",
+                .ref = ref,
+                .detail = "direct write blocked by branch rule",
+                .created_at = api.unixNow(app.io),
+            });
+            return try api.respondError(request, .forbidden, "rule_violation", "branch rule forbids direct commits or branch creation on this branch");
+        },
+        .delete => if (!eff.allow_delete) {
+            events.record(app, .{
+                .repo = name.full,
+                .kind = "rule_rejected",
+                .ref = ref,
+                .detail = "branch delete blocked by branch rule",
+                .created_at = api.unixNow(app.io),
+            });
+            return try api.respondError(request, .forbidden, "rule_violation", "branch rule forbids deleting this branch");
+        },
+    }
+    return null;
+}
+
 fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, name: repo_name.Name, access: Access) Error!http.Status {
     const ChangeJson = struct {
         path: []const u8,
@@ -586,9 +659,7 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
     const ref = ref_name.validateBranch(body.branch, &ref_buf) catch
         return api.respondError(request, .bad_request, "invalid_branch", "branch must be a valid branch name like agent/3/work");
     if (!access.canWrite(ref)) return forbiddenRef(request, ref);
-    if (app.db.isBranchLocked(app.io, name.full, ref) catch return api.internal(request)) {
-        return api.respondError(request, .locked, "branch_locked", "this branch is locked");
-    }
+    if (try checkWriteGate(app, request, name, ref, .direct_write)) |status| return status;
     if (body.message.len == 0 or body.message.len > max_message or std.mem.findScalar(u8, body.message, 0) != null) {
         return api.respondError(request, .bad_request, "invalid_message", "message must be 1-65536 bytes with no NUL");
     }
@@ -681,9 +752,7 @@ fn createBranch(app: *server.App, request: *http.Server.Request, repo: *const re
     const ref = ref_name.validateBranch(parsed.value.name, &ref_buf) catch
         return api.respondError(request, .bad_request, "invalid_branch", "name must be a valid branch name like agent/3/try-2");
     if (!access.canWrite(ref)) return forbiddenRef(request, ref);
-    if (app.db.isBranchLocked(app.io, name.full, ref) catch return api.internal(request)) {
-        return api.respondError(request, .locked, "branch_locked", "this branch is locked");
-    }
+    if (try checkWriteGate(app, request, name, ref, .direct_write)) |status| return status;
     if (ttlInvalid(parsed.value.ttl_seconds)) return api.respondError(request, .bad_request, "invalid_ttl", "ttl_seconds must be 1-604800");
     var full: [ref_name.max_len]u8 = undefined;
     const rev = revFromName(parsed.value.from, &full) orelse return api.respondError(request, .bad_request, "invalid_ref", "from must be a branch name, a full ref, or a commit oid");
@@ -704,9 +773,7 @@ fn deleteBranch(app: *server.App, request: *http.Server.Request, repo: *const re
     var ref_buf: [ref_name.max_len]u8 = undefined;
     const ref = ref_name.validateBranch(branch, &ref_buf) catch return api.respondError(request, .bad_request, "invalid_branch", "the branch name is not valid");
     if (!access.canWrite(ref)) return forbiddenRef(request, ref);
-    if (app.db.isBranchLocked(app.io, name.full, ref) catch return api.internal(request)) {
-        return api.respondError(request, .locked, "branch_locked", "this branch is locked");
-    }
+    if (try checkWriteGate(app, request, name, ref, .delete)) |status| return status;
     var exp_buf: [64]u8 = undefined;
     const expected: ?[]const u8 = if (std.mem.find(u8, query, "expected=") != null) blk: {
         const e = api.queryValue(&exp_buf, query, "expected") orelse "";
@@ -847,6 +914,18 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
     if (!access.canWrite(base_ref)) return forbiddenRef(request, base_ref);
     if (app.db.isBranchLocked(app.io, name.full, base_ref) catch return api.internal(request)) {
         return api.respondError(request, .locked, "branch_locked", "this branch is locked");
+    }
+    const repo_rules = app.db.listBranchRules(app.io, app.gpa, name.full) catch return api.internal(request);
+    defer Db.freeBranchRules(app.gpa, repo_rules);
+    if (!rules.mergeAllowed(rules.evaluate(repo_rules, base_ref), @tagName(body.strategy))) {
+        events.record(app, .{
+            .repo = name.full,
+            .kind = "rule_rejected",
+            .ref = base_ref,
+            .detail = "merge strategy blocked by branch rule",
+            .created_at = api.unixNow(app.io),
+        });
+        return api.respondError(request, .forbidden, "rule_violation", "branch rule forbids this merge strategy");
     }
     const author: repo_git.Repo.Author = if (body.author) |a| blk: {
         if (!validAuthorField(a.name) or !validAuthorField(a.email)) return api.respondError(request, .bad_request, "invalid_author", "author name and email must be 1-200 plain characters");
