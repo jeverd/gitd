@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.linkSystemLibrary("sqlite3", .{});
+    exe.root_module.linkSystemLibrary("git2", .{});
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
