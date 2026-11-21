@@ -273,7 +273,6 @@ test {
     _ = @import("db.zig");
     _ = @import("git_http.zig");
     _ = @import("store.zig");
-    _ = @import("git_proxy.zig");
     _ = @import("server.zig");
     _ = @import("timed_stream.zig");
     _ = @import("http_util.zig");

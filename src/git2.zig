@@ -19,6 +19,9 @@ pub const Blob = opaque {};
 pub const Object = opaque {};
 pub const Odb = opaque {};
 pub const Indexer = opaque {};
+pub const Packbuilder = opaque {};
+
+pub const PackbuilderForeachCb = *const fn (?*anyopaque, usize, ?*anyopaque) callconv(.c) c_int;
 
 pub const IndexerProgress = extern struct {
     total_objects: c_uint = 0,
@@ -295,8 +298,17 @@ pub extern fn git_signature_free(sig: *Signature) void;
 pub extern fn git_revwalk_new(out: *?*Revwalk, repo: *Repository) c_int;
 pub extern fn git_revwalk_sorting(walk: *Revwalk, sort_mode: c_uint) c_int;
 pub extern fn git_revwalk_push(walk: *Revwalk, id: *const Oid) c_int;
+pub extern fn git_revwalk_hide(walk: *Revwalk, id: *const Oid) c_int;
 pub extern fn git_revwalk_next(out: *Oid, walk: *Revwalk) c_int;
 pub extern fn git_revwalk_free(walk: *Revwalk) void;
+
+pub extern fn git_packbuilder_new(out: *?*Packbuilder, repo: *Repository) c_int;
+pub extern fn git_packbuilder_set_threads(pb: *Packbuilder, n: c_uint) c_uint;
+pub extern fn git_packbuilder_insert(pb: *Packbuilder, id: *const Oid, name: ?[*:0]const u8) c_int;
+pub extern fn git_packbuilder_insert_commit(pb: *Packbuilder, id: *const Oid) c_int;
+pub extern fn git_packbuilder_insert_walk(pb: *Packbuilder, walk: *Revwalk) c_int;
+pub extern fn git_packbuilder_foreach(pb: *Packbuilder, cb: PackbuilderForeachCb, payload: ?*anyopaque) c_int;
+pub extern fn git_packbuilder_free(pb: *Packbuilder) void;
 
 const InitState = enum(u8) { uninit = 0, initing = 1, ready = 2 };
 var init_state: std.atomic.Value(u8) = .init(@backingInt(InitState.uninit));

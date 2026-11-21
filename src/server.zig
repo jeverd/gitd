@@ -16,7 +16,6 @@ const http = std.http;
 const auth = @import("auth.zig");
 const repo_name = @import("repo_name.zig");
 const git_http = @import("git_http.zig");
-const git_proxy = @import("git_proxy.zig");
 const Db = @import("db.zig").Db;
 const Store = @import("store.zig").Store;
 const timed = @import("timed_stream.zig");
@@ -210,7 +209,7 @@ fn route(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress, targe
     }
 
     if (git_http.match(request.head.method, path, query)) |maybe_route| {
-        if (maybe_route) |git_route| return serveGit(app, request, git_route, query);
+        if (maybe_route) |git_route| return serveGit(app, request, git_route);
     } else |err| switch (err) {
         error.BadGitRequest => return respondError(request, .bad_request, "bad_git_request", "only the git smart HTTP protocol is served"),
         error.MethodNotAllowed => return respondError(request, .method_not_allowed, "method_not_allowed", "wrong method for this git endpoint"),
@@ -482,7 +481,7 @@ const RepoJson = struct {
 
 // ---- Git ----
 
-fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route, query: []const u8) HandleError!http.Status {
+fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route) HandleError!http.Status {
     var scratch: [auth.max_token_len + 256]u8 = undefined;
     const password = if (findHeader(request, "authorization")) |h| auth.basicPassword(h, &scratch) else null;
     const token = password orelse return respondGitAuth(request);
@@ -537,85 +536,11 @@ fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route,
         return receive_pack.serveRpc(app, request, repo_copy, &claims);
     }
 
-    // Copy what the CGI needs before the body is read. Oversize values are
-    // rejected rather than cut, so git never sees a changed header (R2.3).
-    var ct_buf: [128]u8 = undefined;
+    // Copy the Git-Protocol header before reading the request body (R3.5).
     var proto_buf: [128]u8 = undefined;
-    var query_buf: [64]u8 = undefined;
-    var path_buf: [repo_name.max_len + 64]u8 = undefined;
-    const too_long = "a git request header is too long";
-    const input: git_proxy.CgiInput = .{
-        .method = request.head.method,
-        .path_info = copyBounded(&path_buf, git_route.path_info) orelse
-            return respondError(request, .bad_request, "bad_git_request", too_long),
-        .query = copyBounded(&query_buf, query) orelse
-            return respondError(request, .bad_request, "bad_git_request", too_long),
-        .content_type = copyBounded(&ct_buf, request.head.content_type orelse "") orelse
-            return respondError(request, .bad_request, "bad_git_request", too_long),
-        .content_encoding = switch (request.head.transfer_compression) {
-            .identity => "",
-            .gzip => "gzip",
-            else => return respondError(request, .unsupported_media_type, "unsupported_encoding", "only gzip request bodies are supported"),
-        },
-        .git_protocol = copyBounded(&proto_buf, findHeader(request, "git-protocol") orelse "") orelse
-            return respondError(request, .bad_request, "bad_git_request", too_long),
-    };
-
-    const body = git_proxy.spool(app.io, app.store, request) catch |err| return proxyError(request, err);
-    defer body.close(app.io);
-
-    // Enforce read_refs on git smart HTTP via transfer.hideRefs (R2.1).
-    var hide_buf: [auth.max_ref_patterns_bytes * 2 + 64]u8 = undefined;
-    var hide_pos: usize = 0;
-    var git_cfg_buf: [20][2][]const u8 = undefined;
-    var git_cfg_n: usize = 0;
-    if (claims.isReadRefRestricted()) {
-        git_cfg_buf[git_cfg_n] = .{ "uploadpack.allowAnySHA1InWant", "false" };
-        git_cfg_n += 1;
-        git_cfg_buf[git_cfg_n] = .{ "uploadpack.allowReachableSHA1InWant", "false" };
-        git_cfg_n += 1;
-        git_cfg_buf[git_cfg_n] = .{ "transfer.hideRefs", "refs/" };
-        git_cfg_n += 1;
-        if (!claims.allowsReadRef("refs/heads/main")) {
-            git_cfg_buf[git_cfg_n] = .{ "transfer.hideRefs", "HEAD" };
-            git_cfg_n += 1;
-        }
-        for (0..claims.read_refs_count) |i| {
-            const pat = claims.readRefPattern(i);
-            if (std.mem.endsWith(u8, pat, "/*")) {
-                const prefix = pat[0 .. pat.len - 1]; // keeps trailing '/'
-                const val = std.mem.print(hide_buf[hide_pos..], "!{s}", .{prefix}) catch return internal(request);
-                hide_pos += val.len;
-                git_cfg_buf[git_cfg_n] = .{ "transfer.hideRefs", val };
-                git_cfg_n += 1;
-            } else {
-                const allow = std.mem.print(hide_buf[hide_pos..], "!{s}", .{pat}) catch return internal(request);
-                hide_pos += allow.len;
-                git_cfg_buf[git_cfg_n] = .{ "transfer.hideRefs", allow };
-                git_cfg_n += 1;
-            }
-        }
-    }
-
-    var input_with_cfg = input;
-    input_with_cfg.git_config = git_cfg_buf[0..git_cfg_n];
-    // Git protocol v2 allows fetching hidden ref tips by raw SHA even with
-    // allowAnySHA1InWant=false; falling back to v0/v1 enforces strict
-    // rejection of unadvertised objects (R2.1).
-    if (claims.isReadRefRestricted()) input_with_cfg.git_protocol = "";
-
-    return git_proxy.serve(app.io, app.gpa, app.store, request, git_route, input_with_cfg, body, null) catch |err|
-        proxyError(request, err);
-}
-
-fn proxyError(request: *http.Server.Request, err: git_proxy.ProxyError) HandleError!http.Status {
-    return switch (err) {
-        error.Canceled => error.Canceled,
-        error.ResponseBroken => error.ResponseBroken,
-        error.ClientGone => error.ClientGone,
-        error.BodyTooLarge => respondError(request, .payload_too_large, "too_large", "request body is too large"),
-        error.ProxyFailed, error.OutOfMemory => respondError(request, .bad_gateway, "git_failed", "git could not handle the request"),
-    };
+    const git_proto = copyBounded(&proto_buf, findHeader(request, "git-protocol") orelse "") orelse
+        return respondError(request, .bad_request, "bad_git_request", "a git request header is too long");
+    return upload_pack.serveRpc(app, request, repo_copy, git_proto, &claims);
 }
 
 fn respondGitAuth(request: *http.Server.Request) HandleError!http.Status {

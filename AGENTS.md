@@ -35,8 +35,7 @@ scripts/verify-linux.sh  # unit tests and e2e on Linux in Docker; run it when to
 src/
   main.zig          entry point and CLI; wires modules together, no feature logic
   server.zig        HTTP server: connections, routing, admin auth, repo and token API
-  git_http.zig      git smart HTTP URL matching and CGI response parsing (pure)
-  git_proxy.zig     runs `git http-backend` for one request
+  git_http.zig      git smart HTTP URL matching (pure)
   auth.zig          admin keys, signed repo tokens, the signing secret
   repo_name.zig     repo name validation
   db.zig            SQLite metadata (hand-declared sqlite3 functions)
