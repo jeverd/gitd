@@ -28,7 +28,6 @@ const ui = @import("ui.zig");
 const content = @import("content.zig");
 const expiry = @import("expiry.zig");
 const webhooks = @import("webhooks.zig");
-const rules_mod = @import("rules.zig");
 const maintenance = @import("maintenance.zig");
 const http_util = @import("http_util.zig");
 const keepAlive = http_util.keepAlive;
@@ -525,6 +524,19 @@ fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route,
         return upload_pack.serveInfoRefs(app, request, git_route.repo, git_route.service, git_proto, &claims);
     }
 
+    // `git_route.repo` borrows the request target, which reading the body
+    // overwrites; copy it before reading any body (R3.5).
+    var name_buf: [repo_name.max_len]u8 = undefined;
+    const repo_copy = repo_name.parse(copyBounded(&name_buf, git_route.repo.full) orelse unreachable) catch unreachable; // already valid and in bounds
+
+    if (git_route.service == .receive_pack) {
+        if (request.head.transfer_compression != .identity) {
+            // gitd must read a push's commands to check and record them.
+            return respondError(request, .unsupported_media_type, "unsupported_encoding", "push bodies must not be compressed");
+        }
+        return receive_pack.serveRpc(app, request, repo_copy, &claims);
+    }
+
     // Copy what the CGI needs before the body is read. Oversize values are
     // rejected rather than cut, so git never sees a changed header (R2.3).
     var ct_buf: [128]u8 = undefined;
@@ -549,86 +561,14 @@ fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route,
             return respondError(request, .bad_request, "bad_git_request", too_long),
     };
 
-    // `git_route.repo` borrows the request target, which reading the body
-    // overwrites; events are recorded after that, so keep a copy.
-    var name_buf: [repo_name.max_len]u8 = undefined;
-    const repo_copy = repo_name.parse(copyBounded(&name_buf, git_route.repo.full) orelse unreachable) catch unreachable; // already valid and in bounds
-
-    if (git_route.service == .receive_pack and input.content_encoding.len > 0) {
-        // gitd must read a push's commands to check and record them.
-        return respondError(request, .unsupported_media_type, "unsupported_encoding", "push bodies must not be compressed");
-    }
-
-    var body: ?git_proxy.Body = null;
-    defer if (body) |b| b.close(app.io);
-    if (git_route.kind == .rpc) {
-        body = git_proxy.spool(app.io, app.store, request) catch |err| return proxyError(request, err);
-    }
-
-    // Read what a push will change before git runs (R2.2).
-    var push: ?Push = null;
-    defer if (push) |*p| p.deinit(app.gpa);
-    var deny_non_ff = false;
-    var deny_deletes = false;
-    if (git_route.service == .receive_pack and git_route.kind == .rpc) {
-        push = Push.read(app, body.?) catch |err| switch (err) {
-            error.InvalidPush, error.TooManyCommands => return respondError(request, .bad_request, "bad_git_request", "could not read the push commands"),
-            error.OutOfMemory => return internal(request),
-            else => |e| return proxyError(request, e),
-        };
-        if (!push.?.allowedBy(&claims)) return rejectPush(app, request, &push.?, &claims, repo_copy);
-        for (push.?.commands) |cmd| {
-            const locked = app.db.isBranchLocked(app.io, repo_copy.full, cmd.ref) catch return internal(request);
-            if (locked) return rejectLockedPush(app, request, &push.?, repo_copy);
-        }
-        const repo_rules = app.db.listBranchRules(app.io, app.gpa, repo_copy.full) catch return internal(request);
-        defer Db.freeBranchRules(app.gpa, repo_rules);
-        for (push.?.commands) |cmd| {
-            const eff = rules_mod.evaluate(repo_rules, cmd.ref);
-            if (cmd.isDelete() and !eff.allow_delete) return rejectRulePush(app, request, &push.?, repo_rules, repo_copy);
-            if (!cmd.isDelete() and !eff.allow_direct_push) return rejectRulePush(app, request, &push.?, repo_rules, repo_copy);
-            if (!cmd.isDelete() and !eff.allow_force_push) deny_non_ff = true;
-            if (!eff.allow_delete) deny_deletes = true;
-        }
-        var new_branches: u64 = 0;
-        for (push.?.commands) |cmd| {
-            if (cmd.isCreate() and std.mem.startsWith(u8, cmd.ref, "refs/heads/")) new_branches += 1;
-        }
-        if (new_branches > 0) {
-            const git_repo = repo_git.Repo.open(app.io, app.gpa, app.store, repo_copy) catch return internal(request);
-            const bq = maintenance.checkBranchQuota(app, &git_repo, repo_copy, new_branches, push.?.commands[0].ref) catch |err| return switch (err) {
-                error.Canceled => error.Canceled,
-                else => internal(request),
-            };
-            if (bq == .exceeded) {
-                return rejectQuotaPush(app, request, &push.?, .too_many_requests, "branch quota exceeded");
-            }
-        }
-        if (body.?.len > 0) {
-            const ref_hint = if (push.?.commands.len > 0) push.?.commands[0].ref else "";
-            const dq = maintenance.checkDiskQuota(app, repo_copy, body.?.len, ref_hint) catch |err| return switch (err) {
-                error.Canceled => error.Canceled,
-                else => internal(request),
-            };
-            if (dq == .exceeded) {
-                return rejectQuotaPush(app, request, &push.?, .payload_too_large, "disk quota exceeded");
-            }
-        }
-    }
+    const body = git_proxy.spool(app.io, app.store, request) catch |err| return proxyError(request, err);
+    defer body.close(app.io);
 
     // Enforce read_refs on git smart HTTP via transfer.hideRefs (R2.1).
     var hide_buf: [auth.max_ref_patterns_bytes * 2 + 64]u8 = undefined;
     var hide_pos: usize = 0;
     var git_cfg_buf: [20][2][]const u8 = undefined;
     var git_cfg_n: usize = 0;
-    if (deny_non_ff) {
-        git_cfg_buf[git_cfg_n] = .{ "receive.denyNonFastForwards", "true" };
-        git_cfg_n += 1;
-    }
-    if (deny_deletes) {
-        git_cfg_buf[git_cfg_n] = .{ "receive.denyDeletes", "true" };
-        git_cfg_n += 1;
-    }
     if (claims.isReadRefRestricted()) {
         git_cfg_buf[git_cfg_n] = .{ "uploadpack.allowAnySHA1InWant", "false" };
         git_cfg_n += 1;
@@ -664,9 +604,7 @@ fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route,
     // rejection of unadvertised objects (R2.1).
     if (claims.isReadRefRestricted()) input_with_cfg.git_protocol = "";
 
-    var recorder: Push.Recorder = .{ .app = app, .push = if (push) |*p| p else null, .repo = repo_copy, .repo_id = claims.repo_id, .branch_ttl = claims.branch_ttl };
-    const after: ?git_proxy.After = if (push != null) .{ .ctx = &recorder, .run = Push.Recorder.run } else null;
-    return git_proxy.serve(app.io, app.gpa, app.store, request, git_route, input_with_cfg, body, after) catch |err|
+    return git_proxy.serve(app.io, app.gpa, app.store, request, git_route, input_with_cfg, body, null) catch |err|
         proxyError(request, err);
 }
 
@@ -679,206 +617,6 @@ fn proxyError(request: *http.Server.Request, err: git_proxy.ProxyError) HandleEr
         error.ProxyFailed, error.OutOfMemory => respondError(request, .bad_gateway, "git_failed", "git could not handle the request"),
     };
 }
-
-/// Refuses a push that touches a ref outside the token's patterns (R2.2).
-/// git never runs, so nothing changes; the client gets git's normal report
-/// with a reason per ref, and each refused ref is logged.
-fn rejectPush(app: *App, request: *http.Server.Request, push: *const Push, claims: *const auth.Claims, name: repo_name.Name) HandleError!http.Status {
-    var allowed_buf: [auth.max_ref_patterns_bytes + 16]u8 = undefined;
-    var allowed: std.Io.Writer = .fixed(&allowed_buf);
-    for (0..claims.refs_count) |i| {
-        if (i > 0) allowed.writeAll(", ") catch {};
-        allowed.writeAll(claims.refPattern(i)) catch {};
-    }
-    var reason_buf: [auth.max_ref_patterns_bytes + 64]u8 = undefined;
-    const reason = std.mem.print(&reason_buf, "token may only push to {s}", .{allowed.buffered()}) catch "token may not push here";
-    const other = "push refused: another ref in it is not allowed";
-
-    var reasons: [receive_pack.max_commands][]const u8 = undefined;
-    const now = unixNow(app.io);
-    for (push.commands, 0..) |cmd, i| {
-        const ok = claims.allowsRef(cmd.ref);
-        reasons[i] = if (ok) other else reason;
-        if (!ok) events.record(app, .{ .repo = name.full, .kind = "push_rejected", .ref = cmd.ref, .old = cmd.old, .new = cmd.new, .detail = reason, .created_at = now });
-    }
-    // Rejection lines are the same in report-status and report-status-v2.
-    if (!receive_pack.hasCapability(push.caps, "report-status") and !receive_pack.hasCapability(push.caps, "report-status-v2")) {
-        return respondError(request, .forbidden, "forbidden", reason);
-    }
-    var out: std.Io.Writer.Allocating = .init(app.gpa);
-    defer out.deinit();
-    var msg_buf: [auth.max_ref_patterns_bytes + 96]u8 = undefined;
-    const message = std.mem.print(&msg_buf, "gitd: push rejected: {s}", .{reason}) catch "gitd: push rejected";
-    receive_pack.writeRejection(&out.writer, push.caps, push.commands, reasons[0..push.commands.len], message) catch return internal(request);
-    try request.respond(out.written(), .{
-        .keep_alive = keepAlive(request),
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = "application/x-git-receive-pack-result" },
-            .{ .name = "cache-control", .value = "no-cache" },
-        },
-    });
-    return .ok;
-}
-
-fn rejectLockedPush(app: *App, request: *http.Server.Request, push: *const Push, name: repo_name.Name) HandleError!http.Status {
-    const locked_reason = "branch is locked";
-    const other = "push refused: another ref in it is locked";
-    var reasons: [receive_pack.max_commands][]const u8 = undefined;
-    const now = unixNow(app.io);
-    for (push.commands, 0..) |cmd, i| {
-        const is_locked = app.db.isBranchLocked(app.io, name.full, cmd.ref) catch false;
-        reasons[i] = if (is_locked) locked_reason else other;
-        if (is_locked) events.record(app, .{ .repo = name.full, .kind = "push_rejected", .ref = cmd.ref, .old = cmd.old, .new = cmd.new, .detail = locked_reason, .created_at = now });
-    }
-    if (!receive_pack.hasCapability(push.caps, "report-status") and !receive_pack.hasCapability(push.caps, "report-status-v2")) {
-        return respondError(request, .locked, "branch_locked", "branch is locked");
-    }
-    var out: std.Io.Writer.Allocating = .init(app.gpa);
-    defer out.deinit();
-    receive_pack.writeRejection(&out.writer, push.caps, push.commands, reasons[0..push.commands.len], "gitd: push rejected: branch is locked") catch return internal(request);
-    try request.respond(out.written(), .{
-        .keep_alive = keepAlive(request),
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = "application/x-git-receive-pack-result" },
-            .{ .name = "cache-control", .value = "no-cache" },
-        },
-    });
-    return .ok;
-}
-
-fn rejectRulePush(app: *App, request: *http.Server.Request, push: *const Push, repo_rules: []const Db.BranchRule, name: repo_name.Name) HandleError!http.Status {
-    const no_delete = "branch rule forbids deleting this branch";
-    const no_direct = "branch rule forbids direct push to this branch";
-    const other = "push refused: another ref in it violates a branch rule";
-    var reasons: [receive_pack.max_commands][]const u8 = undefined;
-    const now = unixNow(app.io);
-    for (push.commands, 0..) |cmd, i| {
-        const eff = rules_mod.evaluate(repo_rules, cmd.ref);
-        const bad_delete = cmd.isDelete() and !eff.allow_delete;
-        const bad_direct = !cmd.isDelete() and !eff.allow_direct_push;
-        reasons[i] = if (bad_delete) no_delete else if (bad_direct) no_direct else other;
-        if (bad_delete or bad_direct) {
-            events.record(app, .{
-                .repo = name.full,
-                .kind = "push_rejected",
-                .ref = cmd.ref,
-                .old = cmd.old,
-                .new = cmd.new,
-                .detail = reasons[i],
-                .created_at = now,
-            });
-        }
-    }
-    if (!receive_pack.hasCapability(push.caps, "report-status") and !receive_pack.hasCapability(push.caps, "report-status-v2")) {
-        return respondError(request, .forbidden, "rule_violation", "branch rule rejected push");
-    }
-    var out: std.Io.Writer.Allocating = .init(app.gpa);
-    defer out.deinit();
-    receive_pack.writeRejection(&out.writer, push.caps, push.commands, reasons[0..push.commands.len], "gitd: push rejected: branch rule violation") catch return internal(request);
-    try request.respond(out.written(), .{
-        .keep_alive = keepAlive(request),
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = "application/x-git-receive-pack-result" },
-            .{ .name = "cache-control", .value = "no-cache" },
-        },
-    });
-    return .ok;
-}
-
-fn rejectQuotaPush(
-    app: *App,
-    request: *http.Server.Request,
-    push: *const Push,
-    http_status: http.Status,
-    reason: []const u8,
-) HandleError!http.Status {
-    if (!receive_pack.hasCapability(push.caps, "report-status") and !receive_pack.hasCapability(push.caps, "report-status-v2")) {
-        return respondError(request, http_status, "quota_exceeded", reason);
-    }
-    var reasons: [receive_pack.max_commands][]const u8 = undefined;
-    for (0..push.commands.len) |i| reasons[i] = reason;
-    var msg_buf: [128]u8 = undefined;
-    const banner = std.mem.print(&msg_buf, "gitd: push rejected: {s}", .{reason}) catch "gitd: quota exceeded";
-    var out: std.Io.Writer.Allocating = .init(app.gpa);
-    defer out.deinit();
-    receive_pack.writeRejection(&out.writer, push.caps, push.commands, reasons[0..push.commands.len], banner) catch return internal(request);
-    try request.respond(out.written(), .{
-        .keep_alive = keepAlive(request),
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = "application/x-git-receive-pack-result" },
-            .{ .name = "cache-control", .value = "no-cache" },
-        },
-    });
-    return .ok;
-}
-const Push = struct {
-    head: []u8,
-    commands_buf: *[receive_pack.max_commands]receive_pack.Command,
-    commands: []receive_pack.Command,
-    /// The client's capabilities, borrowing `head`.
-    caps: []const u8,
-
-    fn allowedBy(p: *const Push, claims: *const auth.Claims) bool {
-        for (p.commands) |cmd| if (!claims.allowsRef(cmd.ref)) return false;
-        return true;
-    }
-
-    fn read(app: *App, body: git_proxy.Body) (receive_pack.ParseError || git_proxy.ProxyError)!Push {
-        const buf = try app.gpa.alloc(u8, receive_pack.max_commands_bytes);
-        errdefer app.gpa.free(buf);
-        const head = try body.head(app.io, buf);
-        const commands_buf = try app.gpa.create([receive_pack.max_commands]receive_pack.Command);
-        errdefer app.gpa.destroy(commands_buf);
-        var caps: []const u8 = undefined;
-        const commands = try receive_pack.parse(head, commands_buf, &caps);
-        return .{ .head = buf, .commands_buf = commands_buf, .commands = commands, .caps = caps };
-    }
-
-    /// Runs `record` from inside the proxy, after git exits.
-    const Recorder = struct {
-        app: *App,
-        push: ?*Push,
-        repo: repo_name.Name,
-        repo_id: auth.RepoId,
-        branch_ttl: u32,
-
-        fn run(ctx: *anyopaque) void {
-            const self: *Recorder = @ptrCast(@alignCast(ctx));
-            if (self.push) |p| p.record(self.app, self.repo, &self.repo_id, self.branch_ttl);
-        }
-    };
-
-    fn deinit(p: *Push, gpa: std.mem.Allocator) void {
-        gpa.destroy(p.commands_buf);
-        gpa.free(p.head);
-    }
-
-    /// Records an event for each ref git actually moved. git can refuse
-    /// some or all commands (a stale old value, fsck), so each ref is
-    /// checked rather than trusting the request.
-    /// Branches the push created get `branch_ttl` seconds to live (when
-    /// non-zero); deleted branches lose any expiry.
-    fn record(p: *const Push, app: *App, name: repo_name.Name, repo_id: []const u8, branch_ttl: u32) void {
-        const repo = repo_git.Repo.open(app.io, app.gpa, app.store, name) catch return;
-        const now = unixNow(app.io);
-        for (p.commands) |cmd| {
-            var buf: [64]u8 = undefined;
-            const current = repo.refValue(cmd.ref, &buf) catch |err| {
-                std.log.err("reading {s} after push: {t}", .{ cmd.ref, err });
-                continue;
-            };
-            const applied = if (cmd.isDelete()) current == null else (current != null and std.mem.eql(u8, current.?, cmd.new));
-            if (!applied) continue;
-            const detail = if (cmd.isCreate()) "created" else if (cmd.isDelete()) "deleted" else "updated";
-            events.record(app, .{ .repo = name.full, .kind = "push", .ref = cmd.ref, .old = cmd.old, .new = cmd.new, .detail = detail, .created_at = now });
-            if (cmd.isDelete()) {
-                app.db.clearBranchTtl(app.io, name.full, cmd.ref) catch |err| std.log.err("clearing expiry of {s}: {t}", .{ cmd.ref, err });
-            } else if (cmd.isCreate() and branch_ttl > 0 and std.mem.startsWith(u8, cmd.ref, "refs/heads/")) {
-                app.db.setBranchTtl(app.io, name.full, repo_id, cmd.ref, now + branch_ttl) catch |err| std.log.err("setting expiry of {s}: {t}", .{ cmd.ref, err });
-            }
-        }
-    }
-};
 
 fn respondGitAuth(request: *http.Server.Request) HandleError!http.Status {
     try request.respond("authentication required\n", .{

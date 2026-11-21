@@ -1332,6 +1332,75 @@ git -c protocol.version=2 ls-remote "$(url "$RW" acme/web)" >"$WORK/ls-v2" 2>"$W
 grep -q 'refs/tags/v1-e2e\^{}' "$WORK/ls-v2" || fail "ls-remote v2 missing peeled tag: $(cat "$WORK/ls-v2")"
 pass "real git ls-remote works on protocol v0 and v2 with peeled tags"
 
+echo "== native git-receive-pack (--atomic, corrupt pack, >4MiB spill)"
+# Atomic push: one valid new branch + one stale branch must update NEITHER.
+git -C "$SRC" push -q "$(url "$RW" acme/web)" HEAD:refs/heads/atomic-target 2>"$WORK/err" || fail "seed atomic-target: $(cat "$WORK/err")"
+ATOMIC_OLD="$(git -C "$SRC" rev-parse HEAD)"
+echo "atomic-change" >"$SRC/atomic.txt"
+git -C "$SRC" add atomic.txt
+git "${GIT_ID[@]}" -C "$SRC" commit -qm "atomic move"
+git -C "$SRC" push -q "$(url "$RW" acme/web)" HEAD:refs/heads/atomic-target 2>"$WORK/err" || fail "advance atomic-target: $(cat "$WORK/err")"
+# Send raw atomic push with valid create (atomic-new) + stale old OID on atomic-target.
+ATOMIC_NEW="$(git -C "$SRC" rev-parse HEAD)"
+python3 - "$PORT" "$RW" "$ATOMIC_OLD" "$ATOMIC_NEW" <<'PY' || fail "atomic push check failed"
+import base64, sys, urllib.request
+port, tok, old, new = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+def pkt(s): return f"{len(s)+4:04x}".encode() + s
+zero = b"0" * 40
+body = (
+    pkt(zero + b" " + new.encode() + b" refs/heads/atomic-never\x00report-status atomic side-band-64k\n") +
+    pkt(old.encode() + b" " + new.encode() + b" refs/heads/atomic-target\n") +
+    b"0000"
+)
+req = urllib.request.Request(
+    f"http://127.0.0.1:{port}/acme/web.git/git-receive-pack",
+    data=body,
+    headers={
+        "Authorization": "Basic " + base64.b64encode(f"t:{tok}".encode()).decode(),
+        "Content-Type": "application/x-git-receive-pack-request",
+    },
+)
+resp = urllib.request.urlopen(req).read()
+assert b"ng refs/heads/atomic-never atomic push failed" in resp, resp
+assert b"ng refs/heads/atomic-target stale info" in resp, resp
+PY
+if git ls-remote --exit-code "$(url "$RW" acme/web)" refs/heads/atomic-never >/dev/null 2>&1; then
+  fail "atomic push created ref despite sibling failure"
+fi
+pass "native receive-pack --atomic rejects whole batch on partial failure"
+
+# Corrupt packfile is rejected cleanly without mutating refs.
+python3 - "$PORT" "$RW" "$ATOMIC_NEW" <<'PY' || fail "corrupt pack check failed"
+import base64, sys, urllib.request
+port, tok, new = sys.argv[1], sys.argv[2], sys.argv[3]
+def pkt(s): return f"{len(s)+4:04x}".encode() + s
+body = pkt(b"0"*40 + b" " + new.encode() + b" refs/heads/corrupt-branch\x00report-status\n") + b"0000PACK\x00\x00\x00\x02\x00\x00\x00\x01corruptgarbage"
+req = urllib.request.Request(
+    f"http://127.0.0.1:{port}/acme/web.git/git-receive-pack",
+    data=body,
+    headers={
+        "Authorization": "Basic " + base64.b64encode(f"t:{tok}".encode()).decode(),
+        "Content-Type": "application/x-git-receive-pack-request",
+    },
+)
+resp = urllib.request.urlopen(req).read()
+assert b"unpack invalid packfile" in resp, resp
+assert b"ng refs/heads/corrupt-branch unpack failed" in resp, resp
+PY
+if git ls-remote --exit-code "$(url "$RW" acme/web)" refs/heads/corrupt-branch >/dev/null 2>&1; then
+  fail "corrupt packfile created ref"
+fi
+pass "native receive-pack rejects corrupt packfile cleanly"
+
+# >4 MiB push exercises temp-file spill path and leaves repo fsck-clean with no tmp files.
+head -c 5242880 /dev/urandom >"$SRC/spill5m.bin"
+git -C "$SRC" add spill5m.bin
+git "${GIT_ID[@]}" -C "$SRC" commit -qm "5m spill"
+git -C "$SRC" push -q "$(url "$RW" acme/web)" HEAD:refs/heads/spill5m 2>"$WORK/err" || fail "5m spill push: $(cat "$WORK/err")"
+expect_eq "no temp files left after >4MiB push" 0 "$(find "$DATA/tmp" -type f | wc -l | tr -d ' ')"
+git --git-dir="$DATA/repos/acme/web.git" fsck --strict --full >/dev/null 2>"$WORK/err" || fail "fsck after native pushes: $(cat "$WORK/err")"
+pass "native receive-pack >4MiB file-spilled push passes git fsck --strict"
+
 # Stop while a slow clone is mid-transfer: gitd must still exit promptly and
 # take its git processes with it.
 head -c 4000000 /dev/urandom >"$SRC/big2.bin"

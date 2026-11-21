@@ -1217,36 +1217,197 @@ pub const Repo = struct {
 
     /// The best common ancestor of two commits, or null if they share none.
     pub fn mergeBase(r: *const Repo, a: []const u8, b: []const u8, out: *[64]u8) git_cmd.Error!?[]const u8 {
-        const result = try r.git(&.{ "merge-base", "--end-of-options", a, b }, .{});
-        defer result.deinit(r.gpa);
-        if (result.code != 0) return null;
-        const oid = std.mem.trimEnd(u8, result.stdout, "\n");
-        if (oid.len > out.len) return error.GitFailed;
-        @memcpy(out[0..oid.len], oid);
-        return out[0..oid.len];
+        const repo = try r.openBare();
+        defer git2.git_repository_free(repo);
+        const ca = lookupCommit(repo, a) orelse return null;
+        defer git2.git_commit_free(ca);
+        const cb = lookupCommit(repo, b) orelse return null;
+        defer git2.git_commit_free(cb);
+        var base_oid: git2.Oid = .{};
+        const rc = git2.git_merge_base(&base_oid, repo, git2.git_commit_id(ca), git2.git_commit_id(cb));
+        if (rc == git2.err_not_found) return null;
+        if (rc != git2.ok) {
+            std.log.err("git2 merge_base: {s}", .{git2.lastErrorMessage()});
+            return error.GitFailed;
+        }
+        return formatOidOut(&base_oid, out);
     }
 
     /// Whether `ancestor` is reachable from `descendant` (or equal to it).
     pub fn isAncestor(r: *const Repo, ancestor: []const u8, descendant: []const u8) git_cmd.Error!bool {
-        const result = try r.git(&.{ "merge-base", "--is-ancestor", "--end-of-options", ancestor, descendant }, .{});
-        defer result.deinit(r.gpa);
-        return switch (result.code) {
-            0 => true,
-            1 => false,
-            else => error.GitFailed,
+        const repo = try r.openBare();
+        defer git2.git_repository_free(repo);
+        const ca = lookupCommit(repo, ancestor) orelse return error.GitFailed;
+        defer git2.git_commit_free(ca);
+        const cd = lookupCommit(repo, descendant) orelse return error.GitFailed;
+        defer git2.git_commit_free(cd);
+        const anc_id = git2.git_commit_id(ca);
+        const desc_id = git2.git_commit_id(cd);
+        if (std.mem.eql(u8, &anc_id.id, &desc_id.id)) return true;
+        const rc = git2.git_graph_descendant_of(repo, desc_id, anc_id);
+        return switch (rc) {
+            1 => true,
+            0 => false,
+            else => blk: {
+                std.log.err("git2 descendant_of: {s}", .{git2.lastErrorMessage()});
+                break :blk error.GitFailed;
+            },
         };
     }
 
     /// Commits only in `head` (ahead) and only in `base` (behind).
     pub fn aheadBehind(r: *const Repo, base: []const u8, head: []const u8) git_cmd.Error!struct { ahead: u64, behind: u64 } {
-        var range_buf: [140]u8 = undefined;
-        const range = std.mem.print(&range_buf, "{s}...{s}", .{ base, head }) catch return error.GitFailed;
-        const raw = try r.gitOutput(&.{ "rev-list", "--left-right", "--count", "--end-of-options", range }, .{});
-        defer r.gpa.free(raw);
-        var it = std.mem.tokenizeAny(u8, raw, "\t \n");
-        const behind = std.fmt.parseInt(u64, it.next() orelse return error.GitFailed, 10) catch return error.GitFailed;
-        const ahead = std.fmt.parseInt(u64, it.next() orelse return error.GitFailed, 10) catch return error.GitFailed;
+        const repo = try r.openBare();
+        defer git2.git_repository_free(repo);
+        const cb = lookupCommit(repo, base) orelse return error.GitFailed;
+        defer git2.git_commit_free(cb);
+        const ch = lookupCommit(repo, head) orelse return error.GitFailed;
+        defer git2.git_commit_free(ch);
+        var ahead: usize = 0;
+        var behind: usize = 0;
+        if (git2.git_graph_ahead_behind(&ahead, &behind, repo, git2.git_commit_id(ch), git2.git_commit_id(cb)) != git2.ok) {
+            std.log.err("git2 ahead_behind: {s}", .{git2.lastErrorMessage()});
+            return error.GitFailed;
+        }
         return .{ .ahead = ahead, .behind = behind };
+    }
+
+    pub const IndexPackError = error{ InvalidPack, PackTooManyObjects, GitFailed, OutOfMemory } || Io.Cancelable;
+
+    /// Verifies and indexes a raw Git v2 packfile stream into `<git_dir>/objects/pack`.
+    /// Empty (0-object) packfiles are verified via their SHA-1 trailer and skipped.
+    /// Supports thin packs by resolving bases against the repo's ODB (R2.3).
+    pub fn indexPackSlice(r: *const Repo, pack_bytes: []const u8) IndexPackError!void {
+        if (pack_bytes.len == 0) return;
+        const obj_count = try validatePackHeader(pack_bytes);
+        if (obj_count == 0) {
+            try verifyEmptyPack(pack_bytes);
+            return;
+        }
+        const repo = r.openBare() catch return error.GitFailed;
+        defer git2.git_repository_free(repo);
+        var odb: ?*git2.Odb = null;
+        if (git2.git_repository_odb(&odb, repo) != git2.ok) return error.GitFailed;
+        defer git2.git_odb_free(odb.?);
+
+        var pack_dir_buf: [store_mod.Store.max_path_len + 32]u8 = undefined;
+        const pack_dir = std.mem.printSentinel(&pack_dir_buf, "{s}/objects/pack", .{r.gitDir()}, 0) catch return error.GitFailed;
+
+        var opts: git2.IndexerOptions = .{};
+        if (git2.git_indexer_options_init(&opts, 1) != git2.ok) return error.GitFailed;
+        opts.verify = 1;
+
+        var idx: ?*git2.Indexer = null;
+        if (git2.git_indexer_new(&idx, pack_dir.ptr, 0, odb.?, &opts) != git2.ok) {
+            std.log.err("git2 indexer_new: {s}", .{git2.lastErrorMessage()});
+            return error.GitFailed;
+        }
+        defer git2.git_indexer_free(idx.?);
+
+        var stats: git2.IndexerProgress = .{};
+        var pos: usize = 0;
+        while (pos < pack_bytes.len) {
+            const chunk = pack_bytes[pos..@min(pos + 64 * 1024, pack_bytes.len)];
+            if (git2.git_indexer_append(idx.?, @ptrCast(chunk.ptr), chunk.len, &stats) != git2.ok) {
+                return error.InvalidPack;
+            }
+            pos += chunk.len;
+        }
+        if (git2.git_indexer_commit(idx.?, &stats) != git2.ok) {
+            return error.InvalidPack;
+        }
+    }
+
+    /// Streams packfile bytes from `file` starting at `offset` into `git_indexer`.
+    pub fn indexPackFile(r: *const Repo, file: Io.File, offset: u64, total_len: u64) IndexPackError!void {
+        if (total_len <= offset) return;
+        const pack_len = total_len - offset;
+        var hdr: [32]u8 = undefined;
+        const hdr_want: usize = @intCast(@min(pack_len, hdr.len));
+        const hdr_n = file.readPositionalAll(r.io, hdr[0..hdr_want], offset) catch return error.GitFailed;
+        if (hdr_n < 12) return error.InvalidPack;
+        const obj_count = try validatePackHeader(hdr[0..hdr_n]);
+        if (obj_count == 0) {
+            if (pack_len != 32 or hdr_n != 32) return error.InvalidPack;
+            try verifyEmptyPack(hdr[0..32]);
+            return;
+        }
+
+        const repo = r.openBare() catch return error.GitFailed;
+        defer git2.git_repository_free(repo);
+        var odb: ?*git2.Odb = null;
+        if (git2.git_repository_odb(&odb, repo) != git2.ok) return error.GitFailed;
+        defer git2.git_odb_free(odb.?);
+
+        var pack_dir_buf: [store_mod.Store.max_path_len + 32]u8 = undefined;
+        const pack_dir = std.mem.printSentinel(&pack_dir_buf, "{s}/objects/pack", .{r.gitDir()}, 0) catch return error.GitFailed;
+
+        var opts: git2.IndexerOptions = .{};
+        if (git2.git_indexer_options_init(&opts, 1) != git2.ok) return error.GitFailed;
+        opts.verify = 1;
+
+        var idx: ?*git2.Indexer = null;
+        if (git2.git_indexer_new(&idx, pack_dir.ptr, 0, odb.?, &opts) != git2.ok) {
+            std.log.err("git2 indexer_new: {s}", .{git2.lastErrorMessage()});
+            return error.GitFailed;
+        }
+        defer git2.git_indexer_free(idx.?);
+
+        var stats: git2.IndexerProgress = .{};
+        var buf: [64 * 1024]u8 = undefined;
+        var pos = offset;
+        while (pos < total_len) {
+            const want: usize = @intCast(@min(total_len - pos, buf.len));
+            const n = file.readPositionalAll(r.io, buf[0..want], pos) catch return error.GitFailed;
+            if (n == 0) return error.InvalidPack;
+            if (git2.git_indexer_append(idx.?, @ptrCast(buf[0..n].ptr), n, &stats) != git2.ok) {
+                return error.InvalidPack;
+            }
+            pos += n;
+        }
+        if (git2.git_indexer_commit(idx.?, &stats) != git2.ok) {
+            return error.InvalidPack;
+        }
+    }
+
+    pub const max_pack_objects: u32 = 1_000_000;
+
+    fn validatePackHeader(bytes: []const u8) error{ InvalidPack, PackTooManyObjects }!u32 {
+        if (bytes.len < 12 or !std.mem.eql(u8, bytes[0..4], "PACK")) return error.InvalidPack;
+        const version = std.mem.readInt(u32, bytes[4..8], .big);
+        if (version != 2) return error.InvalidPack;
+        const count = std.mem.readInt(u32, bytes[8..12], .big);
+        if (count > max_pack_objects) return error.PackTooManyObjects;
+        return count;
+    }
+
+    fn verifyEmptyPack(bytes: []const u8) error{InvalidPack}!void {
+        if (bytes.len != 32) return error.InvalidPack;
+        var digest: [20]u8 = undefined;
+        std.crypto.hash.Sha1.hash(bytes[0..12], &digest, .{});
+        if (!std.mem.eql(u8, &digest, bytes[12..32])) return error.InvalidPack;
+    }
+
+    /// Checks whether `oid_hex` exists in the repo and, when `must_be_commit` is true,
+    /// that it is a commit whose root tree is also present in the ODB.
+    pub fn verifyPushedTarget(r: *const Repo, oid_hex: []const u8, must_be_commit: bool) git_cmd.Error!bool {
+        const oid = git2.parseOid(oid_hex) orelse return false;
+        const repo = try r.openBare();
+        defer git2.git_repository_free(repo);
+        var obj: ?*git2.Object = null;
+        if (git2.git_object_lookup(&obj, repo, &oid, git2.obj_any) != git2.ok) return false;
+        defer git2.git_object_free(obj.?);
+        const kind = git2.git_object_type(obj.?);
+        if (must_be_commit and kind != git2.obj_commit) return false;
+        if (kind == git2.obj_commit) {
+            var commit: ?*git2.Commit = null;
+            if (git2.git_commit_lookup(&commit, repo, &oid) != git2.ok) return false;
+            defer git2.git_commit_free(commit.?);
+            var tree: ?*git2.Tree = null;
+            if (git2.git_commit_tree(&tree, commit.?) != git2.ok) return false;
+            git2.git_tree_free(tree.?);
+        }
+        return true;
     }
 
     /// Flags for every diff gitd runs: no external diff or textconv
