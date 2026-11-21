@@ -66,6 +66,10 @@ pub const App = struct {
     gc_interval_seconds: u32 = 300,
     gc_prune_seconds: u32 = 300,
     gc_expired_threshold: u32 = 20,
+    /// Broadcasts new events to live SSE listeners and caps open streams (R3.4).
+    event_hub: events.Hub = .{},
+    sse_keepalive_ms: u32 = 15_000,
+    sse_max_seconds: u32 = 300,
 };
 
 pub const default_idle_timeout_seconds = 60;
@@ -79,6 +83,8 @@ pub fn run(app: *App, listener: *Io.net.Server) Io.Cancelable!void {
     const io = app.io;
     var group: Io.Group = .init;
     defer group.cancel(io);
+    // Wake sleeping SSE streams before group.cancel waits for connection tasks (R3.4).
+    defer app.event_hub.shutdown(io);
     group.concurrent(io, expiry.run, .{app}) catch |err| {
         std.log.err("starting the branch reaper: {t}", .{err});
     };
@@ -210,7 +216,7 @@ fn route(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress, targe
         error.MethodNotAllowed => return respondError(request, .method_not_allowed, "method_not_allowed", "wrong method for this git endpoint"),
     }
 
-    if (std.mem.startsWith(u8, path, "/v1/")) return serveApi(app, request, path, query);
+    if (std.mem.startsWith(u8, path, "/v1/")) return serveApi(app, request, peer, path, query);
     if (std.mem.eql(u8, path, "/ui") or std.mem.startsWith(u8, path, "/ui/")) {
         if (!app.ui_enabled) return respondError(request, .not_found, "not_found", "start gitd with --ui to serve this page");
         if (!isLoopback(peer)) return respondError(request, .forbidden, "forbidden", "the UI is only served to this machine");
@@ -225,10 +231,10 @@ fn route(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress, targe
 
 // ---- Admin API ----
 
-fn serveApi(app: *App, request: *http.Server.Request, path: []const u8, query: []const u8) HandleError!http.Status {
+fn serveApi(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress, path: []const u8, query: []const u8) HandleError!http.Status {
     // Per-repo content routes accept a repo token as well as the admin key.
     if (std.mem.startsWith(u8, path, "/v1/repos/")) {
-        if (splitRepoPath(path["/v1/repos/".len..])) |parts| return serveContent(app, request, parts.name, parts.rest, query);
+        if (splitRepoPath(path["/v1/repos/".len..])) |parts| return serveContent(app, request, peer, parts.name, parts.rest, query);
     }
     switch (checkAdmin(app, request)) {
         .ok => {},
@@ -280,7 +286,7 @@ pub fn splitRepoPath(text: []const u8) ?RepoPath {
 
 /// Authenticates a per-repo content request: the admin key, or a repo
 /// token for this repo (by name and id) sent as `Authorization: Bearer`.
-fn serveContent(app: *App, request: *http.Server.Request, name: repo_name.Name, rest: []const u8, query: []const u8) HandleError!http.Status {
+fn serveContent(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress, name: repo_name.Name, rest: []const u8, query: []const u8) HandleError!http.Status {
     const header = findHeader(request, "authorization") orelse
         return respondError(request, .unauthorized, "unauthorized", "send Authorization: Bearer <admin key or repo token>");
     const bearer = auth.bearer(header) orelse
@@ -300,10 +306,10 @@ fn serveContent(app: *App, request: *http.Server.Request, name: repo_name.Name, 
         if (!std.mem.eql(u8, claims.repo(), name.full) or !std.mem.eql(u8, &claims.repo_id, repo.id)) {
             return respondError(request, .forbidden, "forbidden", "this token is for another repo");
         }
-        return content.serve(app, request, name, rest, query, .{ .claims = &claims, .repo_id = repo.id });
+        return content.serve(app, request, name, rest, query, .{ .claims = &claims, .repo_id = repo.id, .peer = peer });
     }
     switch (checkAdmin(app, request)) {
-        .ok => return content.serve(app, request, name, rest, query, .{ .claims = null, .repo_id = repo.id }),
+        .ok => return content.serve(app, request, name, rest, query, .{ .claims = null, .repo_id = repo.id, .peer = peer }),
         .missing, .invalid => return respondError(request, .unauthorized, "unauthorized", "unknown admin key or token"),
         .failed => return internal(request),
     }

@@ -44,7 +44,7 @@ start_server() {
   local skip
   skip=$(($(wc -l <"$LOG" 2>/dev/null || echo 0) + 1))
   PORT=""
-  GITD_IDLE_TIMEOUT_SECONDS=2 GITD_HEAD_TIMEOUT_SECONDS=3 GITD_WEBHOOK_BACKOFF_MS=100 GITD_WEBHOOK_TIMEOUT_MS=1000 "$BIN" serve --data "$DATA" --listen 127.0.0.1:0 --ui >>"$LOG" 2>&1 &
+  GITD_IDLE_TIMEOUT_SECONDS=2 GITD_HEAD_TIMEOUT_SECONDS=3 GITD_WEBHOOK_BACKOFF_MS=100 GITD_WEBHOOK_TIMEOUT_MS=1000 GITD_SSE_KEEPALIVE_MS=300 "$BIN" serve --data "$DATA" --listen 127.0.0.1:0 --ui >>"$LOG" 2>&1 &
   SERVER_PID=$!
   for _ in $(seq 1 100); do
     PORT="$(tail -n +"$skip" "$LOG" | sed -n 's/.*listening on 127\.0\.0\.1:\([0-9]*\),.*/\1/p' | tail -1)"
@@ -1206,6 +1206,87 @@ expect_eq "path ACL blocks patch to secret.txt" 403 "$(status -H "authorization:
 expect_eq "patch branch stayed at P_H2" "$P_H2" "$(admin "$PB/branches" >/dev/null; python3 -c "import json; print(next(b['commit'] for b in json.load(open('$WORK/body'))['branches'] if b['name']=='agent/patch'))")"
 expect_eq "delete patch repo" 204 "$(admin -X DELETE "$PB")"
 
+echo "== public events API and live SSE stream"
+admin -X POST "$BASE/v1/repos" -d '{"name":"acme/ev"}' >/dev/null
+EB="$BASE/v1/repos/acme/ev"
+expect_eq "seed ev main" 201 "$(admin -X POST "$EB/commits" -d '{"branch":"main","expected_head":null,"message":"init","changes":[{"path":"a.txt","content":"1"}]}')"
+expect_eq "commit agent/pub" 201 "$(admin -X POST "$EB/commits" -d '{"branch":"agent/pub","expected_head":null,"from":"main","message":"pub 1","changes":[{"path":"a.txt","content":"2"}]}')"
+expect_eq "commit agent/secret" 201 "$(admin -X POST "$EB/commits" -d '{"branch":"agent/secret","expected_head":null,"from":"main","message":"sec 1","changes":[{"path":"a.txt","content":"s"}]}')"
+
+# Filtered JSON history & pagination
+expect_eq "events JSON limit 2" 200 "$(admin "$EB/events?limit=2")"
+EV_NEXT="$(json '["next_after"]')"
+python3 - "$WORK/body" <<'PY' || fail "events limit=2 unexpected: $(cat "$WORK/body")"
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert len(d["events"]) == 2 and d["next_after"] == d["events"][-1]["id"], d
+PY
+pass "events JSON pagination works"
+expect_eq "events JSON filter kind and branch" 200 "$(admin "$EB/events?kind=commit&ref=agent/pub")"
+python3 - "$WORK/body" <<'PY' || fail "filtered events unexpected: $(cat "$WORK/body")"
+import json, sys
+evs = json.load(open(sys.argv[1]))["events"]
+assert len(evs) == 1 and evs[0]["ref"] == "refs/heads/agent/pub" and evs[0]["kind"] == "commit", evs
+PY
+pass "events filter by kind and ref"
+
+# read_refs privacy isolation across JSON and SSE
+EV_PUB_TOK="$(admin -X POST "$BASE/v1/tokens" -d '{"repo":"acme/ev","scopes":["git:read"],"read_refs":["refs/heads/agent/pub"]}' >/dev/null; json '["token"]')"
+expect_eq "read_refs token lists events" 200 "$(status -H "authorization: Bearer $EV_PUB_TOK" "$EB/events")"
+python3 - "$WORK/body" <<'PY' || fail "read_refs isolation leaked: $(cat "$WORK/body")"
+import json, sys
+evs = json.load(open(sys.argv[1]))["events"]
+refs = {e["ref"] for e in evs if e["ref"]}
+assert refs == {"refs/heads/agent/pub"}, evs
+PY
+pass "read_refs token cannot see hidden branch events"
+
+# Live SSE stream wakes immediately on commit, check_updated, and merge
+curl -sN -H "authorization: Bearer $KEY" "$EB/events?after=$EV_NEXT&stream=1" >"$WORK/sse.out" 2>/dev/null &
+SSE_LIVE=$!
+for _ in $(seq 1 40); do grep -q ": connected" "$WORK/sse.out" 2>/dev/null && break; sleep 0.05; done
+grep -q ": connected" "$WORK/sse.out" || fail "SSE did not connect: $(cat "$WORK/sse.out")"
+
+expect_eq "live SSE trigger commit" 201 "$(admin -X POST "$EB/commits" -d '{"branch":"agent/pub2","expected_head":null,"from":"main","message":"pub 2","changes":[{"path":"b.txt","content":"b"}]}')"
+EV_SHA="$(json '["sha"]')"
+expect_eq "live SSE trigger check" 200 "$(admin -X POST "$EB/commits/$EV_SHA/checks" -d '{"name":"tests","status":"passed"}')"
+for _ in $(seq 1 40); do
+  if grep -q "event: check_updated" "$WORK/sse.out" 2>/dev/null && grep -q "$EV_SHA" "$WORK/sse.out"; then break; fi
+  sleep 0.05
+done
+grep -q "event: check_updated" "$WORK/sse.out" || fail "SSE missed check_updated: $(cat "$WORK/sse.out")"
+grep -q "$EV_SHA" "$WORK/sse.out" || fail "SSE missed commit sha: $(cat "$WORK/sse.out")"
+kill "$SSE_LIVE" 2>/dev/null || true
+wait "$SSE_LIVE" 2>/dev/null || true
+pass "live SSE delivers commit and check_updated in real time"
+
+# Last-Event-ID resume header
+EV_MID="$(admin "$EB/events?limit=1" >/dev/null; json '["events"][0]["id"]')"
+curl -sN --max-time 1 -H "authorization: Bearer $KEY" -H "Last-Event-ID: $EV_MID" -H "Accept: text/event-stream" "$EB/events" >"$WORK/sse-resume.out" 2>/dev/null || true
+python3 - "$WORK/sse-resume.out" "$EV_MID" <<'PY' || fail "Last-Event-ID resume failed: $(cat "$WORK/sse-resume.out")"
+import sys
+raw = open(sys.argv[1]).read()
+mid = int(sys.argv[2])
+ids = [int(line[4:]) for line in raw.splitlines() if line.startswith("id: ")]
+assert len(ids) > 0 and all(i > mid for i in ids), (mid, ids)
+PY
+pass "Last-Event-ID resumes strictly after given event id"
+
+# Per-peer SSE cap (8 open streams, 9th returns 429)
+sleep 0.5
+SSE_CAPS=()
+for _ in $(seq 1 8); do
+  curl -sN -H "authorization: Bearer $KEY" "$EB/events?stream=1" >/dev/null 2>&1 &
+  SSE_CAPS+=("$!")
+done
+sleep 0.2
+expect_eq "9th concurrent SSE stream hits per-peer cap 429" 429 "$(admin "$EB/events?stream=1")"
+for pid in "${SSE_CAPS[@]}"; do kill "$pid" 2>/dev/null || true; done
+for pid in "${SSE_CAPS[@]}"; do wait "$pid" 2>/dev/null || true; done
+sleep 0.4
+pass "SSE per-peer stream cap enforced and slots released"
+expect_eq "delete events test repo" 204 "$(admin -X DELETE "$EB")"
+
 echo "== SDKs (TypeScript and Python)"
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 if [[ -d "$ROOT_DIR/sdk/python" ]]; then
@@ -1237,9 +1318,12 @@ printf '0032want %s\n00000009done\n' "$TIP" >"$WORK/want"
 curl -s -o /dev/null --limit-rate 100k --max-time 20 -u "t:$RW" -H 'Content-Type: application/x-git-upload-pack-request' \
   --data-binary @"$WORK/want" "$BASE/acme/web.git/git-upload-pack" &
 SLOW_CLONE=$!
+curl -sN -H "authorization: Bearer $KEY" "$BASE/v1/repos/acme/web/events?stream=1" >/dev/null 2>&1 &
+SSE_STOP=$!
 sleep 0.5
 stop_server
 wait "$SLOW_CLONE" 2>/dev/null || true
+wait "$SSE_STOP" 2>/dev/null || true
 for _ in $(seq 1 40); do [[ -z "$(leftover)" ]] && break; sleep 0.1; done
 [[ -z "$(leftover)" ]] || fail "git processes left after stopping mid-clone: $(leftover)"
 pass "stopping mid-clone leaves no git processes"

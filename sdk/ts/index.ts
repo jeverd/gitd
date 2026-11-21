@@ -289,6 +289,24 @@ export interface Webhook {
   created_at: number;
 }
 
+export interface RepoEvent {
+  id: number;
+  repo: string;
+  kind: string;
+  ref: string;
+  old: string;
+  new: string;
+  detail: string;
+  created_at: number;
+}
+
+export interface EventQueryOptions {
+  after?: number;
+  kind?: string;
+  ref?: string;
+  limit?: number;
+}
+
 export class GitdError extends Error {
   readonly status: number;
   readonly code: string;
@@ -626,5 +644,69 @@ export class GitdClient {
 
   gc(repo: string, opts: { prune_seconds?: number } = {}): Promise<GcResult> {
     return this.#json("POST", `/v1/repos/${repo}/gc`, opts.prune_seconds !== undefined ? opts : undefined);
+  }
+
+  // ---- Events & Live SSE Stream ----
+
+  listEvents(
+    repo: string,
+    opts: EventQueryOptions = {},
+  ): Promise<{ events: RepoEvent[]; next_after: number }> {
+    const params = new URLSearchParams();
+    if (opts.after !== undefined) params.set("after", String(opts.after));
+    if (opts.kind) params.set("kind", opts.kind);
+    if (opts.ref) params.set("ref", opts.ref);
+    if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+    const qs = params.toString();
+    return this.#json("GET", `/v1/repos/${repo}/events${qs ? `?${qs}` : ""}`);
+  }
+
+  async *streamEvents(
+    repo: string,
+    opts: Omit<EventQueryOptions, "limit"> & { signal?: AbortSignal } = {},
+  ): AsyncGenerator<RepoEvent> {
+    const params = new URLSearchParams({ stream: "1" });
+    if (opts.after !== undefined) params.set("after", String(opts.after));
+    if (opts.kind) params.set("kind", opts.kind);
+    if (opts.ref) params.set("ref", opts.ref);
+    const resp = await this.#fetch(`${this.baseUrl}/v1/repos/${repo}/events?${params.toString()}`, {
+      method: "GET",
+      headers: {
+        authorization: `Bearer ${this.token}`,
+        accept: "text/event-stream",
+      },
+      signal: opts.signal,
+    });
+    if (!resp.ok || !resp.body) {
+      throw new GitdError(resp.status, `http_${resp.status}`, resp.statusText);
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let dataLines: string[] = [];
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buf.indexOf("\n")) !== -1) {
+          let line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          if (line.endsWith("\r")) line = line.slice(0, -1);
+          if (line === "") {
+            if (dataLines.length > 0) {
+              const payload = dataLines.join("\n");
+              dataLines = [];
+              yield JSON.parse(payload) as RepoEvent;
+            }
+          } else if (line.startsWith("data:")) {
+            dataLines.push(line.slice(5).trimStart());
+          }
+        }
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+    }
   }
 }
