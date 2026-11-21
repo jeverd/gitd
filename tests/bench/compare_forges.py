@@ -10,13 +10,9 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import os
 import secrets
-import shutil
-import statistics
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -110,6 +106,11 @@ def _wait_health(base_url: str, path: str, deadline_s: float = 90.0) -> float:
     raise RuntimeError(f"container at {base_url}{path} did not become healthy within {deadline_s}s")
 
 
+def _cleanup_container_and_volume(cname: str, vol_name: str) -> None:
+    _docker_cmd(["rm", "-f", cname], check=False)
+    _docker_cmd(["volume", "rm", "-f", vol_name], check=False)
+
+
 def _run_gitd_target(image: str, *, cpus: str, memory: str, mode: str) -> dict[str, Any]:
     cold_runs = 1 if mode == "quick" else 3
     prov_count = 20 if mode == "quick" else 100
@@ -122,40 +123,43 @@ def _run_gitd_target(image: str, *, cpus: str, memory: str, mode: str) -> dict[s
     cid_prefix = f"gitd-cmp-{secrets.token_hex(4)}"
 
     def start_one(idx: int) -> tuple[str, str, str, str]:
-        data_dir = tempfile.mkdtemp(prefix="gitd-dk-")
-        os.chmod(data_dir, 0o777)
+        vol_name = f"{cid_prefix}-vol-{idx}"
+        _docker_cmd(["volume", "create", vol_name])
         port = common.pick_free_port()
         admin_key = f"gitd_k_{secrets.token_hex(32)}"
         cname = f"{cid_prefix}-{idx}"
-        t0 = time.perf_counter()
-        _docker_cmd(
-            [
-                "run",
-                "-d",
-                "--name",
-                cname,
-                f"--cpus={cpus}",
-                f"--memory={memory}",
-                "-p",
-                f"127.0.0.1:{port}:8080",
-                "-e",
-                f"GITD_ADMIN_KEY={admin_key}",
-                "-v",
-                f"{data_dir}:/data",
-                image,
-            ]
-        )
         base = f"http://127.0.0.1:{port}"
-        _wait_health(base, "/healthz")
-        cold_ms.append((time.perf_counter() - t0) * 1000.0)
-        return cname, data_dir, base, admin_key
+        try:
+            t0 = time.perf_counter()
+            _docker_cmd(
+                [
+                    "run",
+                    "-d",
+                    "--name",
+                    cname,
+                    f"--cpus={cpus}",
+                    f"--memory={memory}",
+                    "-p",
+                    f"127.0.0.1:{port}:8080",
+                    "-e",
+                    f"GITD_ADMIN_KEY={admin_key}",
+                    "-v",
+                    f"{vol_name}:/data",
+                    image,
+                ]
+            )
+            _wait_health(base, "/healthz")
+            cold_ms.append((time.perf_counter() - t0) * 1000.0)
+        except Exception:
+            _cleanup_container_and_volume(cname, vol_name)
+            raise
+        return cname, vol_name, base, admin_key
 
     for i in range(cold_runs - 1):
-        cname, data_dir, _, _ = start_one(i)
-        _docker_cmd(["rm", "-f", cname], check=False)
-        shutil.rmtree(data_dir, ignore_errors=True)
+        cname, vol_name, _, _ = start_one(i)
+        _cleanup_container_and_volume(cname, vol_name)
 
-    cname, data_dir, base, admin_key = start_one(cold_runs - 1)
+    cname, vol_name, base, admin_key = start_one(cold_runs - 1)
     sampler = ContainerRssSampler(cname)
     client = common.KeepAliveClient(base, admin_key)
     try:
@@ -262,8 +266,7 @@ def _run_gitd_target(image: str, *, cpus: str, memory: str, mode: str) -> dict[s
         peak_mib = sampler.stop()
     finally:
         client.close_all()
-        _docker_cmd(["rm", "-f", cname], check=False)
-        shutil.rmtree(data_dir, ignore_errors=True)
+        _cleanup_container_and_volume(cname, vol_name)
 
     return {
         "target": "gitd",
@@ -278,7 +281,9 @@ def _run_gitd_target(image: str, *, cpus: str, memory: str, mode: str) -> dict[s
         "token_mint_ms": common.summarize(tok_ms),
         "seq_commit_ms": common.summarize(seq_ms),
         "conc_commit_ms": common.summarize(conc_ms),
-        "conc_commits_per_sec": round((conc_agents * conc_commits) / max(0.001, conc_wall_s), 1),
+        "conc_succeeded": len(conc_ms),
+        "conc_errors": len(errs),
+        "conc_commits_per_sec": round(len(conc_ms) / max(0.001, conc_wall_s), 1),
     }
 
 
@@ -298,8 +303,8 @@ def _run_gitea_like_target(
     cid_prefix = f"{kind}-cmp-{secrets.token_hex(4)}"
 
     def start_one(idx: int) -> tuple[str, str, str, str]:
-        data_dir = tempfile.mkdtemp(prefix=f"{kind}-dk-")
-        os.chmod(data_dir, 0o777)
+        vol_name = f"{cid_prefix}-vol-{idx}"
+        _docker_cmd(["volume", "create", vol_name])
         port = common.pick_free_port()
         cname = f"{cid_prefix}-{idx}"
         secret_key = secrets.token_hex(32)
@@ -308,6 +313,8 @@ def _run_gitea_like_target(
         envs = [
             f"{env_prefix}__database__DB_TYPE=sqlite3",
             f"{env_prefix}__database__PATH=/var/lib/gitea/data/gitea.db",
+            f"{env_prefix}__database__SQLITE_JOURNAL_MODE=WAL",
+            f"{env_prefix}__database__SQLITE_TIMEOUT=5000",
             f"{env_prefix}__security__INSTALL_LOCK=true",
             f"{env_prefix}__security__SECRET_KEY={secret_key}",
             f"{env_prefix}__security__INTERNAL_TOKEN={internal_tok}",
@@ -318,6 +325,8 @@ def _run_gitea_like_target(
             # Mirror Gitea env prefix as well for Forgejo compatibility.
             "GITEA__database__DB_TYPE=sqlite3",
             "GITEA__database__PATH=/var/lib/gitea/data/gitea.db",
+            "GITEA__database__SQLITE_JOURNAL_MODE=WAL",
+            "GITEA__database__SQLITE_TIMEOUT=5000",
             "GITEA__security__INSTALL_LOCK=true",
             f"GITEA__security__SECRET_KEY={secret_key}",
             f"GITEA__security__INTERNAL_TOKEN={internal_tok}",
@@ -336,24 +345,27 @@ def _run_gitea_like_target(
             "-p",
             f"127.0.0.1:{port}:3000",
             "-v",
-            f"{data_dir}:/var/lib/gitea",
+            f"{vol_name}:/var/lib/gitea",
         ]
         for ev in envs:
             cmd.extend(["-e", ev])
         cmd.append(image)
 
-        t0 = time.perf_counter()
-        _docker_cmd(cmd)
-        _wait_health(base, "/api/v1/version")
-        cold_ms.append((time.perf_counter() - t0) * 1000.0)
-        return cname, data_dir, base, cli_bin
+        try:
+            t0 = time.perf_counter()
+            _docker_cmd(cmd)
+            _wait_health(base, "/api/v1/version")
+            cold_ms.append((time.perf_counter() - t0) * 1000.0)
+        except Exception:
+            _cleanup_container_and_volume(cname, vol_name)
+            raise
+        return cname, vol_name, base, cli_bin
 
     for i in range(cold_runs - 1):
-        cname, data_dir, _, _ = start_one(i)
-        _docker_cmd(["rm", "-f", cname], check=False)
-        shutil.rmtree(data_dir, ignore_errors=True)
+        cname, vol_name, _, _ = start_one(i)
+        _cleanup_container_and_volume(cname, vol_name)
 
-    cname, data_dir, base, bin_name = start_one(cold_runs - 1)
+    cname, vol_name, base, bin_name = start_one(cold_runs - 1)
     sampler = ContainerRssSampler(cname)
     password = secrets.token_urlsafe(16)
     basic_hdr = "Basic " + base64.b64encode(f"bench:{password}".encode()).decode("ascii")
@@ -412,9 +424,9 @@ def _run_gitea_like_target(
         if c_tok != 201:
             raise RuntimeError(f"{kind} bootstrap token failed ({c_tok}): {tok_out}")
         api_token = tok_out["sha1"]
-        client = common.KeepAliveClient(base, headers_token := api_token)
+        client = common.KeepAliveClient(base)
         # Gitea/Forgejo accept `Authorization: token <sha1>` or `Bearer <sha1>`; use `token` for universal support.
-        auth_hdr = {"Authorization": f"token {headers_token}"}
+        auth_hdr = {"Authorization": f"token {api_token}"}
 
         time.sleep(2.0)
         idle_mib = sampler.sample_once()
@@ -508,7 +520,7 @@ def _run_gitea_like_target(
                         if c != 201:
                             with lock:
                                 errs.append(f"a{idx} s{step}: {c} {out}")
-                            return
+                            break
                     else:
                         c, out, ms = wc.request_json(
                             "PUT",
@@ -524,10 +536,13 @@ def _run_gitea_like_target(
                         if c != 200:
                             with lock:
                                 errs.append(f"a{idx} s{step}: {c} {out}")
-                            return
+                            break
                     sha = out["content"]["sha"]
                     with lock:
                         conc_ms.append(ms)
+            except Exception as exc:
+                with lock:
+                    errs.append(f"a{idx}: {exc}")
             finally:
                 wc.close_all()
 
@@ -538,14 +553,11 @@ def _run_gitea_like_target(
         for t in threads:
             t.join()
         conc_wall_s = time.perf_counter() - t_conc
-        if errs:
-            raise RuntimeError(f"{kind} concurrent commit errors: {errs[:3]}")
         peak_mib = sampler.stop()
     finally:
         if client is not None:
             client.close_all()
-        _docker_cmd(["rm", "-f", cname], check=False)
-        shutil.rmtree(data_dir, ignore_errors=True)
+        _cleanup_container_and_volume(cname, vol_name)
 
     return {
         "target": kind,
@@ -560,7 +572,10 @@ def _run_gitea_like_target(
         "token_mint_ms": common.summarize(tok_ms),
         "seq_commit_ms": common.summarize(seq_ms),
         "conc_commit_ms": common.summarize(conc_ms),
-        "conc_commits_per_sec": round((conc_agents * conc_commits) / max(0.001, conc_wall_s), 1),
+        "conc_succeeded": len(conc_ms),
+        "conc_errors": len(errs),
+        "conc_error_samples": errs[:5],
+        "conc_commits_per_sec": round(len(conc_ms) / max(0.001, conc_wall_s), 1),
     }
 
 
@@ -578,6 +593,9 @@ def render_markdown(report: dict[str, Any]) -> str:
     ]
     rows = []
     for r in report["results"]:
+        conc_cell = f"{common.format_ms(r['conc_commit_ms']['p50'])} ({r['conc_commits_per_sec']}/s)"
+        if r.get("conc_errors", 0):
+            conc_cell += f", {r['conc_errors']} err"
         rows.append(
             [
                 r["target"],
@@ -589,7 +607,7 @@ def render_markdown(report: dict[str, Any]) -> str:
                 common.format_ms(r["repo_create_ms"]["p50"]),
                 common.format_ms(r["token_mint_ms"]["p50"]),
                 common.format_ms(r["seq_commit_ms"]["p50"]),
-                f"{common.format_ms(r['conc_commit_ms']['p50'])} ({r['conc_commits_per_sec']}/s)",
+                conc_cell,
             ]
         )
     parts.append(

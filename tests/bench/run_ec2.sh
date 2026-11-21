@@ -10,8 +10,8 @@ cd "$(dirname "$0")/../.."
 MODE="full"
 WITH_FORGES=1
 OUT_DIR="bench-results-$(date -u +%Y%m%d-%H%M%S)"
-DATA_DIR=""
-OSS_CACHE="/tmp/gitd-bench-oss"
+DATA_DIR="$HOME/gitd-bench-data"
+OSS_CACHE="$HOME/gitd-bench-oss"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -51,17 +51,15 @@ mkdir -p "$OUT_DIR"
 echo "[ec2] building gitd (ReleaseSafe)..."
 zig build -Doptimize=ReleaseSafe
 
+rm -rf "$DATA_DIR" && mkdir -p "$DATA_DIR"
 SUITE_ARGS=(
   --gitd-bin ./zig-out/bin/gitd
   --mode "$MODE"
   --oss-repos
   --oss-cache "$OSS_CACHE"
+  --data-dir "$DATA_DIR"
   --out-dir "$OUT_DIR/suite"
 )
-if [[ -n "$DATA_DIR" ]]; then
-  mkdir -p "$DATA_DIR"
-  SUITE_ARGS+=(--data-dir "$DATA_DIR")
-fi
 
 echo "[ec2] running gitd benchmark suite ($MODE)..."
 python3 tests/bench/suite.py "${SUITE_ARGS[@]}"

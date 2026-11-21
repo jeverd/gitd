@@ -497,7 +497,7 @@ def push_seed_to_gitd(base_url: str, token: str, repo_name: str, local_repo: str
             "push",
             "-q",
             remote_url,
-            "refs/heads/main:refs/heads/main",
+            "HEAD:refs/heads/main",
         ],
         env=common.GIT_ENV,
         capture_output=True,
@@ -793,7 +793,7 @@ def run_b2(
 
             # Free all localhost sockets before launching up to 64 parallel agents.
             admin.close_all()
-            time.sleep(0.05)
+            time.sleep(0.2)
 
             barrier = threading.Barrier(n_agents)
             commit_lats: list[float] = []
