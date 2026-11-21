@@ -1052,8 +1052,8 @@ fn streamPack(
     var pb: ?*git2.Packbuilder = null;
     if (git2.git_packbuilder_new(&pb, git2_repo) != git2.ok) return error.PackFailed;
     defer git2.git_packbuilder_free(pb.?);
-    // Single-threaded per request to keep worker CPU and memory predictable (R3.4).
-    _ = git2.git_packbuilder_set_threads(pb.?, 1);
+    // Bounded parallelism for deltafication without unbounded thread fan-out (R3.4).
+    _ = git2.git_packbuilder_set_threads(pb.?, 4);
 
     // Track included commits when include-tag is requested.
     var packed_commits: std.array_hash_map.Auto([20]u8, void) = .empty;
