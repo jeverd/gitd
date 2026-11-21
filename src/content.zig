@@ -80,6 +80,17 @@ pub const Access = struct {
         return c.scopes.git_read;
     }
 
+    pub fn isReadRefRestricted(a: Access) bool {
+        const c = a.claims orelse return false;
+        return c.isReadRefRestricted();
+    }
+
+    /// Whether `ref` (a full ref name) may be read by this caller.
+    pub fn canReadRef(a: Access, ref: []const u8) bool {
+        const c = a.claims orelse return true;
+        return c.scopes.git_read and c.allowsReadRef(ref);
+    }
+
     /// Whether `ref` (a full ref name) may be created, moved, or deleted.
     pub fn canWrite(a: Access, ref: []const u8) bool {
         if (a.read_only) return false;
@@ -109,15 +120,15 @@ pub fn serve(
 
     if (method == .GET) {
         if (!access.canRead()) return api.respondError(request, .forbidden, "forbidden", "this token lacks git:read");
-        if (std.mem.eql(u8, rest, "branches")) return listBranches(app, request, &repo, name);
-        if (std.mem.startsWith(u8, rest, "files/")) return readFile(app, request, &repo, rest["files/".len..], query);
-        if (std.mem.eql(u8, rest, "tree")) return readTree(app, request, &repo, null, query);
-        if (std.mem.startsWith(u8, rest, "tree/")) return readTree(app, request, &repo, rest["tree/".len..], query);
-        if (std.mem.eql(u8, rest, "log")) return readLog(app, request, &repo, query);
-        if (std.mem.startsWith(u8, rest, "commits/")) return readCommit(app, request, &repo, rest["commits/".len..]);
-        if (std.mem.startsWith(u8, rest, "compare/")) return compare(app, request, &repo, rest["compare/".len..]);
-        if (std.mem.eql(u8, rest, "grep")) return grepRepo(app, request, &repo, query);
-        if (std.mem.eql(u8, rest, "archive")) return readArchive(app, request, &repo, name, query);
+        if (std.mem.eql(u8, rest, "branches")) return listBranches(app, request, &repo, name, access);
+        if (std.mem.startsWith(u8, rest, "files/")) return readFile(app, request, &repo, rest["files/".len..], query, access);
+        if (std.mem.eql(u8, rest, "tree")) return readTree(app, request, &repo, null, query, access);
+        if (std.mem.startsWith(u8, rest, "tree/")) return readTree(app, request, &repo, rest["tree/".len..], query, access);
+        if (std.mem.eql(u8, rest, "log")) return readLog(app, request, &repo, query, access);
+        if (std.mem.startsWith(u8, rest, "commits/")) return readCommit(app, request, &repo, rest["commits/".len..], access);
+        if (std.mem.startsWith(u8, rest, "compare/")) return compare(app, request, &repo, rest["compare/".len..], access);
+        if (std.mem.eql(u8, rest, "grep")) return grepRepo(app, request, &repo, query, access);
+        if (std.mem.eql(u8, rest, "archive")) return readArchive(app, request, &repo, name, query, access);
     }
     if (method == .POST and std.mem.eql(u8, rest, "merges")) return merge(app, request, &repo, name, access);
     if (method == .POST and std.mem.eql(u8, rest, "commits")) return createCommit(app, request, &repo, name, access);
@@ -129,8 +140,8 @@ pub fn serve(
 // ---- Helpers ----
 
 /// Turns the `ref` query value (default `main`) into a commit oid, or
-/// responds with 400/404 and returns null.
-fn commitFromQuery(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, query: []const u8, out: *[64]u8) Error!?[]const u8 {
+/// responds with 400/403/404 and returns null.
+fn commitFromQuery(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, query: []const u8, access: Access, out: *[64]u8) Error!?[]const u8 {
     var decoded: [ref_name.max_len]u8 = undefined;
     const ref = if (std.mem.find(u8, query, "ref=") != null)
         (api.queryValue(&decoded, query, "ref") orelse {
@@ -144,6 +155,7 @@ fn commitFromQuery(app: *server.App, request: *http.Server.Request, repo: *const
         _ = try api.respondError(request, .bad_request, "invalid_ref", "ref must be a branch name, a full ref, or a commit oid");
         return null;
     };
+    if (!try checkReadableRev(request, rev, access)) return null;
     const commit = repo.resolveCommit(rev, out) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => {
@@ -156,6 +168,21 @@ fn commitFromQuery(app: *server.App, request: *http.Server.Request, repo: *const
         _ = try api.respondError(request, .not_found, "not_found", "no such ref or commit");
         return null;
     };
+}
+
+/// Checks `rev` (a validated full ref or oid) against `access.read_refs`.
+/// Responds with 403 and returns false when forbidden.
+fn checkReadableRev(request: *http.Server.Request, rev: []const u8, access: Access) Error!bool {
+    if (!access.isReadRefRestricted()) return true;
+    if (receive_pack.isOid(rev)) {
+        _ = try api.respondError(request, .forbidden, "forbidden", "this token may not read commits by raw SHA");
+        return false;
+    }
+    if (!access.canReadRef(rev)) {
+        _ = try api.respondError(request, .forbidden, "forbidden", "this token may not read that ref");
+        return false;
+    }
+    return true;
 }
 
 /// Accepts an oid, a full ref (`refs/...`), or a branch name, and returns
@@ -208,14 +235,24 @@ pub fn branchesWithExpiry(gpa: std.mem.Allocator, branches: repo_git.Repo.Branch
     return items;
 }
 
-fn listBranches(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, name: repo_name.Name) Error!http.Status {
+fn listBranches(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, name: repo_name.Name, access: Access) Error!http.Status {
     const branches = repo.listBranches() catch |err| return gitError(request, err);
     defer branches.deinit(app.gpa);
     const ttls = app.db.listBranchTtls(app.io, app.gpa, name.full, 0, 10_000) catch return api.internal(request);
     defer Db.freeBranchTtls(app.gpa, ttls);
-    const items = branchesWithExpiry(app.gpa, branches, ttls) catch return api.internal(request);
-    defer app.gpa.free(items);
-    return api.respondJson(app.gpa, request, .ok, .{ .branches = items });
+    const all = branchesWithExpiry(app.gpa, branches, ttls) catch return api.internal(request);
+    defer app.gpa.free(all);
+    if (!access.isReadRefRestricted()) {
+        return api.respondJson(app.gpa, request, .ok, .{ .branches = all });
+    }
+    var visible: std.ArrayList(BranchJson) = .empty;
+    defer visible.deinit(app.gpa);
+    var ref_buf: [ref_name.max_len]u8 = undefined;
+    for (all) |b| {
+        const full = std.mem.print(&ref_buf, "refs/heads/{s}", .{b.name}) catch continue;
+        if (access.canReadRef(full)) visible.append(app.gpa, b) catch return api.internal(request);
+    }
+    return api.respondJson(app.gpa, request, .ok, .{ .branches = visible.items });
 }
 
 /// Validates an optional `ttl_seconds` and records the expiry of `ref`.
@@ -229,11 +266,11 @@ fn setTtl(app: *server.App, name: repo_name.Name, repo_id: []const u8, ref: []co
     app.db.setBranchTtl(app.io, name.full, repo_id, ref, api.unixNow(app.io) + t) catch |err| std.log.err("setting expiry of {s}: {t}", .{ ref, err });
 }
 
-fn readFile(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, raw_path: []const u8, query: []const u8) Error!http.Status {
+fn readFile(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, raw_path: []const u8, query: []const u8, access: Access) Error!http.Status {
     var path_buf: [repo_path.max_len]u8 = undefined;
     const path = (try pathFromUrl(request, raw_path, &path_buf)) orelse return .bad_request;
     var oid_buf: [64]u8 = undefined;
-    const commit = (try commitFromQuery(app, request, repo, query, &oid_buf)) orelse return .not_found;
+    const commit = (try commitFromQuery(app, request, repo, query, access, &oid_buf)) orelse return .not_found;
 
     const entries = repo.lsTree(commit, path, true) catch |err| return gitError(request, err);
     defer entries.deinit(app.gpa);
@@ -255,11 +292,11 @@ fn readFile(app: *server.App, request: *http.Server.Request, repo: *const repo_g
     return .ok;
 }
 
-fn readTree(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, raw_path: ?[]const u8, query: []const u8) Error!http.Status {
+fn readTree(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, raw_path: ?[]const u8, query: []const u8, access: Access) Error!http.Status {
     var path_buf: [repo_path.max_len]u8 = undefined;
     const dir: ?[]const u8 = if (raw_path) |p| ((try pathFromUrl(request, p, &path_buf)) orelse return .bad_request) else null;
     var oid_buf: [64]u8 = undefined;
-    const commit = (try commitFromQuery(app, request, repo, query, &oid_buf)) orelse return .not_found;
+    const commit = (try commitFromQuery(app, request, repo, query, access, &oid_buf)) orelse return .not_found;
 
     if (dir) |d| {
         // A path that is missing or is not a directory is a 404.
@@ -312,9 +349,9 @@ fn commitsJson(arena: std.mem.Allocator, commits: []const repo_git.Repo.Commit) 
     return out;
 }
 
-fn readLog(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, query: []const u8) Error!http.Status {
+fn readLog(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, query: []const u8, access: Access) Error!http.Status {
     var oid_buf: [64]u8 = undefined;
-    const commit = (try commitFromQuery(app, request, repo, query, &oid_buf)) orelse return .not_found;
+    const commit = (try commitFromQuery(app, request, repo, query, access, &oid_buf)) orelse return .not_found;
     const limit_raw = @import("ui.zig").queryInt(query, "limit") orelse default_log_limit;
     if (limit_raw < 1 or limit_raw > max_log_limit) return api.respondError(request, .bad_request, "invalid_limit", "limit must be 1-500");
     var path_buf: [repo_path.max_len]u8 = undefined;
@@ -332,7 +369,8 @@ fn readLog(app: *server.App, request: *http.Server.Request, repo: *const repo_gi
     return api.respondJson(app.gpa, request, .ok, .{ .commits = items });
 }
 
-fn readCommit(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, sha: []const u8) Error!http.Status {
+fn readCommit(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, sha: []const u8, access: Access) Error!http.Status {
+    if (access.isReadRefRestricted()) return api.respondError(request, .forbidden, "forbidden", "this token may not read commits by raw SHA");
     if (!receive_pack.isOid(sha)) return api.respondError(request, .bad_request, "invalid_sha", "give a full commit oid");
     var oid_buf: [64]u8 = undefined;
     const commit = (repo.resolveCommit(sha, &oid_buf) catch |err| return gitError(request, err)) orelse
@@ -355,7 +393,7 @@ fn queryBool(query: []const u8, name: []const u8) error{InvalidBool}!bool {
     return error.InvalidBool;
 }
 
-fn grepRepo(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, query: []const u8) Error!http.Status {
+fn grepRepo(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, query: []const u8, access: Access) Error!http.Status {
     var q_buf: [max_grep_query]u8 = undefined;
     const q = api.queryValue(&q_buf, query, "q") orelse
         return api.respondError(request, .bad_request, "invalid_query", "q is required (1-512 bytes)");
@@ -380,7 +418,7 @@ fn grepRepo(app: *server.App, request: *http.Server.Request, repo: *const repo_g
         path = p;
     }
     var oid_buf: [64]u8 = undefined;
-    const commit = (try commitFromQuery(app, request, repo, query, &oid_buf)) orelse return .not_found;
+    const commit = (try commitFromQuery(app, request, repo, query, access, &oid_buf)) orelse return .not_found;
     const res = repo.grep(commit, q, .{
         .fixed = fixed,
         .ignore_case = ignore_case,
@@ -398,7 +436,7 @@ fn grepRepo(app: *server.App, request: *http.Server.Request, repo: *const repo_g
     });
 }
 
-fn readArchive(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, name: repo_name.Name, query: []const u8) Error!http.Status {
+fn readArchive(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, name: repo_name.Name, query: []const u8, access: Access) Error!http.Status {
     var fmt_buf: [16]u8 = undefined;
     const format: repo_git.Repo.ArchiveFormat = if (std.mem.find(u8, query, "format=") != null) blk: {
         const raw = api.queryValue(&fmt_buf, query, "format") orelse
@@ -417,7 +455,7 @@ fn readArchive(app: *server.App, request: *http.Server.Request, repo: *const rep
         path = p;
     }
     var oid_buf: [64]u8 = undefined;
-    const commit = (try commitFromQuery(app, request, repo, query, &oid_buf)) orelse return .not_found;
+    const commit = (try commitFromQuery(app, request, repo, query, access, &oid_buf)) orelse return .not_found;
     if (path) |p| {
         const entries = repo.lsTree(commit, p, true) catch |err| return gitError(request, err);
         defer entries.deinit(app.gpa);
@@ -526,6 +564,7 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
     } else if (body.from) |f| blk: {
         var full: [ref_name.max_len]u8 = undefined;
         const rev = revFromName(f, &full) orelse return api.respondError(request, .bad_request, "invalid_ref", "from must be a branch name, a full ref, or a commit oid");
+        if (!try checkReadableRev(request, rev, access)) return .forbidden;
         break :blk (repo.resolveCommit(rev, &parent_buf) catch |err| return gitError(request, err)) orelse
             return api.respondError(request, .not_found, "not_found", "from names no commit");
     } else null;
@@ -582,6 +621,7 @@ fn createBranch(app: *server.App, request: *http.Server.Request, repo: *const re
     if (ttlInvalid(parsed.value.ttl_seconds)) return api.respondError(request, .bad_request, "invalid_ttl", "ttl_seconds must be 1-604800");
     var full: [ref_name.max_len]u8 = undefined;
     const rev = revFromName(parsed.value.from, &full) orelse return api.respondError(request, .bad_request, "invalid_ref", "from must be a branch name, a full ref, or a commit oid");
+    if (!try checkReadableRev(request, rev, access)) return .forbidden;
     var oid_buf: [64]u8 = undefined;
     const commit = (repo.resolveCommit(rev, &oid_buf) catch |err| return gitError(request, err)) orelse
         return api.respondError(request, .not_found, "not_found", "from names no commit");
@@ -618,14 +658,15 @@ fn deleteBranch(app: *server.App, request: *http.Server.Request, repo: *const re
 // ---- Diff and merge ----
 
 /// Resolves a branch name, full ref, or oid to a commit; responds with
-/// 400/404 and returns null when it cannot.
-fn resolveNamed(request: *http.Server.Request, repo: *const repo_git.Repo, text: []const u8, what: []const u8, out: *[64]u8) Error!?[]const u8 {
+/// 400/403/404 and returns null when it cannot.
+fn resolveNamed(request: *http.Server.Request, repo: *const repo_git.Repo, text: []const u8, what: []const u8, access: Access, out: *[64]u8) Error!?[]const u8 {
     var full: [ref_name.max_len]u8 = undefined;
     const rev = revFromName(text, &full) orelse {
         var buf: [96]u8 = undefined;
         _ = try api.respondError(request, .bad_request, "invalid_ref", std.mem.print(&buf, "{s} must be a branch name, a full ref, or a commit oid", .{what}) catch "invalid ref");
         return null;
     };
+    if (!try checkReadableRev(request, rev, access)) return null;
     const commit = repo.resolveCommit(rev, out) catch |err| {
         _ = try gitError(request, err);
         return null;
@@ -637,14 +678,14 @@ fn resolveNamed(request: *http.Server.Request, repo: *const repo_git.Repo, text:
     };
 }
 
-fn compare(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, spec_raw: []const u8) Error!http.Status {
+fn compare(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, spec_raw: []const u8, access: Access) Error!http.Status {
     var spec_buf: [2 * ref_name.max_len + 8]u8 = undefined;
     const spec = api.percentDecode(&spec_buf, spec_raw, false) orelse return api.respondError(request, .bad_request, "invalid_ref", "compare/{base}...{head}");
     const sep = std.mem.find(u8, spec, "...") orelse return api.respondError(request, .bad_request, "invalid_ref", "compare/{base}...{head}");
     var base_buf: [64]u8 = undefined;
     var head_buf: [64]u8 = undefined;
-    const base = (try resolveNamed(request, repo, spec[0..sep], "base", &base_buf)) orelse return .not_found;
-    const head = (try resolveNamed(request, repo, spec[sep + 3 ..], "head", &head_buf)) orelse return .not_found;
+    const base = (try resolveNamed(request, repo, spec[0..sep], "base", access, &base_buf)) orelse return .not_found;
+    const head = (try resolveNamed(request, repo, spec[sep + 3 ..], "head", access, &head_buf)) orelse return .not_found;
 
     var mb_buf: [64]u8 = undefined;
     const merge_base = repo.mergeBase(base, head, &mb_buf) catch |err| return gitError(request, err);
@@ -699,8 +740,8 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
 
     var b_buf: [64]u8 = undefined;
     var h_buf: [64]u8 = undefined;
-    const base = (try resolveNamed(request, repo, body.base, "base", &b_buf)) orelse return .not_found;
-    const head = (try resolveNamed(request, repo, body.head, "head", &h_buf)) orelse return .not_found;
+    const base = (try resolveNamed(request, repo, body.base, "base", access, &b_buf)) orelse return .not_found;
+    const head = (try resolveNamed(request, repo, body.head, "head", access, &h_buf)) orelse return .not_found;
     if (body.expected_base_head) |e| {
         if (!std.mem.eql(u8, e, base)) return staleHead(app, request, repo, name, base_ref, e);
     }

@@ -16,6 +16,7 @@ export interface TokenOptions {
   scopes: Scope[];
   ttl_seconds?: number;
   refs?: string[];
+  read_refs?: string[];
   branch_ttl_seconds?: number;
 }
 

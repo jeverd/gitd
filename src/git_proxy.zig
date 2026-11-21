@@ -32,6 +32,8 @@ pub const CgiInput = struct {
     content_type: []const u8 = "",
     content_encoding: []const u8 = "",
     git_protocol: []const u8 = "",
+    /// Extra git config entries appended after `store.forced_config`.
+    git_config: []const [2][]const u8 = &.{},
 };
 
 pub const ProxyError = error{
@@ -90,6 +92,18 @@ pub fn serve(
 
     var env = try store_mod.gitEnv(gpa, store.path_env);
     defer env.deinit();
+    if (input.git_config.len > 0) {
+        var count_buf: [16]u8 = undefined;
+        const total = store_mod.forced_config_count + input.git_config.len;
+        try env.put("GIT_CONFIG_COUNT", std.mem.print(&count_buf, "{d}", .{total}) catch return error.ProxyFailed);
+        for (input.git_config, 0..) |kv, offset| {
+            const idx = store_mod.forced_config_count + offset;
+            var key_buf: [32]u8 = undefined;
+            var val_buf: [32]u8 = undefined;
+            try env.put(std.mem.print(&key_buf, "GIT_CONFIG_KEY_{d}", .{idx}) catch return error.ProxyFailed, kv[0]);
+            try env.put(std.mem.print(&val_buf, "GIT_CONFIG_VALUE_{d}", .{idx}) catch return error.ProxyFailed, kv[1]);
+        }
+    }
     var len_buf: [24]u8 = undefined;
     try env.put("GIT_PROJECT_ROOT", store.root);
     try env.put("GIT_HTTP_EXPORT_ALL", "1");
