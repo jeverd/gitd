@@ -137,6 +137,32 @@ class GitdClient:
     def unlock_branch(self, repo: str, name: str) -> None:
         self._request("DELETE", f"/v1/repos/{repo}/branches/{_encode_path(name)}/lock")
 
+    def create_rule(
+        self,
+        repo: str,
+        pattern: str,
+        *,
+        allow_direct_push: bool = True,
+        allow_force_push: bool = True,
+        allow_delete: bool = True,
+        required_merge_strategy: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "pattern": pattern,
+            "allow_direct_push": allow_direct_push,
+            "allow_force_push": allow_force_push,
+            "allow_delete": allow_delete,
+        }
+        if required_merge_strategy is not None:
+            body["required_merge_strategy"] = required_merge_strategy
+        return self._json("POST", f"/v1/repos/{repo}/rules", body)
+
+    def list_rules(self, repo: str) -> list[dict[str, Any]]:
+        return self._json("GET", f"/v1/repos/{repo}/rules")["rules"]
+
+    def delete_rule(self, repo: str, rule_id: int) -> None:
+        self._request("DELETE", f"/v1/repos/{repo}/rules/{rule_id}")
+
     # ---- Files, Trees, History ----
 
     def read_file(self, repo: str, path: str, *, ref: str | None = None) -> bytes:

@@ -242,4 +242,5 @@ test {
     _ = @import("expiry.zig");
     _ = @import("webhooks.zig");
     _ = @import("sync.zig");
+    _ = @import("rules.zig");
 }

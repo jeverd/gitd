@@ -33,6 +33,26 @@ export interface Branch {
   committed_at: number;
   subject: string;
   expires_at: number | null;
+  locked: boolean;
+  lock_reason: string | null;
+}
+
+export interface BranchRule {
+  id: number;
+  pattern: string;
+  allow_direct_push: boolean;
+  allow_force_push: boolean;
+  allow_delete: boolean;
+  required_merge_strategy: "merge" | "squash" | "fast-forward" | null;
+  created_at: number;
+}
+
+export interface CreateRuleOptions {
+  pattern: string;
+  allow_direct_push?: boolean;
+  allow_force_push?: boolean;
+  allow_delete?: boolean;
+  required_merge_strategy?: "merge" | "squash" | "fast-forward";
 }
 
 export interface TreeEntry {
@@ -322,6 +342,19 @@ export class GitdClient {
 
   async unlockBranch(repo: string, name: string): Promise<void> {
     await this.#request("DELETE", `/v1/repos/${repo}/branches/${encodePath(name)}/lock`);
+  }
+
+  createRule(repo: string, opts: CreateRuleOptions): Promise<BranchRule> {
+    return this.#json("POST", `/v1/repos/${repo}/rules`, opts);
+  }
+
+  async listRules(repo: string): Promise<BranchRule[]> {
+    const res = await this.#json<{ rules: BranchRule[] }>("GET", `/v1/repos/${repo}/rules`);
+    return res.rules;
+  }
+
+  async deleteRule(repo: string, id: number): Promise<void> {
+    await this.#request("DELETE", `/v1/repos/${repo}/rules/${id}`);
   }
 
   // ---- Files, Trees, History ----

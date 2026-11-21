@@ -143,6 +143,24 @@ test("TypeScript SDK end-to-end", async () => {
     const merged = await admin.merge(repoName, { base: "main", head: "agent/ts/work" });
     assert.equal(merged.result, "fast_forward");
 
+    // Branch lock visibility + protection rules
+    await admin.lockBranch(repoName, "main", "freeze");
+    const lockedList = await admin.listBranches(repoName);
+    const mainEntry = lockedList.find((b) => b.name === "main");
+    assert.equal(mainEntry?.locked, true);
+    assert.equal(mainEntry?.lock_reason, "freeze");
+    await admin.unlockBranch(repoName, "main");
+    const rule = await admin.createRule(repoName, {
+      pattern: "refs/heads/main",
+      allow_direct_push: false,
+      allow_force_push: false,
+      allow_delete: false,
+      required_merge_strategy: "squash",
+    });
+    assert.equal(rule.required_merge_strategy, "squash");
+    assert.equal((await admin.listRules(repoName)).length, 1);
+    await admin.deleteRule(repoName, rule.id);
+
     // Upstream sync (fetch from repoName into mirrorName)
     const { token: upToken } = await admin.createToken({
       repo: repoName,

@@ -140,6 +140,25 @@ class GitdSdkTest(unittest.TestCase):
         merged = admin.merge(repo, base="main", head="agent/py/work")
         self.assertEqual(merged["result"], "fast_forward")
 
+        # Branch lock visibility + protection rules
+        admin.lock_branch(repo, "main", reason="freeze")
+        branches = admin.list_branches(repo)
+        main_b = next(b for b in branches if b["name"] == "main")
+        self.assertTrue(main_b["locked"])
+        self.assertEqual(main_b["lock_reason"], "freeze")
+        admin.unlock_branch(repo, "main")
+        rule = admin.create_rule(
+            repo,
+            "refs/heads/main",
+            allow_direct_push=False,
+            allow_force_push=False,
+            allow_delete=False,
+            required_merge_strategy="squash",
+        )
+        self.assertEqual(rule["required_merge_strategy"], "squash")
+        self.assertEqual(len(admin.list_rules(repo)), 1)
+        admin.delete_rule(repo, rule["id"])
+
         # Sync fetch into mirror
         up_tok = admin.create_token(repo, ["git:read", "git:write"])["token"]
         fetched = admin.sync(

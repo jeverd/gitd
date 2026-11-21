@@ -66,7 +66,10 @@ All `/v1` routes need `Authorization: Bearer <admin key>`. Per-repo routes (`/v1
 | `DELETE /v1/repos/{ns}/{repo}` | Delete a repo and its files. Its tokens stop working |
 | `POST /v1/tokens` `{"repo","scopes","ttl_seconds","refs","read_refs","paths","branch_ttl_seconds"}` | Mint a repo token (returns `token`, `jti`, `expires_at`). `refs` limits writes, `read_refs` limits reads & `git clone`/`ls-remote` visibility, `paths` (e.g. `["docs/*","README.md"]`) limits API reads/writes to matching files. With `branch_ttl_seconds`, branches it creates expire after that long |
 | `POST /v1/tokens/{jti}/revoke` | Immediately revoke a minted token by its `jti` (admin key only) |
-| `GET /v1/repos/{ns}/{repo}/branches` | Branches with their commits |
+| `GET /v1/repos/{ns}/{repo}/branches` | Branches with their commits, expiry, and `locked` / `lock_reason` |
+| `POST /v1/repos/{ns}/{repo}/rules` `{"pattern","allow_direct_push","allow_force_push","allow_delete","required_merge_strategy"}` | Create a branch protection rule (admin key only; denies matching pushes, force pushes, deletes, or disallowed merge strategies) |
+| `GET /v1/repos/{ns}/{repo}/rules` | List branch protection rules (admin key only) |
+| `DELETE /v1/repos/{ns}/{repo}/rules/{id}` | Delete a branch protection rule (admin key only) |
 | `GET /v1/repos/{ns}/{repo}/files/{path}?ref=` | Raw file contents (up to 10 MiB) |
 | `GET /v1/repos/{ns}/{repo}/tree[/{path}]?ref=` | Directory listing |
 | `GET /v1/repos/{ns}/{repo}/log?ref=&limit=&path=` | Commits, newest first |

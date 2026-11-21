@@ -942,12 +942,75 @@ git -C "$LOCK_CLONE" push -q origin path/test 2>"$WORK/err" || fail "git push af
 pass "git push succeeds after unlock"
 expect_eq "lock events logged" "1 1" "$(count_events kind=branch_locked repo=acme/other) $(count_events kind=branch_unlocked repo=acme/other)"
 
+echo "== branch protection rules"
+expect_eq "GET branches shows unlocked main" "False None" "$(admin "$CB/branches" >/dev/null; python3 -c "import json; b=next(x for x in json.load(open('$WORK/body'))['branches'] if x['name']=='main'); print(b['locked'], b['lock_reason'])")"
+admin -X PUT "$CB/branches/path/test/lock" -d '{"reason":"inspect freeze"}' >/dev/null
+expect_eq "GET branches shows locked and reason" "True inspect freeze" "$(admin "$CB/branches" >/dev/null; python3 -c "import json; b=next(x for x in json.load(open('$WORK/body'))['branches'] if x['name']=='path/test'); print(b['locked'], b['lock_reason'])")"
+admin -X DELETE "$CB/branches/path/test/lock" >/dev/null
+
+admin -X POST "$BASE/v1/repos" -d '{"name":"acme/rules"}' >/dev/null
+RB="$BASE/v1/repos/acme/rules"
+RTOK="$(mint acme/rules '["git:read","git:write"]')"
+RCLONE="$WORK/rules-clone"
+git "${GIT_ID[@]}" init -q "$RCLONE"
+echo "init" >"$RCLONE/f.txt"; git -C "$RCLONE" add f.txt; git "${GIT_ID[@]}" -C "$RCLONE" commit -qm "seed rules"
+git -C "$RCLONE" push -q "$(url "$RTOK" acme/rules)" main 2>"$WORK/err" || fail "seeding acme/rules: $(cat "$WORK/err")"
+
+expect_eq "rules require admin key" 403 "$(status -H "authorization: Bearer $RTOK" "$RB/rules")"
+expect_eq "invalid rule pattern" 400 "$(admin -X POST "$RB/rules" -d '{"pattern":"main"}')"
+expect_eq "invalid merge strategy" 400 "$(admin -X POST "$RB/rules" -d '{"pattern":"refs/heads/main","required_merge_strategy":"rebase"}')"
+expect_eq "create main rule" 201 "$(admin -X POST "$RB/rules" -d '{"pattern":"refs/heads/main","allow_direct_push":false,"allow_force_push":false,"allow_delete":false,"required_merge_strategy":"squash"}')"
+MAIN_RULE_ID="$(json '["id"]')"
+expect_eq "create release rule" 201 "$(admin -X POST "$RB/rules" -d '{"pattern":"refs/heads/release/*","allow_direct_push":true,"allow_force_push":false,"allow_delete":false}')"
+expect_eq "list rules shows two" 2 "$(admin "$RB/rules" >/dev/null; json '["rules"].__len__()')"
+
+RHEAD="$(git -C "$RCLONE" rev-parse HEAD)"
+expect_eq "direct API commit blocked by rule" 403 "$(admin -X POST "$RB/commits" -d "$(commit_body main "\"$RHEAD\"" nope '[{"path":"f.txt","content":"x"}]')")"
+expect_eq "branch delete API blocked by rule" 403 "$(admin -X DELETE "$RB/branches/main")"
+
+echo "direct push" >"$RCLONE/f.txt"; git "${GIT_ID[@]}" -C "$RCLONE" commit -qam "direct"
+if git -C "$RCLONE" push "$(url "$RTOK" acme/rules)" main >"$WORK/rulepush.out" 2>&1; then fail "direct git push to protected main succeeded"; fi
+grep -q "branch rule forbids direct push" "$WORK/rulepush.out" || fail "missing rule message on direct git push: $(cat "$WORK/rulepush.out")"
+pass "git push blocked on protected main"
+if git -C "$RCLONE" push "$(url "$RTOK" acme/rules)" :refs/heads/main >"$WORK/ruledel.out" 2>&1; then fail "git delete on protected main succeeded"; fi
+grep -q "branch rule forbids deleting" "$WORK/ruledel.out" || fail "missing rule message on git delete: $(cat "$WORK/ruledel.out")"
+pass "git branch delete blocked on protected main"
+
+# Release branch allows fast-forward push, blocks force push and delete
+git -C "$RCLONE" reset -q --hard HEAD~1
+git -C "$RCLONE" push -q "$(url "$RTOK" acme/rules)" main:refs/heads/release/v1 2>"$WORK/err" || fail "initial release push: $(cat "$WORK/err")"
+echo "v1.1" >"$RCLONE/f.txt"; git "${GIT_ID[@]}" -C "$RCLONE" commit -qam "v1.1"
+git -C "$RCLONE" push -q "$(url "$RTOK" acme/rules)" main:refs/heads/release/v1 2>"$WORK/err" || fail "ff push to release: $(cat "$WORK/err")"
+pass "fast-forward git push allowed on release/*"
+git "${GIT_ID[@]}" -C "$RCLONE" commit --amend -qm "rewritten v1.1"
+if git -C "$RCLONE" push --force "$(url "$RTOK" acme/rules)" main:refs/heads/release/v1 >"$WORK/force.out" 2>&1; then fail "force push to release/* succeeded"; fi
+grep -qE "non-fast-forward|denied" "$WORK/force.out" || fail "missing non-ff rejection on force push: $(cat "$WORK/force.out")"
+pass "force push blocked on allow_force_push=false branch"
+if git -C "$RCLONE" push "$(url "$RTOK" acme/rules)" :refs/heads/release/v1 2>/dev/null; then fail "delete push to release/* succeeded"; fi
+pass "delete git push blocked on release/*"
+
+# Merge strategy enforcement on main
+expect_eq "feature branch commit" 201 "$(admin -X POST "$RB/commits" -d '{"branch":"feat/1","expected_head":null,"from":"main","message":"feat commit","changes":[{"path":"feat.txt","content":"feat\n"}]}')"
+expect_eq "disallowed merge strategy rejected" 403 "$(admin -X POST "$RB/merges" -d '{"base":"main","head":"feat/1","strategy":"merge"}')"
+expect_eq "required squash strategy allowed" 201 "$(admin -X POST "$RB/merges" -d '{"base":"main","head":"feat/1","strategy":"squash","message":"Squashed feat"}')"
+expect_eq "delete main rule" 204 "$(admin -X DELETE "$RB/rules/$MAIN_RULE_ID")"
+expect_eq "delete missing rule" 404 "$(admin -X DELETE "$RB/rules/$MAIN_RULE_ID")"
+expect_eq "rule events logged" "2 1 3" "$(count_events repo=acme/rules kind=rule_created) $(count_events repo=acme/rules kind=rule_deleted) $(count_events repo=acme/rules kind=rule_rejected)"
+
+# Deleting repo clears rules on recreate
+expect_eq "delete rules repo" 204 "$(admin -X DELETE "$RB")"
+expect_eq "recreate rules repo" 201 "$(admin -X POST "$BASE/v1/repos" -d '{"name":"acme/rules"}')"
+expect_eq "rules cleared after repo delete" 0 "$(admin "$RB/rules" >/dev/null; json '["rules"].__len__()')"
+expect_eq "delete temporary rules repo" 204 "$(admin -X DELETE "$RB")"
+
 echo "== SDKs (TypeScript and Python)"
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-if GITD_URL="$BASE" GITD_KEY="$KEY" python3 -m unittest discover -s "$ROOT_DIR/sdk/python" -p "test_*.py" >"$WORK/py-sdk.out" 2>&1; then
-  pass "Python SDK end-to-end"
-else
-  fail "Python SDK: $(cat "$WORK/py-sdk.out")"
+if [[ -d "$ROOT_DIR/sdk/python" ]]; then
+  if GITD_URL="$BASE" GITD_KEY="$KEY" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$ROOT_DIR/sdk/python" -p "test_*.py" >"$WORK/py-sdk.out" 2>&1; then
+    pass "Python SDK end-to-end"
+  else
+    fail "Python SDK: $(cat "$WORK/py-sdk.out")"
+  fi
 fi
 if command -v node >/dev/null && node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)'; then
   if GITD_URL="$BASE" GITD_KEY="$KEY" node --test "$ROOT_DIR/sdk/ts/test.ts" >"$WORK/ts-sdk.out" 2>&1; then

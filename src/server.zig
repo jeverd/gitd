@@ -27,6 +27,7 @@ const ui = @import("ui.zig");
 const content = @import("content.zig");
 const expiry = @import("expiry.zig");
 const webhooks = @import("webhooks.zig");
+const rules_mod = @import("rules.zig");
 const http_util = @import("http_util.zig");
 const keepAlive = http_util.keepAlive;
 
@@ -369,6 +370,7 @@ fn deleteRepo(app: *App, request: *http.Server.Request, name: repo_name.Name) Ha
     if (!deleted) return respondError(request, .not_found, "not_found", "no such repo");
     app.db.clearBranchTtl(io, name.full, "") catch |err| std.log.err("clearing expiries of {s}: {t}", .{ name.full, err });
     _ = app.db.unlockBranch(io, name.full, "") catch |err| std.log.err("clearing locks of {s}: {t}", .{ name.full, err });
+    app.db.deleteRepoBranchRules(io, name.full) catch |err| std.log.err("clearing rules of {s}: {t}", .{ name.full, err });
     _ = app.db.deleteWebhooks(io, name.full, 0) catch |err| std.log.err("deleting webhooks of {s}: {t}", .{ name.full, err });
     app.store.delete(io, name) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
@@ -537,6 +539,8 @@ fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route,
     // Read what a push will change before git runs (R2.2).
     var push: ?Push = null;
     defer if (push) |*p| p.deinit(app.gpa);
+    var deny_non_ff = false;
+    var deny_deletes = false;
     if (git_route.service == .receive_pack and git_route.kind == .rpc) {
         push = Push.read(app, body.?) catch |err| switch (err) {
             error.InvalidPush, error.TooManyCommands => return respondError(request, .bad_request, "bad_git_request", "could not read the push commands"),
@@ -548,13 +552,30 @@ fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route,
             const locked = app.db.isBranchLocked(app.io, repo_copy.full, cmd.ref) catch return internal(request);
             if (locked) return rejectLockedPush(app, request, &push.?, repo_copy);
         }
+        const repo_rules = app.db.listBranchRules(app.io, app.gpa, repo_copy.full) catch return internal(request);
+        defer Db.freeBranchRules(app.gpa, repo_rules);
+        for (push.?.commands) |cmd| {
+            const eff = rules_mod.evaluate(repo_rules, cmd.ref);
+            if (cmd.isDelete() and !eff.allow_delete) return rejectRulePush(app, request, &push.?, repo_rules, repo_copy);
+            if (!cmd.isDelete() and !eff.allow_direct_push) return rejectRulePush(app, request, &push.?, repo_rules, repo_copy);
+            if (!cmd.isDelete() and !eff.allow_force_push) deny_non_ff = true;
+            if (!eff.allow_delete) deny_deletes = true;
+        }
     }
 
     // Enforce read_refs on git smart HTTP via transfer.hideRefs (R2.1).
     var hide_buf: [auth.max_ref_patterns_bytes * 2 + 64]u8 = undefined;
     var hide_pos: usize = 0;
-    var git_cfg_buf: [16][2][]const u8 = undefined;
+    var git_cfg_buf: [20][2][]const u8 = undefined;
     var git_cfg_n: usize = 0;
+    if (deny_non_ff) {
+        git_cfg_buf[git_cfg_n] = .{ "receive.denyNonFastForwards", "true" };
+        git_cfg_n += 1;
+    }
+    if (deny_deletes) {
+        git_cfg_buf[git_cfg_n] = .{ "receive.denyDeletes", "true" };
+        git_cfg_n += 1;
+    }
     if (claims.isReadRefRestricted()) {
         git_cfg_buf[git_cfg_n] = .{ "uploadpack.allowAnySHA1InWant", "false" };
         git_cfg_n += 1;
@@ -662,6 +683,45 @@ fn rejectLockedPush(app: *App, request: *http.Server.Request, push: *const Push,
     var out: std.Io.Writer.Allocating = .init(app.gpa);
     defer out.deinit();
     receive_pack.writeRejection(&out.writer, push.caps, push.commands, reasons[0..push.commands.len], "gitd: push rejected: branch is locked") catch return internal(request);
+    try request.respond(out.written(), .{
+        .keep_alive = keepAlive(request),
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/x-git-receive-pack-result" },
+            .{ .name = "cache-control", .value = "no-cache" },
+        },
+    });
+    return .ok;
+}
+
+fn rejectRulePush(app: *App, request: *http.Server.Request, push: *const Push, repo_rules: []const Db.BranchRule, name: repo_name.Name) HandleError!http.Status {
+    const no_delete = "branch rule forbids deleting this branch";
+    const no_direct = "branch rule forbids direct push to this branch";
+    const other = "push refused: another ref in it violates a branch rule";
+    var reasons: [receive_pack.max_commands][]const u8 = undefined;
+    const now = unixNow(app.io);
+    for (push.commands, 0..) |cmd, i| {
+        const eff = rules_mod.evaluate(repo_rules, cmd.ref);
+        const bad_delete = cmd.isDelete() and !eff.allow_delete;
+        const bad_direct = !cmd.isDelete() and !eff.allow_direct_push;
+        reasons[i] = if (bad_delete) no_delete else if (bad_direct) no_direct else other;
+        if (bad_delete or bad_direct) {
+            events.record(app, .{
+                .repo = name.full,
+                .kind = "push_rejected",
+                .ref = cmd.ref,
+                .old = cmd.old,
+                .new = cmd.new,
+                .detail = reasons[i],
+                .created_at = now,
+            });
+        }
+    }
+    if (!receive_pack.hasCapability(push.caps, "report-status") and !receive_pack.hasCapability(push.caps, "report-status-v2")) {
+        return respondError(request, .forbidden, "rule_violation", "branch rule rejected push");
+    }
+    var out: std.Io.Writer.Allocating = .init(app.gpa);
+    defer out.deinit();
+    receive_pack.writeRejection(&out.writer, push.caps, push.commands, reasons[0..push.commands.len], "gitd: push rejected: branch rule violation") catch return internal(request);
     try request.respond(out.written(), .{
         .keep_alive = keepAlive(request),
         .extra_headers = &.{

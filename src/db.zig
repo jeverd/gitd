@@ -105,6 +105,17 @@ const schema =
     \\  locked_at INTEGER NOT NULL,
     \\  PRIMARY KEY (repo, ref)
     \\) STRICT;
+    \\CREATE TABLE IF NOT EXISTS branch_rules (
+    \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+    \\  repo TEXT NOT NULL,
+    \\  pattern TEXT NOT NULL,
+    \\  allow_direct_push INTEGER NOT NULL DEFAULT 1,
+    \\  allow_force_push INTEGER NOT NULL DEFAULT 1,
+    \\  allow_delete INTEGER NOT NULL DEFAULT 1,
+    \\  required_merge_strategy TEXT NOT NULL DEFAULT '',
+    \\  created_at INTEGER NOT NULL
+    \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS branch_rules_repo ON branch_rules (repo);
 ;
 
 pub const Db = struct {
@@ -643,6 +654,158 @@ pub const Db = struct {
         };
     }
 
+    pub const BranchLock = struct {
+        ref: []const u8,
+        reason: []const u8,
+        locked_at: i64,
+
+        pub fn deinit(l: BranchLock, gpa: std.mem.Allocator) void {
+            gpa.free(l.ref);
+            gpa.free(l.reason);
+        }
+    };
+
+    /// Every branch lock in `repo`, ordered by ref. Free with `freeBranchLocks`.
+    pub fn listBranchLocks(db: *Db, io: Io, gpa: std.mem.Allocator, repo: []const u8) Error![]BranchLock {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare("SELECT ref, reason, locked_at FROM branch_locks WHERE repo = ?1 ORDER BY ref");
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        var list: std.ArrayList(BranchLock) = .empty;
+        errdefer {
+            for (list.items) |l| l.deinit(gpa);
+            list.deinit(gpa);
+        }
+        while (true) switch (sqlite3_step(stmt)) {
+            SQLITE_ROW => {
+                const ref = try columnText(stmt, 0, gpa);
+                errdefer gpa.free(ref);
+                const reason = try columnText(stmt, 1, gpa);
+                errdefer gpa.free(reason);
+                try list.append(gpa, .{
+                    .ref = ref,
+                    .reason = reason,
+                    .locked_at = sqlite3_column_int64(stmt, 2),
+                });
+            },
+            SQLITE_DONE => break,
+            else => return db.fail("list branch locks"),
+        };
+        return list.toOwnedSlice(gpa);
+    }
+
+    pub fn freeBranchLocks(gpa: std.mem.Allocator, locks: []const BranchLock) void {
+        for (locks) |l| l.deinit(gpa);
+        gpa.free(locks);
+    }
+
+    pub const BranchRule = struct {
+        id: i64,
+        pattern: []const u8,
+        allow_direct_push: bool,
+        allow_force_push: bool,
+        allow_delete: bool,
+        required_merge_strategy: []const u8,
+        created_at: i64,
+
+        pub fn deinit(r: BranchRule, gpa: std.mem.Allocator) void {
+            gpa.free(r.pattern);
+            gpa.free(r.required_merge_strategy);
+        }
+    };
+
+    pub fn insertBranchRule(
+        db: *Db,
+        io: Io,
+        repo: []const u8,
+        pattern: []const u8,
+        allow_direct_push: bool,
+        allow_force_push: bool,
+        allow_delete: bool,
+        required_merge_strategy: []const u8,
+        created_at: i64,
+    ) Error!i64 {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare(
+            \\INSERT INTO branch_rules (repo, pattern, allow_direct_push, allow_force_push, allow_delete, required_merge_strategy, created_at)
+            \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        );
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        try db.bindText(stmt, 2, pattern);
+        try db.check(sqlite3_bind_int64(stmt, 3, @intFromBool(allow_direct_push)));
+        try db.check(sqlite3_bind_int64(stmt, 4, @intFromBool(allow_force_push)));
+        try db.check(sqlite3_bind_int64(stmt, 5, @intFromBool(allow_delete)));
+        try db.bindText(stmt, 6, required_merge_strategy);
+        try db.check(sqlite3_bind_int64(stmt, 7, created_at));
+        if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("insert branch rule");
+        return sqlite3_last_insert_rowid(db.handle);
+    }
+
+    /// Every protection rule in `repo`, oldest first. Free with `freeBranchRules`.
+    pub fn listBranchRules(db: *Db, io: Io, gpa: std.mem.Allocator, repo: []const u8) Error![]BranchRule {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare(
+            \\SELECT id, pattern, allow_direct_push, allow_force_push, allow_delete, required_merge_strategy, created_at
+            \\FROM branch_rules WHERE repo = ?1 ORDER BY id
+        );
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        var list: std.ArrayList(BranchRule) = .empty;
+        errdefer {
+            for (list.items) |r| r.deinit(gpa);
+            list.deinit(gpa);
+        }
+        while (true) switch (sqlite3_step(stmt)) {
+            SQLITE_ROW => {
+                const pattern = try columnText(stmt, 1, gpa);
+                errdefer gpa.free(pattern);
+                const strat = try columnText(stmt, 5, gpa);
+                errdefer gpa.free(strat);
+                try list.append(gpa, .{
+                    .id = sqlite3_column_int64(stmt, 0),
+                    .pattern = pattern,
+                    .allow_direct_push = sqlite3_column_int64(stmt, 2) != 0,
+                    .allow_force_push = sqlite3_column_int64(stmt, 3) != 0,
+                    .allow_delete = sqlite3_column_int64(stmt, 4) != 0,
+                    .required_merge_strategy = strat,
+                    .created_at = sqlite3_column_int64(stmt, 6),
+                });
+            },
+            SQLITE_DONE => break,
+            else => return db.fail("list branch rules"),
+        };
+        return list.toOwnedSlice(gpa);
+    }
+
+    pub fn freeBranchRules(gpa: std.mem.Allocator, rules: []const BranchRule) void {
+        for (rules) |r| r.deinit(gpa);
+        gpa.free(rules);
+    }
+
+    pub fn deleteBranchRule(db: *Db, io: Io, repo: []const u8, id: i64) Error!bool {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare("DELETE FROM branch_rules WHERE repo = ?1 AND id = ?2");
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        try db.check(sqlite3_bind_int64(stmt, 2, id));
+        if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("delete branch rule");
+        return sqlite3_changes(db.handle) > 0;
+    }
+
+    pub fn deleteRepoBranchRules(db: *Db, io: Io, repo: []const u8) Error!void {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare("DELETE FROM branch_rules WHERE repo = ?1");
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("delete repo branch rules");
+    }
+
     pub const BranchTtl = struct {
         repo: []const u8,
         repo_id: []const u8,
@@ -906,4 +1069,51 @@ fn listEventsAndFree(gpa: std.mem.Allocator, db: *Db, io: Io) !void {
 fn listAndFree(gpa: std.mem.Allocator, db: *Db, io: Io) !void {
     const repos = try db.listRepos(io, gpa);
     Db.freeRepos(gpa, repos);
+}
+
+test "branch locks and branch rules round-trip" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var db: Db = try .open(":memory:");
+    defer db.close();
+
+    try db.lockBranch(io, "a/b", "refs/heads/main", "release freeze", 100);
+    const locks = try db.listBranchLocks(io, gpa, "a/b");
+    defer Db.freeBranchLocks(gpa, locks);
+    try std.testing.expectEqual(@as(usize, 1), locks.len);
+    try std.testing.expectEqualStrings("refs/heads/main", locks[0].ref);
+    try std.testing.expectEqualStrings("release freeze", locks[0].reason);
+    try std.testing.checkAllAllocationFailures(gpa, listLocksAndFree, .{ &db, io });
+
+    const r1 = try db.insertBranchRule(io, "a/b", "refs/heads/main", false, false, false, "squash", 10);
+    const r2 = try db.insertBranchRule(io, "a/b", "refs/heads/release/*", true, false, false, "", 11);
+    _ = try db.insertBranchRule(io, "a/c", "refs/heads/main", false, false, false, "merge", 12);
+
+    const rules = try db.listBranchRules(io, gpa, "a/b");
+    defer Db.freeBranchRules(gpa, rules);
+    try std.testing.expectEqual(@as(usize, 2), rules.len);
+    try std.testing.expectEqual(r1, rules[0].id);
+    try std.testing.expect(!rules[0].allow_direct_push);
+    try std.testing.expect(!rules[0].allow_force_push);
+    try std.testing.expect(!rules[0].allow_delete);
+    try std.testing.expectEqualStrings("squash", rules[0].required_merge_strategy);
+    try std.testing.expectEqual(r2, rules[1].id);
+    try std.testing.expect(rules[1].allow_direct_push);
+
+    try std.testing.expect(!try db.deleteBranchRule(io, "a/c", r1));
+    try std.testing.expect(try db.deleteBranchRule(io, "a/b", r1));
+    try std.testing.expect(!try db.deleteBranchRule(io, "a/b", r1));
+    try db.deleteRepoBranchRules(io, "a/b");
+    const empty = try db.listBranchRules(io, gpa, "a/b");
+    defer Db.freeBranchRules(gpa, empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    try std.testing.checkAllAllocationFailures(gpa, listRulesAndFree, .{ &db, io });
+}
+
+fn listLocksAndFree(gpa: std.mem.Allocator, db: *Db, io: Io) !void {
+    Db.freeBranchLocks(gpa, try db.listBranchLocks(io, gpa, "a/b"));
+}
+
+fn listRulesAndFree(gpa: std.mem.Allocator, db: *Db, io: Io) !void {
+    Db.freeBranchRules(gpa, try db.listBranchRules(io, gpa, "a/c"));
 }
