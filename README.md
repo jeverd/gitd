@@ -6,7 +6,7 @@ Status: MVP complete. Every feature below works end to end; `tests/demo/agents.s
 
 ## Quick start
 
-Needs Zig 0.17.1 and git. SQLite comes with macOS (on Linux, install `libsqlite3-dev`).
+Needs Zig 0.17.1, git, and `libgit2` (on macOS, `brew install libgit2`; on Linux, `libsqlite3-dev libgit2-dev pkg-config`). SQLite comes with macOS.
 
 ```sh
 zig build

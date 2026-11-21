@@ -8,7 +8,7 @@
 # makes one and writes it to /data/admin-key (mode 0600). See docker/entrypoint.sh.
 FROM debian:bookworm-slim AS build
 ARG ZIG_VERSION=0.17.1
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils libsqlite3-dev \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils libsqlite3-dev libgit2-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 RUN arch="$(uname -m)" \
     && curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${arch}-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz \
@@ -19,7 +19,7 @@ COPY src ./src
 RUN /opt/zig/zig build -Doptimize=ReleaseSafe
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends git libsqlite3-0 ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends git libsqlite3-0 libgit2-1.5 ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home-dir /data gitd && mkdir /data && chown gitd /data
 COPY --from=build /src/zig-out/bin/gitd /usr/local/bin/gitd

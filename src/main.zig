@@ -6,6 +6,7 @@ const auth = @import("auth.zig");
 const Db = @import("db.zig").Db;
 const store = @import("store.zig");
 const server = @import("server.zig");
+const git2 = @import("git2.zig");
 
 const usage =
     \\usage:
@@ -212,6 +213,11 @@ fn serve(init: std.process.Init, opts: Options) !u8 {
 
     const data = try store.DataDir.prepare(io, arena, opts.data_dir);
     try data.clearTmp(io);
+    git2.init() catch |err| {
+        std.log.err("initializing libgit2: {t}", .{err});
+        return 1;
+    };
+    defer git2.deinit();
     const secret = try auth.loadSecret(io, data.secret);
     var db: Db = try .open(data.db);
     defer db.close();
@@ -272,6 +278,7 @@ test {
     _ = @import("timed_stream.zig");
     _ = @import("http_util.zig");
     _ = @import("git_cmd.zig");
+    _ = @import("git2.zig");
     _ = @import("ref_name.zig");
     _ = @import("receive_pack.zig");
     _ = @import("repo_git.zig");
