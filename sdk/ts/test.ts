@@ -243,6 +243,24 @@ test("TypeScript SDK end-to-end", async () => {
     const gcRes = await admin.gc(repoName, { prune_seconds: 0 });
     assert.ok(gcRes.after_bytes > 0);
 
+    // Filtered events history + live SSE stream
+    const history = await agent.listEvents(repoName, { limit: 200 });
+    assert.ok(history.events.length > 0);
+    const ac = new AbortController();
+    const seen: string[] = [];
+    const streamTask = (async () => {
+      for await (const ev of agent.streamEvents(repoName, { after: history.next_after, signal: ac.signal })) {
+        seen.push(ev.kind);
+        if (ev.kind === "check_updated") {
+          ac.abort();
+          break;
+        }
+      }
+    })();
+    await checker.postCheck(repoName, c1Info.commit, { name: "sse-smoke", status: "passed" });
+    await streamTask;
+    assert.ok(seen.includes("check_updated"));
+
     await admin.deleteRepo(mirrorName);
     await admin.deleteRepo(repoName);
   } finally {

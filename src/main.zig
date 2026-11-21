@@ -26,6 +26,8 @@ const usage =
     \\  env GITD_GC_INTERVAL_SECONDS: background GC check interval, 0 = off (default 300)
     \\  env GITD_GC_PRUNE_SECONDS: unreferenced object grace period (default 300)
     \\  env GITD_GC_EXPIRED_THRESHOLD: expired branches before auto GC (default 20)
+    \\  env GITD_SSE_KEEPALIVE_MS: SSE keepalive comment interval in ms (default 15000)
+    \\  env GITD_SSE_MAX_SECONDS: max lifetime of one SSE stream in s (default 300)
     \\
 ;
 
@@ -200,6 +202,13 @@ fn serve(init: std.process.Init, opts: Options) !u8 {
     const gc_interval_seconds: u32 = @intCast(boundedU64FromEnv(init, "GITD_GC_INTERVAL_SECONDS", 300, 86_400) orelse return 2);
     const gc_prune_seconds: u32 = @intCast(boundedU64FromEnv(init, "GITD_GC_PRUNE_SECONDS", 300, 604_800) orelse return 2);
     const gc_expired_threshold: u32 = @intCast(boundedU64FromEnv(init, "GITD_GC_EXPIRED_THRESHOLD", 20, 100_000) orelse return 2);
+    const sse_keepalive_raw = msFromEnv(init, "GITD_SSE_KEEPALIVE_MS", 15_000) orelse return 2;
+    if (sse_keepalive_raw < 50 or sse_keepalive_raw > 60_000) {
+        std.log.err("GITD_SSE_KEEPALIVE_MS must be between 50 and 60000", .{});
+        return 2;
+    }
+    const sse_keepalive_ms: u32 = @intCast(sse_keepalive_raw);
+    const sse_max_seconds: u32 = secondsFromEnv(init, "GITD_SSE_MAX_SECONDS", 300) orelse return 2;
 
     const data = try store.DataDir.prepare(io, arena, opts.data_dir);
     try data.clearTmp(io);
@@ -228,6 +237,8 @@ fn serve(init: std.process.Init, opts: Options) !u8 {
         .gc_interval_seconds = gc_interval_seconds,
         .gc_prune_seconds = gc_prune_seconds,
         .gc_expired_threshold = gc_expired_threshold,
+        .sse_keepalive_ms = sse_keepalive_ms,
+        .sse_max_seconds = sse_max_seconds,
     };
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
@@ -242,6 +253,7 @@ fn serve(init: std.process.Init, opts: Options) !u8 {
     }
     std.log.info("stopping (signal {d})", .{signal});
     defer app.maint.deinit(init.gpa);
+    defer app.event_hub.deinit(init.gpa);
     defer app.peers.deinit(init.gpa);
     // The loop only ends by cancellation, so its result is always
     // error.Canceled and carries nothing to report.

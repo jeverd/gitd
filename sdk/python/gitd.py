@@ -6,7 +6,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 
 class GitdError(Exception):
@@ -409,3 +409,80 @@ class GitdClient:
     def gc(self, repo: str, *, prune_seconds: int | None = None) -> dict[str, Any]:
         body = {"prune_seconds": prune_seconds} if prune_seconds is not None else None
         return self._json("POST", f"/v1/repos/{repo}/gc", body)
+
+    # ---- Events & Live SSE Stream ----
+
+    def list_events(
+        self,
+        repo: str,
+        *,
+        after: int | None = None,
+        kind: str | None = None,
+        ref: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, str] = {}
+        if after is not None:
+            params["after"] = str(after)
+        if kind is not None:
+            params["kind"] = kind
+        if ref is not None:
+            params["ref"] = ref
+        if limit is not None:
+            params["limit"] = str(limit)
+        qs = urllib.parse.urlencode(params)
+        return self._json("GET", f"/v1/repos/{repo}/events{f'?{qs}' if qs else ''}")
+
+    def stream_events(
+        self,
+        repo: str,
+        *,
+        after: int | None = None,
+        kind: str | None = None,
+        ref: str | None = None,
+        timeout: float = 30.0,
+    ) -> Iterator[dict[str, Any]]:
+        params: dict[str, str] = {"stream": "1"}
+        if after is not None:
+            params["after"] = str(after)
+        if kind is not None:
+            params["kind"] = kind
+        if ref is not None:
+            params["ref"] = ref
+        req = urllib.request.Request(
+            f"{self.base_url}/v1/repos/{repo}/events?{urllib.parse.urlencode(params)}",
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Accept": "text/event-stream",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data_lines: list[str] = []
+                while True:
+                    raw = resp.readline()
+                    if not raw:
+                        break
+                    line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if line == "":
+                        if data_lines:
+                            payload = "\n".join(data_lines)
+                            data_lines.clear()
+                            yield json.loads(payload)
+                    elif line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+        except urllib.error.HTTPError as exc:
+            raw_err = exc.read()
+            parsed: dict[str, Any] = {}
+            try:
+                parsed = json.loads(raw_err.decode("utf-8"))
+            except Exception:
+                pass
+            err_obj = parsed.get("error") if isinstance(parsed.get("error"), dict) else {}
+            raise GitdError(
+                exc.code,
+                str(err_obj.get("code", f"http_{exc.code}")),
+                str(err_obj.get("message", exc.reason)),
+                parsed,
+            ) from None

@@ -26,6 +26,7 @@
 //! /ui/api/repos/{ns}/{repo}/.
 
 const std = @import("std");
+const Io = std.Io;
 const http = std.http;
 const api = @import("api.zig");
 const auth = @import("auth.zig");
@@ -60,6 +61,7 @@ pub const Access = struct {
     read_only: bool = false,
     /// The repo's id, for anything stored against it.
     repo_id: []const u8,
+    peer: Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } },
 
     /// Whether this caller may write anything at all.
     pub fn canWriteAny(a: Access) bool {
@@ -146,6 +148,9 @@ pub fn serve(
     }
     if (std.mem.eql(u8, rest, "rules") or std.mem.startsWith(u8, rest, "rules/")) {
         return rules.serveApi(app, request, name, rest, access);
+    }
+    if (std.mem.eql(u8, rest, "events")) {
+        return events.serveApi(app, request, name, query, access);
     }
     const repo = repo_git.Repo.open(app.io, app.gpa, app.store, name) catch return api.internal(request);
     if (std.mem.eql(u8, rest, "quotas") or std.mem.eql(u8, rest, "stats") or std.mem.eql(u8, rest, "gc")) {

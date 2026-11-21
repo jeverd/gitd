@@ -44,7 +44,7 @@ src/
   timed_stream.zig  socket reader and writer with per-operation timeouts
   http_util.zig     keep-alive rules and the per-address connection cap
   api.zig           shared handler helpers: JSON bodies, errors, headers, clock
-  events.zig        the activity log (pushes, rejections, merges, ...)
+  events.zig        the activity log and live SSE event stream (`GET /events`)
   ui.zig, ui.html   read-only activity page at /ui (`serve --ui`, loopback only)
   git_cmd.zig       runs one git plumbing command safely, with bounded output
   repo_git.zig      repo operations built on git plumbing (branches, refs, ...)

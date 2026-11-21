@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -239,6 +240,19 @@ class GitdSdkTest(unittest.TestCase):
         self.assertGreater(stats["disk_bytes"], 0)
         gc_res = admin.gc(repo, prune_seconds=0)
         self.assertGreater(gc_res["after_bytes"], 0)
+
+        # Filtered events history + live SSE stream
+        history = agent.list_events(repo, limit=200)
+        self.assertGreater(len(history["events"]), 0)
+        stream = agent.stream_events(repo, after=history["next_after"], timeout=10.0)
+        t = threading.Timer(0.2, lambda: checker.post_check(repo, c1_sha, name="py-sse", status="passed"))
+        t.start()
+        try:
+            ev = next(stream)
+            self.assertEqual(ev["kind"], "check_updated")
+        finally:
+            stream.close()
+            t.join(timeout=5.0)
 
         admin.delete_repo(mirror)
         admin.delete_repo(repo)

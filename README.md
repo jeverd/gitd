@@ -91,6 +91,7 @@ All `/v1` routes need `Authorization: Bearer <admin key>`. Per-repo routes (`/v1
 | `PUT /v1/repos/{ns}/{repo}/quotas` `{"max_branches","max_repo_bytes"}` | Set per-repo quotas; `0` falls back to server defaults (admin key only) |
 | `GET /v1/repos/{ns}/{repo}/stats` | Repo branch count, disk usage, object counts, and maintenance state (admin key only) |
 | `POST /v1/repos/{ns}/{repo}/gc` `{"prune_seconds"}` | Run safe garbage collection/repack on the repo and return reclaimed bytes (admin key only) |
+| `GET /v1/repos/{ns}/{repo}/events` | Filterable repo event history (`?after=&kind=&ref=&limit=`) or live SSE stream (`?stream=1` / `Accept: text/event-stream`, resumes via `Last-Event-ID`; `git:read`) |
 | `POST /v1/repos/{ns}/{repo}/webhooks` `{"url"}` | Add a webhook (admin key only). The response has the signing `secret`, shown once |
 | `GET /v1/repos/{ns}/{repo}/webhooks` | List webhooks (no secrets) |
 | `DELETE /v1/repos/{ns}/{repo}/webhooks/{id}` | Remove a webhook and its queued deliveries |

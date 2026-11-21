@@ -61,6 +61,7 @@ const schema =
     \\  detail TEXT NOT NULL DEFAULT '',
     \\  created_at INTEGER NOT NULL
     \\) STRICT;
+    \\CREATE INDEX IF NOT EXISTS events_repo_id ON events (repo, id);
     \\CREATE TABLE IF NOT EXISTS branch_ttls (
     \\  repo TEXT NOT NULL,
     \\  repo_id TEXT NOT NULL,
@@ -596,6 +597,50 @@ pub const Db = struct {
     pub fn freeEvents(gpa: std.mem.Allocator, events: []const Event) void {
         for (events) |e| e.deinit(gpa);
         gpa.free(events);
+    }
+
+    /// Events in `repo` with id > `after`, optionally filtered by `kind` and
+    /// `ref`, oldest first, at most `limit`. Free with `freeEvents`.
+    pub fn listRepoEventsFiltered(
+        db: *Db,
+        io: Io,
+        gpa: std.mem.Allocator,
+        repo: []const u8,
+        after: i64,
+        kind: []const u8,
+        ref: []const u8,
+        limit: u32,
+    ) Error![]Event {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare(
+            \\SELECT id, repo, kind, ref, old, new, detail, created_at FROM events
+            \\WHERE repo = ?1 AND id > ?2 AND (?3 = '' OR kind = ?3) AND (?4 = '' OR ref = ?4)
+            \\ORDER BY id LIMIT ?5
+        );
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        try db.check(sqlite3_bind_int64(stmt, 2, after));
+        try db.bindText(stmt, 3, kind);
+        try db.bindText(stmt, 4, ref);
+        try db.check(sqlite3_bind_int64(stmt, 5, limit));
+        var list: std.ArrayList(Event) = .empty;
+        errdefer {
+            for (list.items) |e| e.deinit(gpa);
+            list.deinit(gpa);
+        }
+        while (true) switch (sqlite3_step(stmt)) {
+            SQLITE_ROW => {
+                const event = try readEvent(stmt, gpa);
+                list.append(gpa, event) catch |err| {
+                    event.deinit(gpa);
+                    return err;
+                };
+            },
+            SQLITE_DONE => break,
+            else => return db.fail("list repo events filtered"),
+        };
+        return list.toOwnedSlice(gpa);
     }
 
     /// Sets (or replaces) when a branch expires. `repo_id` ties the expiry
@@ -1542,4 +1587,32 @@ test "commit checks round-trip and branch_rules schema upgrade" {
 
 fn listChecksAndFree(gpa: std.mem.Allocator, db: *Db, io: Io) !void {
     Db.freeCommitChecks(gpa, try db.listCommitChecks(io, gpa, "a/b", "sha1"));
+}
+
+test "filtered repo events round-trip" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var db: Db = try .open(":memory:");
+    defer db.close();
+
+    const id1 = try db.insertEvent(io, .{ .repo = "a/b", .kind = "commit", .ref = "refs/heads/main", .new = "sha1", .created_at = 1 });
+    _ = try db.insertEvent(io, .{ .repo = "a/b", .kind = "check_updated", .ref = "sha1", .new = "sha1", .detail = "tests: passed", .created_at = 2 });
+    _ = try db.insertEvent(io, .{ .repo = "a/b", .kind = "commit", .ref = "refs/heads/dev", .new = "sha2", .created_at = 3 });
+    _ = try db.insertEvent(io, .{ .repo = "c/d", .kind = "commit", .ref = "refs/heads/main", .new = "sha3", .created_at = 4 });
+
+    const by_kind = try db.listRepoEventsFiltered(io, gpa, "a/b", id1, "commit", "", 10);
+    defer Db.freeEvents(gpa, by_kind);
+    try std.testing.expectEqual(@as(usize, 1), by_kind.len);
+    try std.testing.expectEqualStrings("refs/heads/dev", by_kind[0].ref);
+
+    const by_ref = try db.listRepoEventsFiltered(io, gpa, "a/b", 0, "", "refs/heads/main", 10);
+    defer Db.freeEvents(gpa, by_ref);
+    try std.testing.expectEqual(@as(usize, 1), by_ref.len);
+    try std.testing.expectEqual(id1, by_ref[0].id);
+
+    try std.testing.checkAllAllocationFailures(gpa, listFilteredEventsAndFree, .{ &db, io });
+}
+
+fn listFilteredEventsAndFree(gpa: std.mem.Allocator, db: *Db, io: Io) !void {
+    Db.freeEvents(gpa, try db.listRepoEventsFiltered(io, gpa, "a/b", 0, "", "", 10));
 }
