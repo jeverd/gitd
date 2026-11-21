@@ -1163,6 +1163,49 @@ pass "ui exposes commit check badges on branch heads"
 expect_eq "merge succeeds after SHA2 checks pass" 201 "$(admin -X POST "$CB/merges" -d '{"base":"main","head":"agent/work","strategy":"squash"}')"
 expect_eq "delete checks repo" 204 "$(admin -X DELETE "$CB")"
 
+echo "== surgical patch and edit commits"
+admin -X POST "$BASE/v1/repos" -d '{"name":"acme/patch"}' >/dev/null
+PB="$BASE/v1/repos/acme/patch"
+P_DOCS_TOK="$(mint acme/patch '["git:read","git:write"]' 900)"
+expect_eq "seed patch main" 201 "$(admin -X POST "$PB/commits" -d '{"branch":"main","expected_head":null,"message":"seed","changes":[{"path":"code.py","content":"l1\nval = 10\nl3\nother = 1\nl5\nother = 2\n"},{"path":"secret.txt","content":"keep\n"}]}')"
+P_BASE="$(admin "$PB/branches" >/dev/null; python3 -c "import json; print(next(b['commit'] for b in json.load(open('$WORK/body'))['branches'] if b['name']=='main'))")"
+
+# Surgical edits change target while leaving surrounding lines intact
+P_BODY_EDIT="{\"branch\":\"agent/patch\",\"expected_head\":null,\"from\":\"main\",\"message\":\"edit code.py\",\"changes\":[{\"path\":\"code.py\",\"edits\":[{\"old\":\"val = 10\",\"new\":\"val = 42\"}]}]}"
+expect_eq "surgical multi-edit commit" 201 "$(admin -X POST "$PB/commits" -d "$P_BODY_EDIT")"
+expect_eq "read patched code.py" 200 "$(admin "$PB/files/code.py?ref=agent/patch")"
+expect_eq "patched file preserves surrounding lines" $'l1\nval = 42\nl3\nother = 1\nl5\nother = 2\nx' "$(cat "$WORK/body"; echo x)"
+P_H1="$(admin "$PB/branches" >/dev/null; python3 -c "import json; print(next(b['commit'] for b in json.load(open('$WORK/body'))['branches'] if b['name']=='agent/patch'))")"
+
+# Unified diff patch commit
+P_BODY_DIFF="{\"branch\":\"agent/patch\",\"expected_head\":\"$P_H1\",\"message\":\"diff code.py\",\"changes\":[{\"path\":\"code.py\",\"patch\":\"--- a/code.py\\n+++ b/code.py\\n@@ -1,3 +1,3 @@\\n l1\\n-val = 42\\n+val = 99\\n l3\\n\"}]}"
+expect_eq "unified diff patch commit" 201 "$(admin -X POST "$PB/commits" -d "$P_BODY_DIFF")"
+P_H2="$(json '["sha"]')"
+expect_eq "read diffed code.py" 200 "$(admin "$PB/files/code.py?ref=$P_H2")"
+expect_eq "diff applied cleanly" $'l1\nval = 99\nl3\nother = 1\nl5\nother = 2\nx' "$(cat "$WORK/body"; echo x)"
+
+# Missing/ambiguous/hunk mismatch -> 422 patch_failed without moving branch
+P_BAD_MISS="{\"branch\":\"agent/patch\",\"expected_head\":\"$P_H2\",\"message\":\"bad\",\"changes\":[{\"path\":\"code.py\",\"edits\":[{\"old\":\"nope\",\"new\":\"y\"}]}]}"
+expect_eq "missing old returns 422" 422 "$(admin -X POST "$PB/commits" -d "$P_BAD_MISS")"
+P_BAD_AMBIG="{\"branch\":\"agent/patch\",\"expected_head\":\"$P_H2\",\"message\":\"ambig\",\"changes\":[{\"path\":\"code.py\",\"edits\":[{\"old\":\"other\",\"new\":\"x\"}]}]}"
+expect_eq "ambiguous old returns 422" 422 "$(admin -X POST "$PB/commits" -d "$P_BAD_AMBIG")"
+P_BAD_HUNK="{\"branch\":\"agent/patch\",\"expected_head\":\"$P_H2\",\"message\":\"stale diff\",\"changes\":[{\"path\":\"code.py\",\"patch\":\"@@ -1,2 +1,2 @@\\n l1\\n-wrong\\n+x\\n\"}]}"
+expect_eq "stale diff hunk returns 422" 422 "$(admin -X POST "$PB/commits" -d "$P_BAD_HUNK")"
+P_STALE="{\"branch\":\"agent/patch\",\"expected_head\":\"$P_H1\",\"message\":\"cas race\",\"changes\":[{\"path\":\"code.py\",\"edits\":[{\"old\":\"val = 42\",\"new\":\"val = 77\"}]}]}"
+expect_eq "stale expected_head returns 409" 409 "$(admin -X POST "$PB/commits" -d "$P_STALE")"
+
+# Disk quota enforces post-patch file size
+expect_eq "set tiny disk quota for patch test" 200 "$(admin -X PUT "$PB/quotas" -d '{"max_branches":10,"max_repo_bytes":100}')"
+P_BIG="{\"branch\":\"agent/patch\",\"expected_head\":\"$P_H2\",\"message\":\"over quota\",\"changes\":[{\"path\":\"code.py\",\"edits\":[{\"old\":\"l1\",\"new\":\"$(python3 -c "print('Z'*200)")\"}]}]}"
+expect_eq "patch over disk quota returns 413" 413 "$(admin -X POST "$PB/commits" -d "$P_BIG")"
+
+# Path-restricted token cannot patch excluded path
+P_PATH_TOK="$(admin -X POST "$BASE/v1/tokens" -d '{"repo":"acme/patch","scopes":["git:read","git:write"],"paths":["code.py"]}' >/dev/null; json '["token"]')"
+P_ACL="{\"branch\":\"agent/patch\",\"expected_head\":\"$P_H2\",\"message\":\"acl\",\"changes\":[{\"path\":\"secret.txt\",\"edits\":[{\"old\":\"keep\",\"new\":\"hack\"}]}]}"
+expect_eq "path ACL blocks patch to secret.txt" 403 "$(status -H "authorization: Bearer $P_PATH_TOK" -X POST "$PB/commits" -d "$P_ACL")"
+expect_eq "patch branch stayed at P_H2" "$P_H2" "$(admin "$PB/branches" >/dev/null; python3 -c "import json; print(next(b['commit'] for b in json.load(open('$WORK/body'))['branches'] if b['name']=='agent/patch'))")"
+expect_eq "delete patch repo" 204 "$(admin -X DELETE "$PB")"
+
 echo "== SDKs (TypeScript and Python)"
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 if [[ -d "$ROOT_DIR/sdk/python" ]]; then

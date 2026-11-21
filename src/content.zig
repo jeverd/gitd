@@ -645,12 +645,33 @@ fn checkWriteGate(
     return null;
 }
 
+fn patchErrorMessage(err: @import("patch.zig").ApplyError) []const u8 {
+    return switch (err) {
+        error.TooManyEdits => "too many edits on one file (max 64)",
+        error.EmptyOld => "edit old text must not be empty",
+        error.EditNotFound => "edit old text was not found in the file",
+        error.EditAmbiguous => "edit old text matched multiple places; add more context or set replace_all",
+        error.InvalidPatch => "patch is not a valid unified diff",
+        error.HunkMismatch => "patch hunk did not match the current file contents",
+        error.OutputTooLarge => "patched file exceeds 10 MiB limit",
+        error.OutOfMemory => "out of memory",
+    };
+}
+
 fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, name: repo_name.Name, access: Access) Error!http.Status {
+    const patch_mod = @import("patch.zig");
+    const EditJson = struct {
+        old: []const u8,
+        new: []const u8,
+        replace_all: bool = false,
+    };
     const ChangeJson = struct {
         path: []const u8,
         content: ?[]const u8 = null,
         content_base64: ?[]const u8 = null,
         delete: bool = false,
+        edits: ?[]const EditJson = null,
+        patch: ?[]const u8 = null,
     };
     const Body = struct {
         branch: []const u8,
@@ -686,22 +707,74 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
         break :blk .{ .name = a.name, .email = a.email };
     } else .{ .name = "gitd agent", .email = "agent@gitd" };
 
+    for (body.changes) |c| {
+        repo_path.validate(c.path) catch return api.respondError(request, .bad_request, "invalid_path", "a change has an invalid path");
+        if (!access.canAccessPath(c.path)) return api.respondError(request, .forbidden, "forbidden", "this token may not modify that path");
+        const given = @as(u8, @intFromBool(c.content != null)) +
+            @intFromBool(c.content_base64 != null) +
+            @intFromBool(c.delete) +
+            @intFromBool(c.edits != null) +
+            @intFromBool(c.patch != null);
+        if (given != 1) return api.respondError(request, .bad_request, "invalid_changes", "each change needs exactly one of content, content_base64, delete, edits, or patch");
+        if (c.edits) |ed| {
+            if (ed.len == 0 or ed.len > patch_mod.max_edits_per_file) {
+                return api.respondError(request, .bad_request, "invalid_changes", "edits must contain 1-64 edits");
+            }
+        }
+    }
+
+    var parent_buf: [64]u8 = undefined;
+    const parent: ?[]const u8 = if (body.expected_head) |e| blk: {
+        if (!receive_pack.isOid(e)) return api.respondError(request, .bad_request, "invalid_expected_head", "expected_head must be a full commit oid or null");
+        break :blk (repo.resolveCommit(e, &parent_buf) catch |err| return gitError(request, err)) orelse
+            return staleHead(app, request, repo, name, ref, e);
+    } else if (body.from) |f| blk: {
+        var full: [ref_name.max_len]u8 = undefined;
+        const rev = revFromName(f, &full) orelse return api.respondError(request, .bad_request, "invalid_ref", "from must be a branch name, a full ref, or a commit oid");
+        if (!try checkReadableRev(request, rev, access)) return .forbidden;
+        break :blk (repo.resolveCommit(rev, &parent_buf) catch |err| return gitError(request, err)) orelse
+            return api.respondError(request, .not_found, "not_found", "from names no commit");
+    } else null;
+
     var arena_state: std.heap.ArenaAllocator = .init(app.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const changes = arena.alloc(repo_git.Repo.Change, body.changes.len) catch return api.internal(request);
     var incoming_bytes: u64 = 0;
     for (body.changes, changes) |c, *out| {
-        repo_path.validate(c.path) catch return api.respondError(request, .bad_request, "invalid_path", "a change has an invalid path");
-        if (!access.canAccessPath(c.path)) return api.respondError(request, .forbidden, "forbidden", "this token may not modify that path");
-        const given = @as(u8, @intFromBool(c.content != null)) + @intFromBool(c.content_base64 != null) + @intFromBool(c.delete);
-        if (given != 1) return api.respondError(request, .bad_request, "invalid_changes", "each change needs exactly one of content, content_base64, or delete");
         const data: ?[]const u8 = if (c.content) |t| t else if (c.content_base64) |b64| blk: {
             const dec = std.base64.standard.Decoder;
             const len = dec.calcSizeForSlice(b64) catch return api.respondError(request, .bad_request, "invalid_changes", "content_base64 is not valid base64");
             const buf = arena.alloc(u8, len) catch return api.internal(request);
             dec.decode(buf, b64) catch return api.respondError(request, .bad_request, "invalid_changes", "content_base64 is not valid base64");
             break :blk buf;
+        } else if (c.edits != null or c.patch != null) blk: {
+            const p_commit = parent orelse
+                return api.respondError(request, .unprocessable_entity, "patch_failed", "edits and patch require an existing parent commit");
+            const entries = repo.lsTree(p_commit, c.path, true) catch |err| return gitError(request, err);
+            defer entries.deinit(app.gpa);
+            if (entries.items.len != 1 or entries.items[0].kind != .blob) {
+                return api.respondError(request, .unprocessable_entity, "patch_failed", "target path does not exist as a file on parent commit");
+            }
+            if ((entries.items[0].size orelse 0) > max_file_bytes) {
+                return api.respondError(request, .payload_too_large, "too_large", "target file exceeds 10 MiB limit");
+            }
+            const base_bytes = repo.readBlob(entries.items[0].oid, max_file_bytes) catch |err| return gitError(request, err);
+            defer app.gpa.free(base_bytes);
+
+            const next_bytes = if (c.edits) |ed_json| ed_blk: {
+                const edits = arena.alloc(patch_mod.Edit, ed_json.len) catch return api.internal(request);
+                for (ed_json, edits) |ej, *ep| {
+                    ep.* = .{ .old = ej.old, .new = ej.new, .replace_all = ej.replace_all };
+                }
+                break :ed_blk patch_mod.applyEdits(arena, base_bytes, edits, max_file_bytes);
+            } else patch_mod.applyUnifiedPatch(arena, base_bytes, c.patch.?, max_file_bytes);
+
+            break :blk next_bytes catch |err| switch (err) {
+                error.OutputTooLarge => return api.respondError(request, .payload_too_large, "too_large", patchErrorMessage(err)),
+                error.OutOfMemory => return api.internal(request),
+                else => return api.respondError(request, .unprocessable_entity, "patch_failed", patchErrorMessage(err)),
+            };
         } else null;
         if (data) |d| incoming_bytes +|= d.len;
         out.* = .{ .path = c.path, .content = data };
@@ -721,19 +794,6 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
     if (dq == .exceeded) {
         return api.respondError(request, .payload_too_large, "quota_exceeded", "disk quota exceeded for this repo");
     }
-
-    var parent_buf: [64]u8 = undefined;
-    const parent: ?[]const u8 = if (body.expected_head) |e| blk: {
-        if (!receive_pack.isOid(e)) return api.respondError(request, .bad_request, "invalid_expected_head", "expected_head must be a full commit oid or null");
-        break :blk (repo.resolveCommit(e, &parent_buf) catch |err| return gitError(request, err)) orelse
-            return staleHead(app, request, repo, name, ref, e);
-    } else if (body.from) |f| blk: {
-        var full: [ref_name.max_len]u8 = undefined;
-        const rev = revFromName(f, &full) orelse return api.respondError(request, .bad_request, "invalid_ref", "from must be a branch name, a full ref, or a commit oid");
-        if (!try checkReadableRev(request, rev, access)) return .forbidden;
-        break :blk (repo.resolveCommit(rev, &parent_buf) catch |err| return gitError(request, err)) orelse
-            return api.respondError(request, .not_found, "not_found", "from names no commit");
-    } else null;
 
     var sha_buf: [64]u8 = undefined;
     const sha = repo.buildCommit(parent, changes, body.message, author, &sha_buf) catch |err| return gitError(request, err);

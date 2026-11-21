@@ -76,7 +76,7 @@ All `/v1` routes need `Authorization: Bearer <admin key>`. Per-repo routes (`/v1
 | `GET /v1/repos/{ns}/{repo}/commits/{sha}` | One commit |
 | `POST /v1/repos/{ns}/{repo}/commits/{sha}/checks` `{"name","status","summary","url"}` | Post or update a commit check (`pending`, `running`, `passed`, `failed`; admin key or `checks:write` scope) |
 | `GET /v1/repos/{ns}/{repo}/commits/{sha}/checks` | List checks and overall rollup for a commit (`git:read`) |
-| `POST /v1/repos/{ns}/{repo}/commits` | Commit file changes to a branch. Send `expected_head` (the commit you built on, or `null` for a new branch); if the branch moved, you get 409 with `current_head` |
+| `POST /v1/repos/{ns}/{repo}/commits` | Commit file changes (`content`, `content_base64`, `delete`, surgical `edits`, or unified `patch`). Send `expected_head` (the commit you built on, or `null` for a new branch); if the branch moved, you get 409 with `current_head` |
 | `POST /v1/repos/{ns}/{repo}/branches` `{"name","from","ttl_seconds"}` | Create a branch (409 if it exists); with `ttl_seconds` it is deleted after that long. Commits that create a branch take `ttl_seconds` too |
 | `DELETE /v1/repos/{ns}/{repo}/branches/{name}?expected=` | Delete a branch, optionally only if it is at `expected` |
 | `PUT /v1/repos/{ns}/{repo}/branches/{name}/lock` `{"reason"}` | Lock a branch against commits, merges, deletes, and `git push` (admin key only; blocked writes return 423) |

@@ -124,11 +124,19 @@ export interface CommitInfo {
   body: string;
 }
 
+export interface FileEdit {
+  old: string;
+  new: string;
+  replace_all?: boolean;
+}
+
 export interface FileChange {
   path: string;
   content?: string;
   content_base64?: string;
   delete?: boolean;
+  edits?: FileEdit[];
+  patch?: string;
 }
 
 export interface CommitOptions {
