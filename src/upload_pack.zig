@@ -14,6 +14,7 @@ const receive_pack = @import("receive_pack.zig");
 const repo_git = @import("repo_git.zig");
 const repo_name = @import("repo_name.zig");
 const server = @import("server.zig");
+const store_mod = @import("store.zig");
 
 const zero_oid = "0000000000000000000000000000000000000000";
 const upload_pack_v1_caps =
@@ -27,6 +28,9 @@ pub const max_wants: usize = 4096;
 pub const max_haves: usize = 16384;
 pub const max_ref_prefixes: usize = 256;
 pub const max_shallow_commits: usize = 65536;
+/// Repos with packfiles larger than this use `git pack-objects` delta reuse
+/// when Tier 1 direct `.pack` pass-through does not apply (e.g. shallow/dirty clones).
+const pack_reuse_threshold: u64 = 16 * 1024 * 1024;
 
 // ---- Ref discovery: GET /info/refs ----
 
@@ -674,7 +678,10 @@ fn handleV2Fetch(
         common.items,
         args.shallows.items,
         if (args.deepen != null) shallow_info.included.items else null,
+        shallow_info.boundaries.items,
         args.include_tag,
+        args.ofs_delta,
+        args.thin_pack,
         claims,
         &response.writer,
         pktline.sideband_64k_max,
@@ -810,6 +817,8 @@ fn serveV1(
         }
     }
 
+    const ofs_delta = receive_pack.hasCapability(req.caps, "ofs-delta");
+    const thin_pack = receive_pack.hasCapability(req.caps, "thin-pack");
     streamPack(
         app.gpa,
         repo,
@@ -818,7 +827,10 @@ fn serveV1(
         common.items,
         req.shallows.items,
         if (req.deepen != null) shallow_info.included.items else null,
+        shallow_info.boundaries.items,
         include_tag,
+        ofs_delta,
+        thin_pack,
         claims,
         &response.writer,
         band_max,
@@ -1005,35 +1017,286 @@ const StreamCtx = struct {
     failed: bool = false,
 };
 
+fn writePackChunk(writer: *std.Io.Writer, band_max: usize, data: []const u8) std.Io.Writer.Error!void {
+    // Write in bounded 16 KiB chunks so TimedWriter checks the per-write
+    // idle timeout before each chunk instead of blocking inside one large send (R3.4).
+    var rest = data;
+    while (rest.len > 0) {
+        const n = @min(rest.len, 16 * 1024);
+        const chunk = rest[0..n];
+        if (band_max > 0) {
+            try pktline.writeSideband(writer, .pack, chunk, band_max);
+        } else {
+            try writer.writeAll(chunk);
+        }
+        try writer.flush();
+        rest = rest[n..];
+    }
+}
+
 fn packForeachCb(buf: ?*anyopaque, size: usize, payload: ?*anyopaque) callconv(.c) c_int {
     const ctx: *StreamCtx = @ptrCast(@alignCast(payload.?));
     if (ctx.failed) return -1;
     if (size == 0) return 0;
     const data: [*]const u8 = @ptrCast(buf orelse return -1);
-    // Write in bounded 16 KiB chunks so TimedWriter checks the per-write
-    // idle timeout before each chunk instead of blocking inside one large send (R3.4).
-    var rest = data[0..size];
-    while (rest.len > 0) {
-        const n = @min(rest.len, 16 * 1024);
-        const chunk = rest[0..n];
-        if (ctx.band_max > 0) {
-            pktline.writeSideband(ctx.writer, .pack, chunk, ctx.band_max) catch {
-                ctx.failed = true;
-                return -1;
-            };
-        } else {
-            ctx.writer.writeAll(chunk) catch {
-                ctx.failed = true;
-                return -1;
-            };
-        }
-        ctx.writer.flush() catch {
-            ctx.failed = true;
-            return -1;
-        };
-        rest = rest[n..];
-    }
+    writePackChunk(ctx.writer, ctx.band_max, data[0..size]) catch {
+        ctx.failed = true;
+        return -1;
+    };
     return 0;
+}
+
+const PackDirInfo = struct {
+    pack_count: usize = 0,
+    total_pack_bytes: u64 = 0,
+    has_loose: bool = false,
+    single_pack_buf: [256]u8 = undefined,
+    single_pack_len: usize = 0,
+
+    fn singlePackName(p: *const PackDirInfo) ?[]const u8 {
+        if (p.pack_count != 1 or p.single_pack_len == 0) return null;
+        return p.single_pack_buf[0..p.single_pack_len];
+    }
+};
+
+fn inspectPackDir(io: Io, git_dir: []const u8) PackDirInfo {
+    var info: PackDirInfo = .{};
+    const cwd = Io.Dir.cwd();
+
+    var pack_dir_buf: [store_mod.Store.max_path_len + 32]u8 = undefined;
+    if (std.mem.print(&pack_dir_buf, "{s}/objects/pack", .{git_dir})) |pack_dir_path| {
+        if (cwd.openDir(io, pack_dir_path, .{ .iterate = true })) |dir_val| {
+            var dir = dir_val;
+            defer dir.close(io);
+            var it = dir.iterate();
+            while (it.next(io) catch null) |entry| {
+                if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".pack")) continue;
+                info.pack_count += 1;
+                if (dir.statFile(io, entry.name, .{})) |st| {
+                    info.total_pack_bytes +|= st.size;
+                } else |_| {}
+                if (info.pack_count == 1 and entry.name.len <= info.single_pack_buf.len) {
+                    @memcpy(info.single_pack_buf[0..entry.name.len], entry.name);
+                    info.single_pack_len = entry.name.len;
+                }
+            }
+        } else |_| {}
+    } else |_| {}
+
+    var obj_dir_buf: [store_mod.Store.max_path_len + 32]u8 = undefined;
+    if (std.mem.print(&obj_dir_buf, "{s}/objects", .{git_dir})) |obj_dir_path| {
+        if (cwd.openDir(io, obj_dir_path, .{ .iterate = true })) |dir_val| {
+            var dir = dir_val;
+            defer dir.close(io);
+            var it = dir.iterate();
+            while (it.next(io) catch null) |entry| {
+                if (entry.kind != .directory or entry.name.len != 2) continue;
+                if (!isHexByte(entry.name[0]) or !isHexByte(entry.name[1])) continue;
+                if (dir.openDir(io, entry.name, .{ .iterate = true })) |sub_val| {
+                    var sub = sub_val;
+                    defer sub.close(io);
+                    var sub_it = sub.iterate();
+                    if ((sub_it.next(io) catch null) != null) {
+                        info.has_loose = true;
+                        break;
+                    }
+                } else |_| {}
+            }
+        } else |_| {}
+    } else |_| {}
+
+    return info;
+}
+
+fn isHexByte(c: u8) bool {
+    return std.ascii.isDigit(c) or (c >= 'a' and c <= 'f');
+}
+
+fn wantsCoverAllBranches(gpa: std.mem.Allocator, repo: *const repo_git.Repo, wants: []const [40]u8) bool {
+    if (wants.len == 0) return false;
+    const refs = repo.listRefs(false) catch return false;
+    defer refs.deinit(gpa);
+    for (refs.items) |ref| {
+        if (!std.mem.startsWith(u8, ref.name, "refs/heads/")) continue;
+        var found = false;
+        for (wants) |w| {
+            if (std.mem.eql(u8, &w, &ref.oid)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+/// Tier 1: Zero-copy pass-through of a single clean `.pack` file on disk.
+/// Returns true if streamed, false if caller should fall back to Tier 2/3.
+fn tryStreamSinglePack(
+    io: Io,
+    git_dir: []const u8,
+    pack_name: []const u8,
+    writer: *std.Io.Writer,
+    band_max: usize,
+) error{PackFailed}!bool {
+    var path_buf: [store_mod.Store.max_path_len + 300]u8 = undefined;
+    const path = std.mem.print(&path_buf, "{s}/objects/pack/{s}", .{ git_dir, pack_name }) catch return false;
+    var file = Io.Dir.cwd().openFile(io, path, .{}) catch return false;
+    defer file.close(io);
+
+    var hdr: [12]u8 = undefined;
+    const hdr_n = file.readPositionalAll(io, &hdr, 0) catch return false;
+    if (hdr_n < 12 or !std.mem.eql(u8, hdr[0..4], "PACK")) return false;
+    if (std.mem.readInt(u32, hdr[4..8], .big) != 2) return false;
+
+    writePackChunk(writer, band_max, &hdr) catch return error.PackFailed;
+    var buf: [64 * 1024]u8 = undefined;
+    var off: u64 = 12;
+    while (true) {
+        const n = file.readPositionalAll(io, &buf, off) catch return error.PackFailed;
+        if (n == 0) break;
+        writePackChunk(writer, band_max, buf[0..n]) catch return error.PackFailed;
+        off += n;
+    }
+    return true;
+}
+
+/// Tier 3: Streams a delta-reusing pack from `git pack-objects --stdout` for large
+/// dirty or shallow repositories (>16 MiB) while keeping wire protocol, auth, and
+/// `read_refs` enforcement native in Zig (R2.1, R2.4, R3.4).
+fn streamGitPackObjects(
+    gpa: std.mem.Allocator,
+    repo: *const repo_git.Repo,
+    wants: []const [40]u8,
+    common_haves: []const git2.Oid,
+    client_shallows: []const [40]u8,
+    shallow_boundaries: []const git2.Oid,
+    include_tag: bool,
+    ofs_delta: bool,
+    thin_pack: bool,
+    claims: *const auth.Claims,
+    writer: *std.Io.Writer,
+    band_max: usize,
+) error{ PackFailed, OutOfMemory }!void {
+    const io = repo.io;
+
+    // Build stdin payload in an unlinked temp file so the child can never deadlock on pipes.
+    var stdin_buf: std.ArrayList(u8) = .empty;
+    defer stdin_buf.deinit(gpa);
+
+    const has_shallow = shallow_boundaries.len > 0 or client_shallows.len > 0;
+    for (shallow_boundaries) |s_oid| {
+        var hex: [40]u8 = undefined;
+        _ = git2.formatOid(&s_oid, &hex);
+        try stdin_buf.appendSlice(gpa, "--shallow ");
+        try stdin_buf.appendSlice(gpa, &hex);
+        try stdin_buf.append(gpa, '\n');
+    }
+    for (client_shallows) |s_hex| {
+        try stdin_buf.appendSlice(gpa, "--shallow ");
+        try stdin_buf.appendSlice(gpa, &s_hex);
+        try stdin_buf.append(gpa, '\n');
+    }
+    for (wants) |w_hex| {
+        try stdin_buf.appendSlice(gpa, &w_hex);
+        try stdin_buf.append(gpa, '\n');
+    }
+    for (common_haves) |h_oid| {
+        var hex: [40]u8 = undefined;
+        _ = git2.formatOid(&h_oid, &hex);
+        try stdin_buf.append(gpa, '^');
+        try stdin_buf.appendSlice(gpa, &hex);
+        try stdin_buf.append(gpa, '\n');
+    }
+
+    var random: [8]u8 = undefined;
+    io.random(&random);
+    var tmp_path_buf: [store_mod.Store.max_path_len]u8 = undefined;
+    const tmp_path = std.mem.print(&tmp_path_buf, "{s}/{x}.packin", .{ repo.store.tmp, random }) catch return error.PackFailed;
+    const cwd = Io.Dir.cwd();
+    const in_file = cwd.createFile(io, tmp_path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) }) catch return error.PackFailed;
+    defer in_file.close(io);
+    cwd.deleteFile(io, tmp_path) catch return error.PackFailed;
+
+    {
+        var wbuf: [16 * 1024]u8 = undefined;
+        var fw = in_file.writer(io, &wbuf);
+        fw.interface.writeAll(stdin_buf.items) catch return error.PackFailed;
+        fw.interface.flush() catch return error.PackFailed;
+        fw.seekTo(0) catch return error.PackFailed;
+    }
+
+    var env = try store_mod.gitEnv(gpa, repo.store.path_env);
+    defer env.deinit();
+
+    var argv: [12][]const u8 = undefined;
+    var argc: usize = 0;
+    argv[argc] = "git";
+    argc += 1;
+    argv[argc] = "--git-dir";
+    argc += 1;
+    argv[argc] = repo.gitDir();
+    argc += 1;
+    argv[argc] = "pack-objects";
+    argc += 1;
+    argv[argc] = "--revs";
+    argc += 1;
+    argv[argc] = "--stdout";
+    argc += 1;
+    argv[argc] = "-q";
+    argc += 1;
+    if (has_shallow) {
+        argv[argc] = "--shallow";
+        argc += 1;
+    }
+    if (ofs_delta) {
+        argv[argc] = "--delta-base-offset";
+        argc += 1;
+    }
+    if (thin_pack and common_haves.len > 0) {
+        argv[argc] = "--thin";
+        argc += 1;
+    }
+    if (include_tag and !claims.isReadRefRestricted()) {
+        argv[argc] = "--include-tag";
+        argc += 1;
+    }
+
+    var child = std.process.spawn(io, .{
+        .argv = argv[0..argc],
+        .environ_map = &env,
+        .stdin = .{ .file = in_file },
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .pgid = 0,
+    }) catch return error.PackFailed;
+    defer killPackChild(io, &child);
+
+    var read_buf: [64 * 1024]u8 = undefined;
+    var stdout_reader = child.stdout.?.readerStreaming(io, &read_buf);
+    var chunk: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = stdout_reader.interface.readSliceShort(&chunk) catch return error.PackFailed;
+        if (n == 0) break;
+        writePackChunk(writer, band_max, chunk[0..n]) catch return error.PackFailed;
+    }
+
+    const term = child.wait(io) catch return error.PackFailed;
+    switch (term) {
+        .exited => |code| if (code != 0) return error.PackFailed,
+        .signal, .stopped, .unknown => return error.PackFailed,
+    }
+}
+
+fn killPackChild(io: Io, child: *std.process.Child) void {
+    const pid = child.id orelse return;
+    if (child.stdout) |f| {
+        f.close(io);
+        child.stdout = null;
+    }
+    // ESRCH just means the process group already exited.
+    std.posix.kill(-pid, .KILL) catch {};
+    child.kill(io);
 }
 
 fn streamPack(
@@ -1044,11 +1307,48 @@ fn streamPack(
     common_haves: []const git2.Oid,
     client_shallows: []const [40]u8,
     shallow_commits: ?[]const git2.Oid,
+    shallow_boundaries: []const git2.Oid,
     include_tag: bool,
+    ofs_delta: bool,
+    thin_pack: bool,
     claims: *const auth.Claims,
     writer: *std.Io.Writer,
     band_max: usize,
 ) error{ PackFailed, OutOfMemory }!void {
+    const pack_info = inspectPackDir(repo.io, repo.gitDir());
+
+    // Tier 1: Clean single-pack full clone — stream the on-disk `.pack` directly
+    // with zero decompression, zero RAM spike, and zero subprocesses.
+    if (ofs_delta and !claims.isReadRefRestricted() and common_haves.len == 0 and
+        client_shallows.len == 0 and shallow_commits == null and !pack_info.has_loose)
+    {
+        if (pack_info.singlePackName()) |pack_name| {
+            if (wantsCoverAllBranches(gpa, repo, wants)) {
+                if (try tryStreamSinglePack(repo.io, repo.gitDir(), pack_name, writer, band_max)) return;
+            }
+        }
+    }
+
+    // Tier 3: Large dirty/multi-pack/shallow clones (>16 MiB) — delegate only pack
+    // generation to `git pack-objects` so existing on-disk pack deltas are reused.
+    if (pack_info.total_pack_bytes > pack_reuse_threshold and common_haves.len == 0) {
+        return streamGitPackObjects(
+            gpa,
+            repo,
+            wants,
+            common_haves,
+            client_shallows,
+            shallow_boundaries,
+            include_tag,
+            ofs_delta,
+            thin_pack,
+            claims,
+            writer,
+            band_max,
+        );
+    }
+
+    // Tier 2: In-process libgit2 packbuilder (small/medium repos & incremental fetches).
     var pb: ?*git2.Packbuilder = null;
     if (git2.git_packbuilder_new(&pb, git2_repo) != git2.ok) return error.PackFailed;
     defer git2.git_packbuilder_free(pb.?);
@@ -1313,4 +1613,94 @@ fn fuzzUploadPack(_: void, smith: *std.testing.Smith) anyerror!void {
         var mut = r2.*;
         mut.deinit(testing.allocator);
     } else |_| {}
+}
+
+test "Tier 1 direct single-pack streaming and Tier 3 git pack-objects shallow reuse" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "repos");
+    try tmp.dir.createDirPath(io, "tmp");
+    const base = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(base);
+    const repos_dir = try std.mem.concat(gpa, u8, &.{ base, "/repos" });
+    defer gpa.free(repos_dir);
+    const tmp_dir = try std.mem.concat(gpa, u8, &.{ base, "/tmp" });
+    defer gpa.free(tmp_dir);
+
+    const store: store_mod.Store = .{
+        .root = repos_dir,
+        .tmp = tmp_dir,
+        .path_env = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+    };
+    const name = try repo_name.parse("acme/packreuse");
+    const dst_name = try repo_name.parse("acme/packdst");
+    try store.create(io, gpa, name);
+    try store.create(io, gpa, dst_name);
+    const repo = try repo_git.Repo.open(io, gpa, &store, name);
+    const dst = try repo_git.Repo.open(io, gpa, &store, dst_name);
+
+    const author: repo_git.Repo.Author = .{ .name = "A", .email = "a@b" };
+    var c1_buf: [64]u8 = undefined;
+    const c1 = try repo.buildCommit(null, &.{
+        .{ .path = "keep.txt", .content = "from-c1\n" },
+        .{ .path = "a.txt", .content = "v1\n" },
+    }, "c1", author, &c1_buf);
+    var c2_buf: [64]u8 = undefined;
+    const c2 = try repo.buildCommit(c1, &.{
+        .{ .path = "a.txt", .content = "v2\n" },
+    }, "c2", author, &c2_buf);
+    try testing.expectEqual(repo_git.Repo.RefUpdate.updated, try repo.updateRef("refs/heads/main", c2, null));
+
+    // Before gc: loose objects exist, no packs yet.
+    const dirty_info = inspectPackDir(io, repo.gitDir());
+    try testing.expect(dirty_info.has_loose);
+    try testing.expectEqual(@as(usize, 0), dirty_info.pack_count);
+
+    // After gc: exactly 1 pack and 0 loose objects -> Tier 1 eligible.
+    try repo.gc(0);
+    const clean_info = inspectPackDir(io, repo.gitDir());
+    try testing.expect(!clean_info.has_loose);
+    try testing.expectEqual(@as(usize, 1), clean_info.pack_count);
+    try testing.expect(clean_info.total_pack_bytes > 32);
+
+    var c2_hex: [40]u8 = undefined;
+    @memcpy(&c2_hex, c2[0..40]);
+    try testing.expect(wantsCoverAllBranches(gpa, &repo, &.{c2_hex}));
+
+    // Tier 1 streams the pack directly and the resulting pack indexes cleanly.
+    var t1_out: std.Io.Writer.Allocating = .init(gpa);
+    defer t1_out.deinit();
+    const streamed = try tryStreamSinglePack(io, repo.gitDir(), clean_info.singlePackName().?, &t1_out.writer, 0);
+    try testing.expect(streamed);
+    try testing.expectEqual(clean_info.total_pack_bytes, t1_out.written().len);
+    try dst.indexPackSlice(t1_out.written());
+    try testing.expect(try dst.verifyPushedTarget(c2, true));
+
+    // Tier 3 shallow pack excludes c1 while keeping c2 and its unchanged `keep.txt` blob.
+    const claims: auth.Claims = .{
+        .repo_id = @splat('a'),
+        .scopes = .{ .git_read = true },
+        .expires_at = 999999,
+    };
+    const c2_oid = git2.parseOid(c2).?;
+    var t3_out: std.Io.Writer.Allocating = .init(gpa);
+    defer t3_out.deinit();
+    try streamGitPackObjects(gpa, &repo, &.{c2_hex}, &.{}, &.{}, &.{c2_oid}, false, true, false, &claims, &t3_out.writer, 0);
+
+    const shallow_dst_name = try repo_name.parse("acme/shallowdst");
+    try store.create(io, gpa, shallow_dst_name);
+    const shallow_dst = try repo_git.Repo.open(io, gpa, &store, shallow_dst_name);
+    try shallow_dst.indexPackSlice(t3_out.written());
+    try testing.expect(try shallow_dst.verifyPushedTarget(c2, true));
+    // c1 must NOT be in the shallow pack, while keep.txt at c2 MUST be readable.
+    try testing.expect(!(try shallow_dst.verifyPushedTarget(c1, true)));
+    const entries = try shallow_dst.lsTree(c2, "keep.txt", true);
+    defer entries.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), entries.items.len);
+    const blob = try shallow_dst.readBlob(entries.items[0].oid, 64);
+    defer gpa.free(blob);
+    try testing.expectEqualStrings("from-c1\n", blob);
 }
