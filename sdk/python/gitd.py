@@ -111,6 +111,9 @@ class GitdClient:
             body["branch_ttl_seconds"] = branch_ttl_seconds
         return self._json("POST", "/v1/tokens", body)
 
+    def revoke_token(self, jti: str) -> None:
+        self._request("POST", f"/v1/tokens/{urllib.parse.quote(jti, safe='')}/revoke")
+
     # ---- Branches ----
 
     def list_branches(self, repo: str) -> list[dict[str, Any]]:
@@ -127,6 +130,12 @@ class GitdClient:
     def delete_branch(self, repo: str, name: str, *, expected: str | None = None) -> None:
         q = f"?expected={urllib.parse.quote(expected, safe='')}" if expected else ""
         self._request("DELETE", f"/v1/repos/{repo}/branches/{_encode_path(name)}{q}")
+
+    def lock_branch(self, repo: str, name: str, *, reason: str = "") -> dict[str, Any]:
+        return self._json("PUT", f"/v1/repos/{repo}/branches/{_encode_path(name)}/lock", {"reason": reason})
+
+    def unlock_branch(self, repo: str, name: str) -> None:
+        self._request("DELETE", f"/v1/repos/{repo}/branches/{_encode_path(name)}/lock")
 
     # ---- Files, Trees, History ----
 

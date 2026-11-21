@@ -246,6 +246,11 @@ fn serveApi(app: *App, request: *http.Server.Request, path: []const u8, query: [
         if (method != .POST) return respondError(request, .method_not_allowed, "method_not_allowed", "use POST");
         return createToken(app, request);
     }
+    if (std.mem.startsWith(u8, path, "/v1/tokens/") and std.mem.endsWith(u8, path, "/revoke")) {
+        if (method != .POST) return respondError(request, .method_not_allowed, "method_not_allowed", "use POST");
+        const jti = path["/v1/tokens/".len .. path.len - "/revoke".len];
+        return revokeToken(app, request, jti);
+    }
     return respondError(request, .not_found, "not_found", "no such route");
 }
 
@@ -276,6 +281,10 @@ fn serveContent(app: *App, request: *http.Server.Request, name: repo_name.Name, 
     if (std.mem.startsWith(u8, bearer, auth.token_prefix)) {
         const claims = auth.verify(app.secret, bearer, unixNow(app.io)) catch
             return respondError(request, .unauthorized, "unauthorized", "invalid or expired token");
+        if (claims.jti) |*jti| {
+            const revoked = app.db.isTokenRevoked(app.io, jti) catch return internal(request);
+            if (revoked) return respondError(request, .unauthorized, "unauthorized", "token has been revoked");
+        }
         if (!std.mem.eql(u8, claims.repo(), name.full) or !std.mem.eql(u8, &claims.repo_id, repo.id)) {
             return respondError(request, .forbidden, "forbidden", "this token is for another repo");
         }
@@ -359,6 +368,7 @@ fn deleteRepo(app: *App, request: *http.Server.Request, name: repo_name.Name) Ha
     const deleted = app.db.deleteRepo(io, name.full) catch return internal(request);
     if (!deleted) return respondError(request, .not_found, "not_found", "no such repo");
     app.db.clearBranchTtl(io, name.full, "") catch |err| std.log.err("clearing expiries of {s}: {t}", .{ name.full, err });
+    _ = app.db.unlockBranch(io, name.full, "") catch |err| std.log.err("clearing locks of {s}: {t}", .{ name.full, err });
     _ = app.db.deleteWebhooks(io, name.full, 0) catch |err| std.log.err("deleting webhooks of {s}: {t}", .{ name.full, err });
     app.store.delete(io, name) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
@@ -424,9 +434,20 @@ fn createToken(app: *App, request: *http.Server.Request) HandleError!http.Status
         return respondError(request, .bad_request, "invalid_ttl", "branch_ttl_seconds must be 0-604800");
     }
     claims.branch_ttl = @intCast(body.branch_ttl_seconds);
+    const jti = auth.newJti(app.io) catch return internal(request);
+    claims.jti = jti;
     var token_buf: [auth.max_token_len]u8 = undefined;
     const token = auth.mint(app.secret, &claims, &token_buf) catch return internal(request);
-    return api.respondJson(app.gpa, request, .created, .{ .token = token, .expires_at = expires_at });
+    return api.respondJson(app.gpa, request, .created, .{ .token = token, .jti = &jti, .expires_at = expires_at });
+}
+
+fn revokeToken(app: *App, request: *http.Server.Request, jti: []const u8) HandleError!http.Status {
+    if (!auth.isJti(jti)) return respondError(request, .bad_request, "invalid_jti", "jti must be 32 lowercase hex characters");
+    // Keep the revocation record for the maximum token lifetime; the reaper prunes it after.
+    const expires_at = unixNow(app.io) + auth.max_ttl_seconds;
+    app.db.revokeToken(app.io, jti, expires_at) catch return internal(request);
+    try request.respond("", .{ .status = .no_content, .keep_alive = keepAlive(request) });
+    return .no_content;
 }
 
 const RepoJson = struct {
@@ -442,6 +463,10 @@ fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route,
     const password = if (findHeader(request, "authorization")) |h| auth.basicPassword(h, &scratch) else null;
     const token = password orelse return respondGitAuth(request);
     const claims = auth.verify(app.secret, token, unixNow(app.io)) catch return respondGitAuth(request);
+    if (claims.jti) |*jti| {
+        const revoked = app.db.isTokenRevoked(app.io, jti) catch return internal(request);
+        if (revoked) return respondGitAuth(request);
+    }
 
     if (!std.mem.eql(u8, claims.repo(), git_route.repo.full)) {
         return respondError(request, .forbidden, "forbidden", "this token is for another repo");
@@ -519,6 +544,10 @@ fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route,
             else => |e| return proxyError(request, e),
         };
         if (!push.?.allowedBy(&claims)) return rejectPush(app, request, &push.?, &claims, repo_copy);
+        for (push.?.commands) |cmd| {
+            const locked = app.db.isBranchLocked(app.io, repo_copy.full, cmd.ref) catch return internal(request);
+            if (locked) return rejectLockedPush(app, request, &push.?, repo_copy);
+        }
     }
 
     // Enforce read_refs on git smart HTTP via transfer.hideRefs (R2.1).
@@ -607,6 +636,32 @@ fn rejectPush(app: *App, request: *http.Server.Request, push: *const Push, claim
     var msg_buf: [auth.max_ref_patterns_bytes + 96]u8 = undefined;
     const message = std.mem.print(&msg_buf, "gitd: push rejected: {s}", .{reason}) catch "gitd: push rejected";
     receive_pack.writeRejection(&out.writer, push.caps, push.commands, reasons[0..push.commands.len], message) catch return internal(request);
+    try request.respond(out.written(), .{
+        .keep_alive = keepAlive(request),
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/x-git-receive-pack-result" },
+            .{ .name = "cache-control", .value = "no-cache" },
+        },
+    });
+    return .ok;
+}
+
+fn rejectLockedPush(app: *App, request: *http.Server.Request, push: *const Push, name: repo_name.Name) HandleError!http.Status {
+    const locked_reason = "branch is locked";
+    const other = "push refused: another ref in it is locked";
+    var reasons: [receive_pack.max_commands][]const u8 = undefined;
+    const now = unixNow(app.io);
+    for (push.commands, 0..) |cmd, i| {
+        const is_locked = app.db.isBranchLocked(app.io, name.full, cmd.ref) catch false;
+        reasons[i] = if (is_locked) locked_reason else other;
+        if (is_locked) events.record(app, .{ .repo = name.full, .kind = "push_rejected", .ref = cmd.ref, .old = cmd.old, .new = cmd.new, .detail = locked_reason, .created_at = now });
+    }
+    if (!receive_pack.hasCapability(push.caps, "report-status") and !receive_pack.hasCapability(push.caps, "report-status-v2")) {
+        return respondError(request, .locked, "branch_locked", "branch is locked");
+    }
+    var out: std.Io.Writer.Allocating = .init(app.gpa);
+    defer out.deinit();
+    receive_pack.writeRejection(&out.writer, push.caps, push.commands, reasons[0..push.commands.len], "gitd: push rejected: branch is locked") catch return internal(request);
     try request.respond(out.written(), .{
         .keep_alive = keepAlive(request),
         .extra_headers = &.{

@@ -34,6 +34,7 @@ pub fn run(app: *server.App) Io.Cancelable!void {
 pub fn reapDue(app: *server.App) Io.Cancelable!void {
     const io = app.io;
     const now = api.unixNow(io);
+    app.db.pruneRevokedTokens(io, now) catch |err| std.log.err("pruning revoked tokens: {t}", .{err});
     const due = app.db.listBranchTtls(io, app.gpa, "", now, batch) catch |err| {
         std.log.err("listing due branches: {t}", .{err});
         return;

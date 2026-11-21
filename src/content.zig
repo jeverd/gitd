@@ -153,6 +153,12 @@ pub fn serve(
     if (method == .POST and std.mem.eql(u8, rest, "merges")) return merge(app, request, &repo, name, access);
     if (method == .POST and std.mem.eql(u8, rest, "commits")) return createCommit(app, request, &repo, name, access);
     if (method == .POST and std.mem.eql(u8, rest, "branches")) return createBranch(app, request, &repo, name, access);
+    if (std.mem.startsWith(u8, rest, "branches/") and std.mem.endsWith(u8, rest, "/lock")) {
+        const raw_branch = rest["branches/".len .. rest.len - "/lock".len];
+        if (method == .PUT) return lockBranch(app, request, name, raw_branch, access);
+        if (method == .DELETE) return unlockBranch(app, request, name, raw_branch, access);
+        return api.respondError(request, .method_not_allowed, "method_not_allowed", "use PUT or DELETE");
+    }
     if (method == .DELETE and std.mem.startsWith(u8, rest, "branches/")) return deleteBranch(app, request, &repo, name, rest["branches/".len..], query, access);
     return api.respondError(request, .not_found, "not_found", "no such repo route");
 }
@@ -580,6 +586,9 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
     const ref = ref_name.validateBranch(body.branch, &ref_buf) catch
         return api.respondError(request, .bad_request, "invalid_branch", "branch must be a valid branch name like agent/3/work");
     if (!access.canWrite(ref)) return forbiddenRef(request, ref);
+    if (app.db.isBranchLocked(app.io, name.full, ref) catch return api.internal(request)) {
+        return api.respondError(request, .locked, "branch_locked", "this branch is locked");
+    }
     if (body.message.len == 0 or body.message.len > max_message or std.mem.findScalar(u8, body.message, 0) != null) {
         return api.respondError(request, .bad_request, "invalid_message", "message must be 1-65536 bytes with no NUL");
     }
@@ -672,6 +681,9 @@ fn createBranch(app: *server.App, request: *http.Server.Request, repo: *const re
     const ref = ref_name.validateBranch(parsed.value.name, &ref_buf) catch
         return api.respondError(request, .bad_request, "invalid_branch", "name must be a valid branch name like agent/3/try-2");
     if (!access.canWrite(ref)) return forbiddenRef(request, ref);
+    if (app.db.isBranchLocked(app.io, name.full, ref) catch return api.internal(request)) {
+        return api.respondError(request, .locked, "branch_locked", "this branch is locked");
+    }
     if (ttlInvalid(parsed.value.ttl_seconds)) return api.respondError(request, .bad_request, "invalid_ttl", "ttl_seconds must be 1-604800");
     var full: [ref_name.max_len]u8 = undefined;
     const rev = revFromName(parsed.value.from, &full) orelse return api.respondError(request, .bad_request, "invalid_ref", "from must be a branch name, a full ref, or a commit oid");
@@ -692,6 +704,9 @@ fn deleteBranch(app: *server.App, request: *http.Server.Request, repo: *const re
     var ref_buf: [ref_name.max_len]u8 = undefined;
     const ref = ref_name.validateBranch(branch, &ref_buf) catch return api.respondError(request, .bad_request, "invalid_branch", "the branch name is not valid");
     if (!access.canWrite(ref)) return forbiddenRef(request, ref);
+    if (app.db.isBranchLocked(app.io, name.full, ref) catch return api.internal(request)) {
+        return api.respondError(request, .locked, "branch_locked", "this branch is locked");
+    }
     var exp_buf: [64]u8 = undefined;
     const expected: ?[]const u8 = if (std.mem.find(u8, query, "expected=") != null) blk: {
         const e = api.queryValue(&exp_buf, query, "expected") orelse "";
@@ -705,6 +720,47 @@ fn deleteBranch(app: *server.App, request: *http.Server.Request, repo: *const re
     if (outcome == .stale) return api.respondError(request, .conflict, "stale_head", "the branch is not at the expected commit");
     app.db.clearBranchTtl(app.io, name.full, ref) catch |err| std.log.err("clearing expiry of {s}: {t}", .{ ref, err });
     events.record(app, .{ .repo = name.full, .kind = "branch_deleted", .ref = ref, .old = current, .created_at = api.unixNow(app.io) });
+    try request.respond("", .{ .status = .no_content, .keep_alive = http_util.keepAlive(request) });
+    return .no_content;
+}
+
+fn lockBranch(app: *server.App, request: *http.Server.Request, name: repo_name.Name, raw: []const u8, access: Access) Error!http.Status {
+    if (access.claims != null or access.read_only) {
+        return api.respondError(request, .forbidden, "forbidden", "branch locks need the admin key");
+    }
+    var decoded: [ref_name.max_len]u8 = undefined;
+    const branch = api.percentDecode(&decoded, raw, false) orelse return api.respondError(request, .bad_request, "invalid_branch", "the branch name is not valid");
+    var ref_buf: [ref_name.max_len]u8 = undefined;
+    const ref = ref_name.validateBranch(branch, &ref_buf) catch return api.respondError(request, .bad_request, "invalid_branch", "the branch name is not valid");
+    var reason_buf: [200]u8 = undefined;
+    var reason: []const u8 = "";
+    if (http_util.hasBody(request)) {
+        const Body = struct { reason: []const u8 = "" };
+        var parsed = api.readJson(Body, app.gpa, request) catch |err| return api.respondBodyError(request, err);
+        defer parsed.deinit();
+        if (parsed.value.reason.len > reason_buf.len) {
+            return api.respondError(request, .bad_request, "invalid_reason", "reason must be at most 200 bytes");
+        }
+        @memcpy(reason_buf[0..parsed.value.reason.len], parsed.value.reason);
+        reason = reason_buf[0..parsed.value.reason.len];
+    }
+    const now = api.unixNow(app.io);
+    app.db.lockBranch(app.io, name.full, ref, reason, now) catch return api.internal(request);
+    events.record(app, .{ .repo = name.full, .kind = "branch_locked", .ref = ref, .detail = reason, .created_at = now });
+    return api.respondJson(app.gpa, request, .ok, .{ .branch = branch, .locked = true, .reason = reason });
+}
+
+fn unlockBranch(app: *server.App, request: *http.Server.Request, name: repo_name.Name, raw: []const u8, access: Access) Error!http.Status {
+    if (access.claims != null or access.read_only) {
+        return api.respondError(request, .forbidden, "forbidden", "branch locks need the admin key");
+    }
+    var decoded: [ref_name.max_len]u8 = undefined;
+    const branch = api.percentDecode(&decoded, raw, false) orelse return api.respondError(request, .bad_request, "invalid_branch", "the branch name is not valid");
+    var ref_buf: [ref_name.max_len]u8 = undefined;
+    const ref = ref_name.validateBranch(branch, &ref_buf) catch return api.respondError(request, .bad_request, "invalid_branch", "the branch name is not valid");
+    const removed = app.db.unlockBranch(app.io, name.full, ref) catch return api.internal(request);
+    if (!removed) return api.respondError(request, .not_found, "not_found", "branch is not locked");
+    events.record(app, .{ .repo = name.full, .kind = "branch_unlocked", .ref = ref, .created_at = api.unixNow(app.io) });
     try request.respond("", .{ .status = .no_content, .keep_alive = http_util.keepAlive(request) });
     return .no_content;
 }
@@ -789,6 +845,9 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
     const base_ref = ref_name.validateBranch(body.base, &ref_buf) catch
         return api.respondError(request, .bad_request, "invalid_branch", "base must be a branch name");
     if (!access.canWrite(base_ref)) return forbiddenRef(request, base_ref);
+    if (app.db.isBranchLocked(app.io, name.full, base_ref) catch return api.internal(request)) {
+        return api.respondError(request, .locked, "branch_locked", "this branch is locked");
+    }
     const author: repo_git.Repo.Author = if (body.author) |a| blk: {
         if (!validAuthorField(a.name) or !validAuthorField(a.email)) return api.respondError(request, .bad_request, "invalid_author", "author name and email must be 1-200 plain characters");
         break :blk .{ .name = a.name, .email = a.email };
