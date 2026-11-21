@@ -116,6 +116,17 @@ const schema =
     \\  created_at INTEGER NOT NULL
     \\) STRICT;
     \\CREATE INDEX IF NOT EXISTS branch_rules_repo ON branch_rules (repo);
+    \\CREATE TABLE IF NOT EXISTS repo_quotas (
+    \\  repo TEXT PRIMARY KEY,
+    \\  max_branches INTEGER NOT NULL DEFAULT 0,
+    \\  max_repo_bytes INTEGER NOT NULL DEFAULT 0,
+    \\  updated_at INTEGER NOT NULL
+    \\) STRICT;
+    \\CREATE TABLE IF NOT EXISTS repo_maintenance (
+    \\  repo TEXT PRIMARY KEY,
+    \\  last_gc_at INTEGER NOT NULL DEFAULT 0,
+    \\  expired_since_gc INTEGER NOT NULL DEFAULT 0
+    \\) STRICT;
 ;
 
 pub const Db = struct {
@@ -806,6 +817,156 @@ pub const Db = struct {
         if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("delete repo branch rules");
     }
 
+    pub const RepoQuota = struct {
+        max_branches: i64,
+        max_repo_bytes: i64,
+        updated_at: i64,
+    };
+
+    pub fn setRepoQuota(db: *Db, io: Io, repo: []const u8, max_branches: i64, max_repo_bytes: i64, updated_at: i64) Error!void {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare(
+            \\INSERT INTO repo_quotas (repo, max_branches, max_repo_bytes, updated_at)
+            \\VALUES (?1, ?2, ?3, ?4)
+            \\ON CONFLICT (repo) DO UPDATE SET
+            \\  max_branches = excluded.max_branches,
+            \\  max_repo_bytes = excluded.max_repo_bytes,
+            \\  updated_at = excluded.updated_at
+        );
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        try db.check(sqlite3_bind_int64(stmt, 2, max_branches));
+        try db.check(sqlite3_bind_int64(stmt, 3, max_repo_bytes));
+        try db.check(sqlite3_bind_int64(stmt, 4, updated_at));
+        if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("set repo quota");
+    }
+
+    pub fn getRepoQuota(db: *Db, io: Io, repo: []const u8) Error!?RepoQuota {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare("SELECT max_branches, max_repo_bytes, updated_at FROM repo_quotas WHERE repo = ?1");
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        return switch (sqlite3_step(stmt)) {
+            SQLITE_ROW => .{
+                .max_branches = sqlite3_column_int64(stmt, 0),
+                .max_repo_bytes = sqlite3_column_int64(stmt, 1),
+                .updated_at = sqlite3_column_int64(stmt, 2),
+            },
+            SQLITE_DONE => null,
+            else => db.fail("get repo quota"),
+        };
+    }
+
+    pub fn deleteRepoQuota(db: *Db, io: Io, repo: []const u8) Error!void {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare("DELETE FROM repo_quotas WHERE repo = ?1");
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("delete repo quota");
+    }
+
+    pub const RepoMaint = struct {
+        repo: []const u8,
+        last_gc_at: i64,
+        expired_since_gc: i64,
+
+        pub fn deinit(m: RepoMaint, gpa: std.mem.Allocator) void {
+            gpa.free(m.repo);
+        }
+    };
+
+    pub fn freeRepoMaints(gpa: std.mem.Allocator, list: []const RepoMaint) void {
+        for (list) |m| m.deinit(gpa);
+        gpa.free(list);
+    }
+
+    pub fn getRepoMaint(db: *Db, io: Io, gpa: std.mem.Allocator, repo: []const u8) Error!?RepoMaint {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare("SELECT repo, last_gc_at, expired_since_gc FROM repo_maintenance WHERE repo = ?1");
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        return switch (sqlite3_step(stmt)) {
+            SQLITE_ROW => .{
+                .repo = try columnText(stmt, 0, gpa),
+                .last_gc_at = sqlite3_column_int64(stmt, 1),
+                .expired_since_gc = sqlite3_column_int64(stmt, 2),
+            },
+            SQLITE_DONE => null,
+            else => db.fail("get repo maint"),
+        };
+    }
+
+    pub fn recordBranchExpired(db: *Db, io: Io, repo: []const u8) Error!void {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare(
+            \\INSERT INTO repo_maintenance (repo, last_gc_at, expired_since_gc)
+            \\VALUES (?1, 0, 1)
+            \\ON CONFLICT (repo) DO UPDATE SET expired_since_gc = expired_since_gc + 1
+        );
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("record branch expired");
+    }
+
+    pub fn recordGcCompleted(db: *Db, io: Io, repo: []const u8, now: i64) Error!void {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare(
+            \\INSERT INTO repo_maintenance (repo, last_gc_at, expired_since_gc)
+            \\VALUES (?1, ?2, 0)
+            \\ON CONFLICT (repo) DO UPDATE SET last_gc_at = excluded.last_gc_at, expired_since_gc = 0
+        );
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        try db.check(sqlite3_bind_int64(stmt, 2, now));
+        if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("record gc completed");
+    }
+
+    pub fn listReposDueForGc(db: *Db, io: Io, gpa: std.mem.Allocator, min_expired: i64, limit: u32) Error![]RepoMaint {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare(
+            \\SELECT repo, last_gc_at, expired_since_gc FROM repo_maintenance
+            \\WHERE expired_since_gc >= ?1 ORDER BY expired_since_gc DESC LIMIT ?2
+        );
+        defer _ = sqlite3_finalize(stmt);
+        try db.check(sqlite3_bind_int64(stmt, 1, min_expired));
+        try db.check(sqlite3_bind_int64(stmt, 2, limit));
+        var list: std.ArrayList(RepoMaint) = .empty;
+        errdefer {
+            for (list.items) |m| m.deinit(gpa);
+            list.deinit(gpa);
+        }
+        while (true) switch (sqlite3_step(stmt)) {
+            SQLITE_ROW => {
+                const r = try columnText(stmt, 0, gpa);
+                errdefer gpa.free(r);
+                try list.append(gpa, .{
+                    .repo = r,
+                    .last_gc_at = sqlite3_column_int64(stmt, 1),
+                    .expired_since_gc = sqlite3_column_int64(stmt, 2),
+                });
+            },
+            SQLITE_DONE => break,
+            else => return db.fail("list repos due for gc"),
+        };
+        return list.toOwnedSlice(gpa);
+    }
+
+    pub fn deleteRepoMaint(db: *Db, io: Io, repo: []const u8) Error!void {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare("DELETE FROM repo_maintenance WHERE repo = ?1");
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("delete repo maint");
+    }
+
     pub const BranchTtl = struct {
         repo: []const u8,
         repo_id: []const u8,
@@ -1116,4 +1277,45 @@ fn listLocksAndFree(gpa: std.mem.Allocator, db: *Db, io: Io) !void {
 
 fn listRulesAndFree(gpa: std.mem.Allocator, db: *Db, io: Io) !void {
     Db.freeBranchRules(gpa, try db.listBranchRules(io, gpa, "a/c"));
+}
+
+test "repo quotas and maintenance round-trip" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var db: Db = try .open(":memory:");
+    defer db.close();
+
+    try std.testing.expectEqual(null, try db.getRepoQuota(io, "a/b"));
+    try db.setRepoQuota(io, "a/b", 10, 1024 * 1024, 50);
+    const q = (try db.getRepoQuota(io, "a/b")).?;
+    try std.testing.expectEqual(@as(i64, 10), q.max_branches);
+    try std.testing.expectEqual(@as(i64, 1024 * 1024), q.max_repo_bytes);
+    try db.deleteRepoQuota(io, "a/b");
+    try std.testing.expectEqual(null, try db.getRepoQuota(io, "a/b"));
+
+    try db.recordBranchExpired(io, "a/b");
+    try db.recordBranchExpired(io, "a/b");
+    try db.recordBranchExpired(io, "a/c");
+    const m = (try db.getRepoMaint(io, gpa, "a/b")).?;
+    defer m.deinit(gpa);
+    try std.testing.expectEqual(@as(i64, 2), m.expired_since_gc);
+
+    const due = try db.listReposDueForGc(io, gpa, 2, 10);
+    defer Db.freeRepoMaints(gpa, due);
+    try std.testing.expectEqual(@as(usize, 1), due.len);
+    try std.testing.expectEqualStrings("a/b", due[0].repo);
+
+    try db.recordGcCompleted(io, "a/b", 200);
+    const after = (try db.getRepoMaint(io, gpa, "a/b")).?;
+    defer after.deinit(gpa);
+    try std.testing.expectEqual(@as(i64, 200), after.last_gc_at);
+    try std.testing.expectEqual(@as(i64, 0), after.expired_since_gc);
+
+    try db.deleteRepoMaint(io, "a/b");
+    try std.testing.expectEqual(null, try db.getRepoMaint(io, gpa, "a/b"));
+    try std.testing.checkAllAllocationFailures(gpa, listDueAndFree, .{ &db, io });
+}
+
+fn listDueAndFree(gpa: std.mem.Allocator, db: *Db, io: Io) !void {
+    Db.freeRepoMaints(gpa, try db.listReposDueForGc(io, gpa, 1, 10));
 }

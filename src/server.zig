@@ -28,6 +28,7 @@ const content = @import("content.zig");
 const expiry = @import("expiry.zig");
 const webhooks = @import("webhooks.zig");
 const rules_mod = @import("rules.zig");
+const maintenance = @import("maintenance.zig");
 const http_util = @import("http_util.zig");
 const keepAlive = http_util.keepAlive;
 
@@ -58,6 +59,13 @@ pub const App = struct {
     webhook_backoff_ms: i64 = 1000,
     /// A webhook delivery that takes longer than this counts as failed.
     webhook_timeout_ms: i64 = 10_000,
+    /// Coordinates safe background/on-demand GC against deleteRepo.
+    maint: maintenance.Coordinator = .{},
+    default_max_branches: u64 = 0,
+    default_max_repo_bytes: u64 = 0,
+    gc_interval_seconds: u32 = 300,
+    gc_prune_seconds: u32 = 300,
+    gc_expired_threshold: u32 = 20,
 };
 
 pub const default_idle_timeout_seconds = 60;
@@ -76,6 +84,9 @@ pub fn run(app: *App, listener: *Io.net.Server) Io.Cancelable!void {
     };
     group.concurrent(io, webhooks.run, .{app}) catch |err| {
         std.log.err("starting the webhook worker: {t}", .{err});
+    };
+    group.concurrent(io, maintenance.run, .{app}) catch |err| {
+        std.log.err("starting the gc worker: {t}", .{err});
     };
     while (true) {
         try app.connection_slots.wait(io);
@@ -364,6 +375,8 @@ fn deleteRepo(app: *App, request: *http.Server.Request, name: repo_name.Name) Ha
     const io = app.io;
     try app.repo_lock.lock(io);
     defer app.repo_lock.unlock(io);
+    app.maint.beginDeleteLocked(&app.repo_lock, io, name.full);
+    defer app.maint.endDeleteLocked(io, app.gpa, name.full);
     // Database first: once the row is gone the repo is unreachable, and a
     // leftover directory is cleared by the next create of the same name.
     const deleted = app.db.deleteRepo(io, name.full) catch return internal(request);
@@ -371,6 +384,8 @@ fn deleteRepo(app: *App, request: *http.Server.Request, name: repo_name.Name) Ha
     app.db.clearBranchTtl(io, name.full, "") catch |err| std.log.err("clearing expiries of {s}: {t}", .{ name.full, err });
     _ = app.db.unlockBranch(io, name.full, "") catch |err| std.log.err("clearing locks of {s}: {t}", .{ name.full, err });
     app.db.deleteRepoBranchRules(io, name.full) catch |err| std.log.err("clearing rules of {s}: {t}", .{ name.full, err });
+    app.db.deleteRepoQuota(io, name.full) catch |err| std.log.err("clearing quotas of {s}: {t}", .{ name.full, err });
+    app.db.deleteRepoMaint(io, name.full) catch |err| std.log.err("clearing maintenance of {s}: {t}", .{ name.full, err });
     _ = app.db.deleteWebhooks(io, name.full, 0) catch |err| std.log.err("deleting webhooks of {s}: {t}", .{ name.full, err });
     app.store.delete(io, name) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
@@ -561,6 +576,30 @@ fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route,
             if (!cmd.isDelete() and !eff.allow_force_push) deny_non_ff = true;
             if (!eff.allow_delete) deny_deletes = true;
         }
+        var new_branches: u64 = 0;
+        for (push.?.commands) |cmd| {
+            if (cmd.isCreate() and std.mem.startsWith(u8, cmd.ref, "refs/heads/")) new_branches += 1;
+        }
+        if (new_branches > 0) {
+            const git_repo = repo_git.Repo.open(app.io, app.gpa, app.store, repo_copy) catch return internal(request);
+            const bq = maintenance.checkBranchQuota(app, &git_repo, repo_copy, new_branches, push.?.commands[0].ref) catch |err| return switch (err) {
+                error.Canceled => error.Canceled,
+                else => internal(request),
+            };
+            if (bq == .exceeded) {
+                return rejectQuotaPush(app, request, &push.?, .too_many_requests, "branch quota exceeded");
+            }
+        }
+        if (body.?.len > 0) {
+            const ref_hint = if (push.?.commands.len > 0) push.?.commands[0].ref else "";
+            const dq = maintenance.checkDiskQuota(app, repo_copy, body.?.len, ref_hint) catch |err| return switch (err) {
+                error.Canceled => error.Canceled,
+                else => internal(request),
+            };
+            if (dq == .exceeded) {
+                return rejectQuotaPush(app, request, &push.?, .payload_too_large, "disk quota exceeded");
+            }
+        }
     }
 
     // Enforce read_refs on git smart HTTP via transfer.hideRefs (R2.1).
@@ -732,7 +771,32 @@ fn rejectRulePush(app: *App, request: *http.Server.Request, push: *const Push, r
     return .ok;
 }
 
-/// The ref updates a push asks for, read from its spooled body.
+fn rejectQuotaPush(
+    app: *App,
+    request: *http.Server.Request,
+    push: *const Push,
+    http_status: http.Status,
+    reason: []const u8,
+) HandleError!http.Status {
+    if (!receive_pack.hasCapability(push.caps, "report-status") and !receive_pack.hasCapability(push.caps, "report-status-v2")) {
+        return respondError(request, http_status, "quota_exceeded", reason);
+    }
+    var reasons: [receive_pack.max_commands][]const u8 = undefined;
+    for (0..push.commands.len) |i| reasons[i] = reason;
+    var msg_buf: [128]u8 = undefined;
+    const banner = std.mem.print(&msg_buf, "gitd: push rejected: {s}", .{reason}) catch "gitd: quota exceeded";
+    var out: std.Io.Writer.Allocating = .init(app.gpa);
+    defer out.deinit();
+    receive_pack.writeRejection(&out.writer, push.caps, push.commands, reasons[0..push.commands.len], banner) catch return internal(request);
+    try request.respond(out.written(), .{
+        .keep_alive = keepAlive(request),
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/x-git-receive-pack-result" },
+            .{ .name = "cache-control", .value = "no-cache" },
+        },
+    });
+    return .ok;
+}
 const Push = struct {
     head: []u8,
     commands_buf: *[receive_pack.max_commands]receive_pack.Command,

@@ -1044,6 +1044,76 @@ expect_eq "dry_run + check generated zero merge events" 0 "$(count_events repo=a
 expect_eq "dry_run + check generated zero conflict events" 0 "$(count_events repo=acme/radar kind=merge_conflict)"
 expect_eq "delete temporary radar repo" 204 "$(admin -X DELETE "$RDB")"
 
+echo "== quotas, stats, and safe GC"
+admin -X POST "$BASE/v1/repos" -d '{"name":"acme/quota"}' >/dev/null
+QB="$BASE/v1/repos/acme/quota"
+QTOK="$(mint acme/quota '["git:read","git:write"]')"
+expect_eq "quotas require admin key" 403 "$(status -H "authorization: Bearer $QTOK" "$QB/quotas")"
+expect_eq "stats require admin key" 403 "$(status -H "authorization: Bearer $QTOK" "$QB/stats")"
+expect_eq "gc require admin key" 403 "$(status -H "authorization: Bearer $QTOK" -X POST "$QB/gc")"
+expect_eq "default quotas unlimited" "0 0" "$(admin "$QB/quotas" >/dev/null; json '["effective_max_branches"]') $(json '["effective_max_repo_bytes"]')"
+
+expect_eq "seed quota main" 201 "$(admin -X POST "$QB/commits" -d '{"branch":"main","expected_head":null,"message":"init","changes":[{"path":"a.txt","content":"hello\n"}]}')"
+expect_eq "set max_branches 2" 200 "$(admin -X PUT "$QB/quotas" -d '{"max_branches":2,"max_repo_bytes":0}')"
+expect_eq "second branch allowed" 201 "$(admin -X POST "$QB/branches" -d '{"name":"b2","from":"main"}')"
+expect_eq "third API branch blocked by quota" 429 "$(admin -X POST "$QB/branches" -d '{"name":"b3","from":"main"}')"
+expect_eq "third API commit new branch blocked by quota" 429 "$(admin -X POST "$QB/commits" -d '{"branch":"b3","expected_head":null,"from":"main","message":"over","changes":[{"path":"b.txt","content":"b"}]}')"
+
+QCLONE="$WORK/quota-clone"
+git clone -q "$(url "$QTOK" acme/quota)" "$QCLONE" 2>"$WORK/err" || fail "clone acme/quota: $(cat "$WORK/err")"
+if git -C "$QCLONE" push "$(url "$QTOK" acme/quota)" HEAD:refs/heads/b3 >"$WORK/qpush.out" 2>&1; then fail "git push over branch quota succeeded"; fi
+grep -q "branch quota exceeded" "$WORK/qpush.out" || fail "missing branch quota message: $(cat "$WORK/qpush.out")"
+pass "git push over branch quota rejected before writing"
+
+CUR_BYTES="$(admin "$QB/stats" >/dev/null; json '["disk_bytes"]')"
+[[ "$CUR_BYTES" -gt 0 ]] || fail "disk_bytes was $CUR_BYTES"
+LIMIT_BYTES=$((CUR_BYTES + 10000))
+QBODY="{\"max_branches\":10,\"max_repo_bytes\":$LIMIT_BYTES}"
+expect_eq "set tight disk quota" 200 "$(admin -X PUT "$QB/quotas" -d "$QBODY")"
+python3 -c 'import json; print(json.dumps({"branch":"b3","expected_head":None,"from":"main","message":"big","changes":[{"path":"big.bin","content":"X"*25600}]}))' >"$WORK/qbig.json"
+expect_eq "oversize API commit blocked by disk quota" 413 "$(admin -X POST "$QB/commits" --data-binary @"$WORK/qbig.json")"
+head -c 30720 /dev/urandom >"$QCLONE/rand.bin"
+git -C "$QCLONE" add rand.bin && git "${GIT_ID[@]}" -C "$QCLONE" commit -qm "too big"
+if git -C "$QCLONE" push "$(url "$QTOK" acme/quota)" HEAD:refs/heads/bigpush >"$WORK/qdisk.out" 2>&1; then fail "git push over disk quota succeeded"; fi
+grep -q "disk quota exceeded" "$WORK/qdisk.out" || fail "missing disk quota message: $(cat "$WORK/qdisk.out")"
+pass "git push over disk quota rejected before writing"
+
+# Raise quota, create an expiring branch with a 200 KiB uncompressible blob, let it expire, and GC
+expect_eq "clear quotas" 200 "$(admin -X PUT "$QB/quotas" -d '{"max_branches":0,"max_repo_bytes":0}')"
+Q_EXP_TOK="$(admin -X POST "$BASE/v1/tokens" -d '{"repo":"acme/quota","scopes":["git:read","git:write"],"branch_ttl_seconds":1}' >/dev/null; json '["token"]')"
+head -c 204800 /dev/urandom >"$QCLONE/rand.bin"
+git -C "$QCLONE" add rand.bin && git "${GIT_ID[@]}" -C "$QCLONE" commit --amend -qm "200k expiring blob"
+git -C "$QCLONE" push -q "$(url "$Q_EXP_TOK" acme/quota)" HEAD:refs/heads/ttl/big 2>"$WORK/err" || fail "push expiring blob: $(cat "$WORK/err")"
+for _ in $(seq 1 40); do
+  admin "$QB/branches" >/dev/null
+  if python3 -c "import json,sys; sys.exit(0 if not any(b['name']=='ttl/big' for b in json.load(open('$WORK/body'))['branches']) else 1)"; then break; fi
+  sleep 0.25
+done
+expect_eq "expired_since_gc recorded" 1 "$(admin "$QB/stats" >/dev/null; json '["expired_since_gc"]')"
+expect_eq "run gc prune_seconds=0" 200 "$(admin -X POST "$QB/gc" -d '{"prune_seconds":0}')"
+RECLAIMED="$(json '["reclaimed_bytes"]')"
+BEFORE_GC="$(json '["before_bytes"]')"
+AFTER_GC="$(json '["after_bytes"]')"
+[[ "$RECLAIMED" -gt 100000 && "$AFTER_GC" -lt "$BEFORE_GC" ]] || fail "expected GC to reclaim >100KB: before=$BEFORE_GC after=$AFTER_GC reclaimed=$RECLAIMED"
+pass "gc reclaimed $RECLAIMED bytes from expired branch"
+expect_eq "expired_since_gc reset and last_gc_at set" 0 "$(admin "$QB/stats" >/dev/null; json '["expired_since_gc"]')"
+[[ "$(json '["last_gc_at"]')" =~ ^[0-9]+$ ]] || fail "missing last_gc_at after gc"
+pass "stats updated after gc"
+expect_eq "main intact after gc" 200 "$(admin "$QB/files/a.txt?ref=main")"
+
+# Concurrent GC + deleteRepo race leaves server clean (RepoGC.tla)
+admin -X POST "$BASE/v1/repos" -d '{"name":"acme/gc-race"}' >/dev/null
+admin -X POST "$BASE/v1/repos/acme/gc-race/commits" -d '{"branch":"main","expected_head":null,"message":"race","changes":[{"path":"r.txt","content":"race"}]}' >/dev/null
+curl -s -o "$WORK/gcr1" -w '%{http_code}' -H "authorization: Bearer $KEY" -X POST "$BASE/v1/repos/acme/gc-race/gc" >"$WORK/gcr1.code" &
+PID_GC=$!
+curl -s -o "$WORK/gcr2" -w '%{http_code}' -H "authorization: Bearer $KEY" -X DELETE "$BASE/v1/repos/acme/gc-race" >"$WORK/gcr2.code" &
+PID_DEL=$!
+wait "$PID_GC" "$PID_DEL"
+C1="$(cat "$WORK/gcr1.code")"; C2="$(cat "$WORK/gcr2.code")"
+[[ "$C1" =~ ^(200|404|409)$ && "$C2" =~ ^(204|404)$ ]] || fail "unexpected status in gc+delete race: gc=$C1 del=$C2"
+pass "concurrent gc and deleteRepo resolved safely (gc=$C1, del=$C2)"
+expect_eq "delete temporary quota repo" 204 "$(admin -X DELETE "$QB")"
+
 echo "== SDKs (TypeScript and Python)"
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 if [[ -d "$ROOT_DIR/sdk/python" ]]; then

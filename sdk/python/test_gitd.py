@@ -199,6 +199,15 @@ class GitdSdkTest(unittest.TestCase):
         )
         self.assertEqual(fetched["new_sha"], merged["sha"])
 
+        # Quotas, stats & GC
+        quotas = admin.set_quotas(repo, max_branches=10, max_repo_bytes=5_000_000)
+        self.assertEqual(quotas["effective_max_branches"], 10)
+        stats = admin.get_stats(repo)
+        self.assertGreater(stats["branches"], 0)
+        self.assertGreater(stats["disk_bytes"], 0)
+        gc_res = admin.gc(repo, prune_seconds=0)
+        self.assertGreater(gc_res["after_bytes"], 0)
+
         admin.delete_repo(mirror)
         admin.delete_repo(repo)
 
