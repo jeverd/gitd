@@ -1114,6 +1114,55 @@ C1="$(cat "$WORK/gcr1.code")"; C2="$(cat "$WORK/gcr2.code")"
 pass "concurrent gc and deleteRepo resolved safely (gc=$C1, del=$C2)"
 expect_eq "delete temporary quota repo" 204 "$(admin -X DELETE "$QB")"
 
+echo "== commit checks and required-check merge gates"
+admin -X POST "$BASE/v1/repos" -d '{"name":"acme/checks"}' >/dev/null
+CB="$BASE/v1/repos/acme/checks"
+CK_CODE="$(mint acme/checks '["git:read","git:write"]')"
+CK_CI="$(mint acme/checks '["git:read","checks:write"]')"
+expect_eq "seed checks main" 201 "$(admin -X POST "$CB/commits" -d '{"branch":"main","expected_head":null,"message":"init","changes":[{"path":"app.txt","content":"v1\n"}]}')"
+expect_eq "agent branch commit" 201 "$(status -H "authorization: Bearer $CK_CODE" -X POST "$CB/commits" -d '{"branch":"agent/work","expected_head":null,"from":"main","message":"work 1","changes":[{"path":"app.txt","content":"v2\n"}]}')"
+SHA1="$(json '["sha"]')"
+
+# Coding agent cannot post checks, checker token can
+expect_eq "coding token cannot post checks" 403 "$(status -H "authorization: Bearer $CK_CODE" -X POST "$CB/commits/$SHA1/checks" -d '{"name":"tests","status":"passed"}')"
+expect_eq "checker posts running" 200 "$(status -H "authorization: Bearer $CK_CI" -X POST "$CB/commits/$SHA1/checks" -d '{"name":"tests","status":"running","summary":"started"}')"
+expect_eq "checker posts failed" 200 "$(status -H "authorization: Bearer $CK_CI" -X POST "$CB/commits/$SHA1/checks" -d '{"name":"tests","status":"failed","summary":"1 failing test"}')"
+expect_eq "checker posts passed" 200 "$(status -H "authorization: Bearer $CK_CI" -X POST "$CB/commits/$SHA1/checks" -d '{"name":"tests","status":"passed","summary":"12 passed","url":"https://ci.example/1"}')"
+expect_eq "checks list rollup before second check" "passed" "$(status -H "authorization: Bearer $CK_CODE" "$CB/commits/$SHA1/checks" >/dev/null; json '["rollup"]')"
+
+# Rule requiring tests + lint blocks merge until both pass on exact HEAD commit
+expect_eq "create required_checks rule" 201 "$(admin -X POST "$CB/rules" -d '{"pattern":"refs/heads/main","required_merge_strategy":"squash","required_checks":["tests","lint"]}')"
+expect_eq "dry_run blocked by missing lint" 200 "$(status -H "authorization: Bearer $CK_CODE" -X POST "$CB/merges" -d '{"base":"main","head":"agent/work","strategy":"squash","dry_run":true}')"
+expect_eq "dry_run missing_required_check" "False missing_required_check lint" "$(json '["mergeable"]') $(json '["blocked_by"]') $(json '["missing_checks"][0]')"
+expect_eq "merge rejected while lint missing" 403 "$(admin -X POST "$CB/merges" -d '{"base":"main","head":"agent/work","strategy":"squash"}')"
+expect_eq "missing_required_check code" "missing_required_check" "$(json '["error"]["code"]')"
+
+expect_eq "post lint passed on SHA1" 200 "$(status -H "authorization: Bearer $CK_CI" -X POST "$CB/commits/$SHA1/checks" -d '{"name":"lint","status":"passed"}')"
+expect_eq "dry_run mergeable once checks pass" "True" "$(admin -X POST "$CB/merges" -d '{"base":"main","head":"agent/work","strategy":"squash","dry_run":true}' >/dev/null; json '["mergeable"]')"
+
+# New git push commit SHA2 invalidates SHA1 checks until SHA2 is checked
+CK_CLONE="$WORK/checks-clone"
+git clone -q "$(url "$CK_CODE" acme/checks)" "$CK_CLONE" 2>"$WORK/err" || fail "clone acme/checks: $(cat "$WORK/err")"
+git -C "$CK_CLONE" checkout -q -b agent/work origin/agent/work
+echo "v3" >"$CK_CLONE/app.txt"
+git "${GIT_ID[@]}" -C "$CK_CLONE" commit -qam "push v3"
+git -C "$CK_CLONE" push -q "$(url "$CK_CODE" acme/checks)" agent/work 2>"$WORK/err" || fail "push SHA2: $(cat "$WORK/err")"
+SHA2="$(git -C "$CK_CLONE" rev-parse HEAD)"
+expect_eq "new commit invalidates old checks" 403 "$(admin -X POST "$CB/merges" -d '{"base":"main","head":"agent/work","strategy":"squash"}')"
+expect_eq "pass tests on SHA2" 200 "$(status -H "authorization: Bearer $CK_CI" -X POST "$CB/commits/$SHA2/checks" -d '{"name":"tests","status":"passed"}')"
+expect_eq "pass lint on SHA2" 200 "$(status -H "authorization: Bearer $CK_CI" -X POST "$CB/commits/$SHA2/checks" -d '{"name":"lint","status":"passed"}')"
+expect_eq "ui state includes branch check badges" 200 "$(status "$BASE/ui/api/state")"
+python3 - "$WORK/body" <<'PY' || fail "missing check badges in ui state: $(cat "$WORK/body")"
+import json, sys
+s = json.load(open(sys.argv[1]))
+repo = next(r for r in s["repos"] if r["name"] == "acme/checks")
+b = next(br for br in repo["branches"] if br["name"] == "agent/work")
+assert {(c["name"], c["status"]) for c in b["checks"]} == {("tests", "passed"), ("lint", "passed")}, b
+PY
+pass "ui exposes commit check badges on branch heads"
+expect_eq "merge succeeds after SHA2 checks pass" 201 "$(admin -X POST "$CB/merges" -d '{"base":"main","head":"agent/work","strategy":"squash"}')"
+expect_eq "delete checks repo" 204 "$(admin -X DELETE "$CB")"
+
 echo "== SDKs (TypeScript and Python)"
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 if [[ -d "$ROOT_DIR/sdk/python" ]]; then

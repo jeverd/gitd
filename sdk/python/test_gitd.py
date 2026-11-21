@@ -183,9 +183,23 @@ class GitdSdkTest(unittest.TestCase):
             allow_force_push=False,
             allow_delete=False,
             required_merge_strategy="squash",
+            required_checks=["tests"],
         )
         self.assertEqual(rule["required_merge_strategy"], "squash")
+        self.assertEqual(rule["required_checks"], ["tests"])
         self.assertEqual(len(admin.list_rules(repo)), 1)
+
+        chk_tok = admin.create_token(repo, ["git:read", "checks:write"])["token"]
+        checker = admin.with_token(chk_tok)
+        c1_sha = next(b["commit"] for b in admin.list_branches(repo) if b["name"] == "agent/py/c1")
+        dry_blocked = agent.merge(repo, base="main", head="agent/py/c1", strategy="squash", dry_run=True)
+        self.assertFalse(dry_blocked["mergeable"])
+        self.assertEqual(dry_blocked["blocked_by"], "missing_required_check")
+        self.assertEqual(dry_blocked["missing_checks"], ["tests"])
+        checker.post_check(repo, c1_sha, name="tests", status="passed", summary="all green")
+        chk_list = agent.list_checks(repo, c1_sha)
+        self.assertEqual(chk_list["rollup"], "passed")
+        self.assertEqual(chk_list["checks"][0]["name"], "tests")
         admin.delete_rule(repo, rule["id"])
 
         # Sync fetch into mirror

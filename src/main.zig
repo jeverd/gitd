@@ -274,4 +274,5 @@ test {
     _ = @import("rules.zig");
     _ = @import("merge_check.zig");
     _ = @import("maintenance.zig");
+    _ = @import("checks.zig");
 }

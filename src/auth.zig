@@ -39,24 +39,30 @@ pub const default_ttl_seconds = 15 * 60;
 pub const Scopes = packed struct(u8) {
     git_read: bool = false,
     git_write: bool = false,
-    _: u6 = 0,
+    checks_write: bool = false,
+    _: u5 = 0,
 
-    pub const Name = enum { @"git:read", @"git:write" };
+    pub const Name = enum { @"git:read", @"git:write", @"checks:write" };
 
     pub fn fromName(name: []const u8) ?Scopes {
         const tag = std.meta.stringToEnum(Name, name) orelse return null;
         return switch (tag) {
             .@"git:read" => .{ .git_read = true },
             .@"git:write" => .{ .git_write = true },
+            .@"checks:write" => .{ .checks_write = true },
         };
     }
 
     pub fn merge(a: Scopes, b: Scopes) Scopes {
-        return .{ .git_read = a.git_read or b.git_read, .git_write = a.git_write or b.git_write };
+        return .{
+            .git_read = a.git_read or b.git_read,
+            .git_write = a.git_write or b.git_write,
+            .checks_write = a.checks_write or b.checks_write,
+        };
     }
 
     pub fn isEmpty(s: Scopes) bool {
-        return !s.git_read and !s.git_write;
+        return !s.git_read and !s.git_write and !s.checks_write;
     }
 };
 
@@ -230,7 +236,7 @@ pub const VerifyError = error{ InvalidToken, ExpiredToken };
 
 /// Writes a token for `claims` into `out` and returns the used part.
 pub fn mint(secret: *const Secret, claims: *const Claims, out: *[max_token_len]u8) error{TokenTooLong}![]const u8 {
-    var names: [2][]const u8 = undefined;
+    var names: [3][]const u8 = undefined;
     var count: usize = 0;
     if (claims.scopes.git_read) {
         names[count] = "git:read";
@@ -238,6 +244,10 @@ pub fn mint(secret: *const Secret, claims: *const Claims, out: *[max_token_len]u
     }
     if (claims.scopes.git_write) {
         names[count] = "git:write";
+        count += 1;
+    }
+    if (claims.scopes.checks_write) {
+        names[count] = "checks:write";
         count += 1;
     }
     var refs: [max_ref_patterns][]const u8 = undefined;
@@ -534,6 +544,15 @@ test "path patterns survive mint and verify, and limit access" {
     try std.testing.expect(!got.allowsPath("secrets/prod.env"));
     try std.testing.expect(got.allowsDir("docs"));
     try std.testing.expect(!got.allowsDir("secrets"));
+}
+
+test "checks:write scope survives mint and verify" {
+    var claims = try Claims.init("acme/web", test_rid, .{ .git_read = true, .checks_write = true }, 1000);
+    var buf: [max_token_len]u8 = undefined;
+    const got = try verify(&test_secret, try mint(&test_secret, &claims, &buf), 0);
+    try std.testing.expect(got.scopes.git_read);
+    try std.testing.expect(!got.scopes.git_write);
+    try std.testing.expect(got.scopes.checks_write);
 }
 
 test "admin keys hash stably and differ from the key" {

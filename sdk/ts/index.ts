@@ -3,7 +3,23 @@
  * Uses the built-in Fetch API (Node 20+, Deno, Bun, browsers).
  */
 
-export type Scope = "git:read" | "git:write";
+export type Scope = "git:read" | "git:write" | "checks:write";
+
+export type CheckStatus = "pending" | "running" | "passed" | "failed";
+
+export interface CommitCheck {
+  name: string;
+  status: CheckStatus;
+  summary: string;
+  url: string;
+  updated_at: number;
+}
+
+export interface CommitCheckList {
+  sha: string;
+  rollup: "none" | "pending" | "passed" | "failed";
+  checks: CommitCheck[];
+}
 
 export interface Repo {
   name: string;
@@ -71,6 +87,7 @@ export interface BranchRule {
   allow_force_push: boolean;
   allow_delete: boolean;
   required_merge_strategy: "merge" | "squash" | "fast-forward" | null;
+  required_checks: string[];
   created_at: number;
 }
 
@@ -80,6 +97,7 @@ export interface CreateRuleOptions {
   allow_force_push?: boolean;
   allow_delete?: boolean;
   required_merge_strategy?: "merge" | "squash" | "fast-forward";
+  required_checks?: string[];
 }
 
 export interface TreeEntry {
@@ -165,8 +183,15 @@ export interface DryRunMergeResult {
   dry_run: true;
   mergeable: boolean;
   result: "fast_forward" | "merged" | "squashed" | "up_to_date" | null;
-  blocked_by: "branch_locked" | "rule_violation" | "not_fast_forward" | "merge_conflict" | null;
+  blocked_by:
+    | "branch_locked"
+    | "rule_violation"
+    | "missing_required_check"
+    | "not_fast_forward"
+    | "merge_conflict"
+    | null;
   conflicts: string[];
+  missing_checks: string[];
 }
 
 export interface MergeCheckBranch {
@@ -450,6 +475,18 @@ export class GitdClient {
 
   getCommit(repo: string, sha: string): Promise<CommitInfo> {
     return this.#json("GET", `/v1/repos/${repo}/commits/${encodeURIComponent(sha)}`);
+  }
+
+  postCheck(
+    repo: string,
+    sha: string,
+    opts: { name: string; status: CheckStatus; summary?: string; url?: string },
+  ): Promise<CommitCheck & { sha: string }> {
+    return this.#json("POST", `/v1/repos/${repo}/commits/${encodeURIComponent(sha)}/checks`, opts);
+  }
+
+  listChecks(repo: string, sha: string): Promise<CommitCheckList> {
+    return this.#json("GET", `/v1/repos/${repo}/commits/${encodeURIComponent(sha)}/checks`);
   }
 
   // ---- Commits, Compare, Merge ----

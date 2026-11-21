@@ -118,6 +118,13 @@ pub const Access = struct {
         const c = a.claims orelse return true;
         return c.scopes.git_write and c.allowsRef(ref);
     }
+
+    /// Whether this caller may post commit check results.
+    pub fn canWriteChecks(a: Access) bool {
+        if (a.read_only) return false;
+        const c = a.claims orelse return true;
+        return c.scopes.checks_write;
+    }
 };
 
 const Error = api.HandleError;
@@ -143,6 +150,10 @@ pub fn serve(
     const repo = repo_git.Repo.open(app.io, app.gpa, app.store, name) catch return api.internal(request);
     if (std.mem.eql(u8, rest, "quotas") or std.mem.eql(u8, rest, "stats") or std.mem.eql(u8, rest, "gc")) {
         return @import("maintenance.zig").serveApi(app, request, &repo, name, rest, access);
+    }
+    if (std.mem.startsWith(u8, rest, "commits/") and std.mem.endsWith(u8, rest, "/checks")) {
+        const raw_sha = rest["commits/".len .. rest.len - "/checks".len];
+        return @import("checks.zig").serveApi(app, request, &repo, name, raw_sha, access);
     }
 
     if (method == .GET) {
@@ -925,6 +936,7 @@ fn respondDryRunMerge(
     result: ?[]const u8,
     blocked_by: ?[]const u8,
     conflicts: []const []const u8,
+    missing_checks: []const []const u8,
 ) Error!http.Status {
     const Resp = struct {
         dry_run: bool = true,
@@ -932,12 +944,14 @@ fn respondDryRunMerge(
         result: ?[]const u8,
         blocked_by: ?[]const u8,
         conflicts: []const []const u8,
+        missing_checks: []const []const u8,
     };
     return api.respondJson(app.gpa, request, .ok, Resp{
         .mergeable = mergeable,
         .result = result,
         .blocked_by = blocked_by,
         .conflicts = conflicts,
+        .missing_checks = missing_checks,
     });
 }
 
@@ -974,13 +988,13 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
     }
 
     if (app.db.isBranchLocked(app.io, name.full, base_ref) catch return api.internal(request)) {
-        if (body.dry_run) return respondDryRunMerge(app, request, false, null, "branch_locked", &.{});
+        if (body.dry_run) return respondDryRunMerge(app, request, false, null, "branch_locked", &.{}, &.{});
         return api.respondError(request, .locked, "branch_locked", "this branch is locked");
     }
     const repo_rules = app.db.listBranchRules(app.io, app.gpa, name.full) catch return api.internal(request);
     defer Db.freeBranchRules(app.gpa, repo_rules);
     if (!rules.mergeAllowed(rules.evaluate(repo_rules, base_ref), @tagName(body.strategy))) {
-        if (body.dry_run) return respondDryRunMerge(app, request, false, null, "rule_violation", &.{});
+        if (body.dry_run) return respondDryRunMerge(app, request, false, null, "rule_violation", &.{}, &.{});
         events.record(app, .{
             .repo = name.full,
             .kind = "rule_rejected",
@@ -1007,8 +1021,49 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
     var detail_buf: [2 * ref_name.max_len + 32]u8 = undefined;
 
     if (repo.isAncestor(head, base) catch |err| return gitError(request, err)) {
-        if (body.dry_run) return respondDryRunMerge(app, request, true, "up_to_date", null, &.{});
+        if (body.dry_run) return respondDryRunMerge(app, request, true, "up_to_date", null, &.{}, &.{});
         return api.respondJson(app.gpa, request, .ok, .{ .result = "up_to_date", .sha = base });
+    }
+    const req_checks = rules.collectRequiredChecks(app.gpa, repo_rules, base_ref) catch return api.internal(request);
+    defer app.gpa.free(req_checks);
+    if (req_checks.len > 0) {
+        const commit_checks = app.db.listCommitChecks(app.io, app.gpa, name.full, head) catch return api.internal(request);
+        defer Db.freeCommitChecks(app.gpa, commit_checks);
+        var missing: std.ArrayList([]const u8) = .empty;
+        defer missing.deinit(app.gpa);
+        for (req_checks) |req_name| {
+            var passed = false;
+            for (commit_checks) |c| {
+                if (std.mem.eql(u8, c.name, req_name) and std.mem.eql(u8, c.status, "passed")) {
+                    passed = true;
+                    break;
+                }
+            }
+            if (!passed) missing.append(app.gpa, req_name) catch return api.internal(request);
+        }
+        if (missing.items.len > 0) {
+            if (body.dry_run) return respondDryRunMerge(app, request, false, null, "missing_required_check", &.{}, missing.items);
+            var miss_buf: [512]u8 = undefined;
+            var miss_w: std.Io.Writer = .fixed(&miss_buf);
+            for (missing.items, 0..) |m, idx| {
+                if (idx > 0) miss_w.writeAll(", ") catch break;
+                miss_w.writeAll(m) catch break;
+            }
+            const detail = std.mem.print(&detail_buf, "missing required checks: {s}", .{miss_w.buffered()}) catch "missing required checks";
+            events.record(app, .{
+                .repo = name.full,
+                .kind = "rule_rejected",
+                .ref = base_ref,
+                .new = head,
+                .detail = detail,
+                .created_at = now,
+            });
+            const Err = struct { code: []const u8, message: []const u8 };
+            return api.respondJson(app.gpa, request, .forbidden, .{
+                .@"error" = Err{ .code = "missing_required_check", .message = "head commit is missing passing required checks" },
+                .missing_checks = missing.items,
+            });
+        }
     }
     if (access.isPathRestricted()) {
         var mb_buf: [64]u8 = undefined;
@@ -1024,10 +1079,10 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
     const can_ff = repo.isAncestor(base, head) catch |err| return gitError(request, err);
     if (body.strategy == .@"fast-forward" or (can_ff and body.strategy == .merge)) {
         if (!can_ff) {
-            if (body.dry_run) return respondDryRunMerge(app, request, false, null, "not_fast_forward", &.{});
+            if (body.dry_run) return respondDryRunMerge(app, request, false, null, "not_fast_forward", &.{}, &.{});
             return api.respondError(request, .conflict, "not_fast_forward", "base has commits head does not; use strategy merge or squash");
         }
-        if (body.dry_run) return respondDryRunMerge(app, request, true, "fast_forward", null, &.{});
+        if (body.dry_run) return respondDryRunMerge(app, request, true, "fast_forward", null, &.{}, &.{});
         const outcome = repo.updateRef(base_ref, head, base) catch |err| return gitError(request, err);
         if (outcome == .stale) return staleHead(app, request, repo, name, base_ref, base);
         const detail = std.mem.print(&detail_buf, "{s} into {s} (fast-forward)", .{ body.head, body.base }) catch "fast-forward";
@@ -1041,7 +1096,7 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
         .conflicts => |c| {
             defer app.gpa.free(c.raw);
             defer app.gpa.free(c.paths);
-            if (body.dry_run) return respondDryRunMerge(app, request, false, null, "merge_conflict", c.paths);
+            if (body.dry_run) return respondDryRunMerge(app, request, false, null, "merge_conflict", c.paths, &.{});
             var list_buf: [512]u8 = undefined;
             var list: std.Io.Writer = .fixed(&list_buf);
             for (c.paths, 0..) |p, i| {
@@ -1064,6 +1119,7 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
                     true,
                     if (body.strategy == .squash) "squashed" else "merged",
                     null,
+                    &.{},
                     &.{},
                 );
             }

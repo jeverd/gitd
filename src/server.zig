@@ -384,6 +384,7 @@ fn deleteRepo(app: *App, request: *http.Server.Request, name: repo_name.Name) Ha
     app.db.clearBranchTtl(io, name.full, "") catch |err| std.log.err("clearing expiries of {s}: {t}", .{ name.full, err });
     _ = app.db.unlockBranch(io, name.full, "") catch |err| std.log.err("clearing locks of {s}: {t}", .{ name.full, err });
     app.db.deleteRepoBranchRules(io, name.full) catch |err| std.log.err("clearing rules of {s}: {t}", .{ name.full, err });
+    app.db.deleteRepoChecks(io, name.full) catch |err| std.log.err("clearing checks of {s}: {t}", .{ name.full, err });
     app.db.deleteRepoQuota(io, name.full) catch |err| std.log.err("clearing quotas of {s}: {t}", .{ name.full, err });
     app.db.deleteRepoMaint(io, name.full) catch |err| std.log.err("clearing maintenance of {s}: {t}", .{ name.full, err });
     _ = app.db.deleteWebhooks(io, name.full, 0) catch |err| std.log.err("deleting webhooks of {s}: {t}", .{ name.full, err });
@@ -422,7 +423,7 @@ fn createToken(app: *App, request: *http.Server.Request) HandleError!http.Status
     var scopes: auth.Scopes = .{};
     for (body.scopes) |scope| {
         scopes = scopes.merge(auth.Scopes.fromName(scope) orelse
-            return respondError(request, .bad_request, "invalid_scope", "scopes are git:read and git:write"));
+            return respondError(request, .bad_request, "invalid_scope", "scopes are git:read, git:write, and checks:write"));
     }
     if (scopes.isEmpty()) return respondError(request, .bad_request, "invalid_scope", "give at least one scope");
     if (body.ttl_seconds < 1 or body.ttl_seconds > auth.max_ttl_seconds) {
