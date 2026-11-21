@@ -21,6 +21,42 @@ pub fn validate(path: []const u8) Error!void {
     }
 }
 
+/// Validates a path pattern: either an exact path (`README.md`, `src/a.zig`)
+/// with no `*`, or `<dir>/*` (matches any file inside `<dir>` at any depth).
+pub fn validatePattern(pattern: []const u8) Error!void {
+    if (std.mem.endsWith(u8, pattern, "/*")) {
+        const dir = pattern[0 .. pattern.len - 2];
+        if (std.mem.findScalar(u8, dir, '*') != null) return error.InvalidPath;
+        return validate(dir);
+    }
+    if (std.mem.findScalar(u8, pattern, '*') != null) return error.InvalidPath;
+    return validate(pattern);
+}
+
+/// Whether `pattern` covers file `path`.
+pub fn matchesPattern(pattern: []const u8, path: []const u8) bool {
+    if (std.mem.endsWith(u8, pattern, "/*")) {
+        const prefix = pattern[0 .. pattern.len - 1]; // keeps trailing '/'
+        return std.mem.startsWith(u8, path, prefix);
+    }
+    return std.mem.eql(u8, pattern, path);
+}
+
+/// Whether directory `dir` may be listed/traversed under `pattern` (either
+/// `dir` is inside `pattern`, or `pattern` matches something inside `dir`).
+pub fn allowsDir(pattern: []const u8, dir: []const u8) bool {
+    if (matchesPattern(pattern, dir)) return true;
+    return pattern.len > dir.len and std.mem.startsWith(u8, pattern, dir) and pattern[dir.len] == '/';
+}
+
+/// Whether every file under directory `dir` is covered by `pattern`.
+pub fn coversWholeDir(pattern: []const u8, dir: []const u8) bool {
+    if (!std.mem.endsWith(u8, pattern, "/*")) return false;
+    const prefix = pattern[0 .. pattern.len - 2];
+    if (std.mem.eql(u8, prefix, dir)) return true;
+    return dir.len > prefix.len and std.mem.startsWith(u8, dir, prefix) and dir[prefix.len] == '/';
+}
+
 const testing = std.testing;
 
 test "valid and invalid paths" {
@@ -45,5 +81,50 @@ fn fuzzValidate(_: void, smith: *std.testing.Smith) anyerror!void {
         try testing.expect(segment.len > 0);
         try testing.expect(!std.mem.eql(u8, segment, ".."));
         try testing.expect(!std.ascii.eqlIgnoreCase(segment, ".git"));
+    }
+}
+
+test "path patterns validate and match" {
+    try validatePattern("README.md");
+    try validatePattern("docs/*");
+    try validatePattern("src/ui/*");
+    for ([_][]const u8{ "", "*", "/*", "docs/", "docs/*", "a/*/b", "docs/**/*" }) |p| {
+        if (std.mem.eql(u8, p, "docs/*")) continue;
+        try testing.expectError(error.InvalidPath, validatePattern(p));
+    }
+    try testing.expect(matchesPattern("README.md", "README.md"));
+    try testing.expect(!matchesPattern("README.md", "README.md.bak"));
+    try testing.expect(matchesPattern("docs/*", "docs/a.md"));
+    try testing.expect(matchesPattern("docs/*", "docs/sub/b.md"));
+    try testing.expect(!matchesPattern("docs/*", "docs2/a.md"));
+    try testing.expect(!matchesPattern("docs/*", "docs"));
+    try testing.expect(allowsDir("docs/*", "docs"));
+    try testing.expect(allowsDir("docs/*", "docs/sub"));
+    try testing.expect(allowsDir("docs/a.md", "docs"));
+    try testing.expect(!allowsDir("docs/*", "docs2"));
+    try testing.expect(coversWholeDir("docs/*", "docs"));
+    try testing.expect(coversWholeDir("docs/*", "docs/sub"));
+    try testing.expect(!coversWholeDir("docs/sub/*", "docs"));
+    try testing.expect(!coversWholeDir("docs/a.md", "docs"));
+}
+
+test "fuzz match path pattern" {
+    try testing.fuzz({}, fuzzMatchPattern, .{ .corpus = &.{ "docs/*\x00docs/a.md", "README.md\x00README.md" } });
+}
+
+fn fuzzMatchPattern(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [256]u8 = undefined;
+    const input = buf[0..smith.slice(&buf)];
+    const sep = std.mem.findScalar(u8, input, 0) orelse return;
+    const pat = input[0..sep];
+    const path = input[sep + 1 ..];
+    validatePattern(pat) catch return;
+    validate(path) catch return;
+    if (matchesPattern(pat, path)) {
+        if (std.mem.endsWith(u8, pat, "/*")) {
+            try testing.expect(std.mem.startsWith(u8, path, pat[0 .. pat.len - 1]));
+        } else {
+            try testing.expectEqualStrings(pat, path);
+        }
     }
 }

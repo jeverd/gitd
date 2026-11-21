@@ -17,6 +17,7 @@ export interface TokenOptions {
   ttl_seconds?: number;
   refs?: string[];
   read_refs?: string[];
+  paths?: string[];
   branch_ttl_seconds?: number;
 }
 

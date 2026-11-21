@@ -11,6 +11,7 @@
 const std = @import("std");
 const repo_name = @import("repo_name.zig");
 const ref_name = @import("ref_name.zig");
+const repo_path = @import("repo_path.zig");
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -27,6 +28,10 @@ pub const max_token_len = 4096;
 pub const max_ref_patterns = 4;
 /// Total bytes of all ref patterns in one token.
 pub const max_ref_patterns_bytes = 600;
+/// A token can limit access to at most this many path patterns.
+pub const max_path_patterns = 4;
+/// Total bytes of all path patterns in one token.
+pub const max_path_patterns_bytes = 600;
 /// Upper bound on a token's lifetime, in seconds.
 pub const max_ttl_seconds = 24 * 60 * 60;
 pub const default_ttl_seconds = 15 * 60;
@@ -86,6 +91,10 @@ pub const Claims = struct {
     read_refs_buf: [max_ref_patterns_bytes]u8 = undefined,
     read_refs_ends: [max_ref_patterns]u16 = undefined,
     read_refs_count: usize = 0,
+    /// Path patterns this token may read or write (see repo_path). None means any.
+    paths_buf: [max_path_patterns_bytes]u8 = undefined,
+    paths_ends: [max_path_patterns]u16 = undefined,
+    paths_count: usize = 0,
     /// Seconds a branch created by a push with this token lives before
     /// gitd deletes it. Zero means such branches do not expire.
     branch_ttl: u32 = 0,
@@ -144,6 +153,42 @@ pub const Claims = struct {
         return c.read_refs_count > 0;
     }
 
+    pub fn pathPattern(c: *const Claims, i: usize) []const u8 {
+        const start = if (i == 0) 0 else c.paths_ends[i - 1];
+        return c.paths_buf[start..c.paths_ends[i]];
+    }
+
+    pub fn addPathPattern(c: *Claims, pattern: []const u8) error{ InvalidPathPattern, TooManyPathPatterns }!void {
+        repo_path.validatePattern(pattern) catch return error.InvalidPathPattern;
+        const start: usize = if (c.paths_count == 0) 0 else c.paths_ends[c.paths_count - 1];
+        if (c.paths_count == max_path_patterns or start + pattern.len > max_path_patterns_bytes) return error.TooManyPathPatterns;
+        @memcpy(c.paths_buf[start..][0..pattern.len], pattern);
+        c.paths_ends[c.paths_count] = @intCast(start + pattern.len);
+        c.paths_count += 1;
+    }
+
+    pub fn isPathRestricted(c: *const Claims) bool {
+        return c.paths_count > 0;
+    }
+
+    pub fn allowsPath(c: *const Claims, path: []const u8) bool {
+        if (c.paths_count == 0) return true;
+        for (0..c.paths_count) |i| if (repo_path.matchesPattern(c.pathPattern(i), path)) return true;
+        return false;
+    }
+
+    pub fn allowsDir(c: *const Claims, dir: []const u8) bool {
+        if (c.paths_count == 0) return true;
+        for (0..c.paths_count) |i| if (repo_path.allowsDir(c.pathPattern(i), dir)) return true;
+        return false;
+    }
+
+    pub fn coversWholeDir(c: *const Claims, dir: []const u8) bool {
+        if (c.paths_count == 0) return true;
+        for (0..c.paths_count) |i| if (repo_path.coversWholeDir(c.pathPattern(i), dir)) return true;
+        return false;
+    }
+
     pub fn init(name: []const u8, repo_id: []const u8, scopes: Scopes, expires_at: i64) error{InvalidRepoName}!Claims {
         _ = try repo_name.parse(name);
         if (!isRepoId(repo_id)) return error.InvalidRepoName;
@@ -163,6 +208,7 @@ const Payload = struct {
     exp: i64,
     refs: []const []const u8 = &.{},
     rrefs: []const []const u8 = &.{},
+    paths: []const []const u8 = &.{},
     bttl: u32 = 0,
 };
 
@@ -184,6 +230,8 @@ pub fn mint(secret: *const Secret, claims: *const Claims, out: *[max_token_len]u
     for (0..claims.refs_count) |i| refs[i] = claims.refPattern(i);
     var rrefs: [max_ref_patterns][]const u8 = undefined;
     for (0..claims.read_refs_count) |i| rrefs[i] = claims.readRefPattern(i);
+    var paths: [max_path_patterns][]const u8 = undefined;
+    for (0..claims.paths_count) |i| paths[i] = claims.pathPattern(i);
     const payload: Payload = .{
         .v = 1,
         .repo = claims.repo(),
@@ -192,6 +240,7 @@ pub fn mint(secret: *const Secret, claims: *const Claims, out: *[max_token_len]u
         .exp = claims.expires_at,
         .refs = refs[0..claims.refs_count],
         .rrefs = rrefs[0..claims.read_refs_count],
+        .paths = paths[0..claims.paths_count],
         .bttl = claims.branch_ttl,
     };
 
@@ -250,6 +299,7 @@ pub fn verify(secret: *const Secret, token: []const u8, now: i64) VerifyError!Cl
     var claims = Claims.init(payload.repo, payload.rid, scopes, payload.exp) catch return error.InvalidToken;
     for (payload.refs) |pattern| claims.addRefPattern(pattern) catch return error.InvalidToken;
     for (payload.rrefs) |pattern| claims.addReadRefPattern(pattern) catch return error.InvalidToken;
+    for (payload.paths) |pattern| claims.addPathPattern(pattern) catch return error.InvalidToken;
     claims.branch_ttl = payload.bttl;
     if (now >= claims.expires_at) return error.ExpiredToken;
     return claims;
@@ -450,6 +500,21 @@ test "read_refs patterns survive mint and verify, and limit reads" {
     try std.testing.expect(got.allowsReadRef("refs/heads/agent/7/work"));
     try std.testing.expect(!got.allowsReadRef("refs/heads/secret"));
     try std.testing.expect(!got.allowsReadRef("refs/heads/agent/8/work"));
+}
+
+test "path patterns survive mint and verify, and limit access" {
+    var claims = try Claims.init("acme/web", test_rid, .{ .git_read = true, .git_write = true }, 1000);
+    try std.testing.expect(!claims.isPathRestricted());
+    try claims.addPathPattern("docs/*");
+    try claims.addPathPattern("README.md");
+    var buf: [max_token_len]u8 = undefined;
+    const got = try verify(&test_secret, try mint(&test_secret, &claims, &buf), 0);
+    try std.testing.expect(got.isPathRestricted());
+    try std.testing.expect(got.allowsPath("docs/guide.md"));
+    try std.testing.expect(got.allowsPath("README.md"));
+    try std.testing.expect(!got.allowsPath("secrets/prod.env"));
+    try std.testing.expect(got.allowsDir("docs"));
+    try std.testing.expect(!got.allowsDir("secrets"));
 }
 
 test "admin keys hash stably and differ from the key" {

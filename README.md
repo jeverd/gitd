@@ -64,7 +64,7 @@ All `/v1` routes need `Authorization: Bearer <admin key>`. Per-repo routes (`/v1
 | `GET /v1/repos` | List repos |
 | `GET /v1/repos/{ns}/{repo}` | Get one repo |
 | `DELETE /v1/repos/{ns}/{repo}` | Delete a repo and its files. Its tokens stop working |
-| `POST /v1/tokens` `{"repo","scopes","ttl_seconds","refs","read_refs","branch_ttl_seconds"}` | Mint a repo token. `refs` (optional, up to 4) limits writes, `read_refs` (optional, up to 4) limits reads & `git clone`/`ls-remote` visibility (e.g. `["refs/heads/main","refs/heads/agent/7/*"]`). With `branch_ttl_seconds`, branches it creates expire after that long |
+| `POST /v1/tokens` `{"repo","scopes","ttl_seconds","refs","read_refs","paths","branch_ttl_seconds"}` | Mint a repo token. `refs` limits writes, `read_refs` limits reads & `git clone`/`ls-remote` visibility, `paths` (e.g. `["docs/*","README.md"]`) limits API reads/writes to matching files (path-scoped tokens use the HTTP API rather than raw `git clone`). With `branch_ttl_seconds`, branches it creates expire after that long |
 | `GET /v1/repos/{ns}/{repo}/branches` | Branches with their commits |
 | `GET /v1/repos/{ns}/{repo}/files/{path}?ref=` | Raw file contents (up to 10 MiB) |
 | `GET /v1/repos/{ns}/{repo}/tree[/{path}]?ref=` | Directory listing |

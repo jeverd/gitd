@@ -95,6 +95,7 @@ class GitdClient:
         ttl_seconds: int | None = None,
         refs: list[str] | None = None,
         read_refs: list[str] | None = None,
+        paths: list[str] | None = None,
         branch_ttl_seconds: int | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"repo": repo, "scopes": scopes}
@@ -104,6 +105,8 @@ class GitdClient:
             body["refs"] = refs
         if read_refs is not None:
             body["read_refs"] = read_refs
+        if paths is not None:
+            body["paths"] = paths
         if branch_ttl_seconds is not None:
             body["branch_ttl_seconds"] = branch_ttl_seconds
         return self._json("POST", "/v1/tokens", body)
