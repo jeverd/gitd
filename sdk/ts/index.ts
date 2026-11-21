@@ -123,6 +123,7 @@ export interface MergeOptions {
   base: string;
   head: string;
   strategy?: "merge" | "squash" | "fast-forward";
+  dry_run?: boolean;
   expected_base_head?: string;
   message?: string;
   author?: { name: string; email: string };
@@ -131,6 +132,41 @@ export interface MergeOptions {
 export interface MergeResult {
   result: "fast_forward" | "merged" | "squashed" | "up_to_date";
   sha: string;
+}
+
+export interface DryRunMergeResult {
+  dry_run: true;
+  mergeable: boolean;
+  result: "fast_forward" | "merged" | "squashed" | "up_to_date" | null;
+  blocked_by: "branch_locked" | "rule_violation" | "not_fast_forward" | "merge_conflict" | null;
+  conflicts: string[];
+}
+
+export interface MergeCheckBranch {
+  head: string;
+  sha: string;
+  mergeable: boolean;
+  conflicts: string[];
+}
+
+export interface MergeCheckPair {
+  a: string;
+  b: string;
+  conflicts: string[];
+}
+
+export interface MergeCheckOverlap {
+  a: string;
+  b: string;
+  paths: string[];
+}
+
+export interface MergeCheckResult {
+  base: string;
+  base_sha: string;
+  branches: MergeCheckBranch[];
+  pair_conflicts: MergeCheckPair[];
+  file_overlaps: MergeCheckOverlap[];
 }
 
 export interface GrepOptions {
@@ -439,6 +475,17 @@ export class GitdClient {
 
   merge(repo: string, opts: MergeOptions): Promise<MergeResult> {
     return this.#json("POST", `/v1/repos/${repo}/merges`, opts);
+  }
+
+  mergeDryRun(repo: string, opts: Omit<MergeOptions, "dry_run">): Promise<DryRunMergeResult> {
+    return this.#json("POST", `/v1/repos/${repo}/merges`, { ...opts, dry_run: true });
+  }
+
+  checkMergeConflicts(
+    repo: string,
+    opts: { base: string; heads: string[]; include_file_overlaps?: boolean },
+  ): Promise<MergeCheckResult> {
+    return this.#json("POST", `/v1/repos/${repo}/merges/check`, opts);
   }
 
   // ---- Grep, Archive, Sync ----

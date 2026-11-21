@@ -257,6 +257,7 @@ class GitdClient:
         base: str,
         head: str,
         strategy: str | None = None,
+        dry_run: bool = False,
         expected_base_head: str | None = None,
         message: str | None = None,
         author: dict[str, str] | None = None,
@@ -264,6 +265,8 @@ class GitdClient:
         body: dict[str, Any] = {"base": base, "head": head}
         if strategy is not None:
             body["strategy"] = strategy
+        if dry_run:
+            body["dry_run"] = True
         if expected_base_head is not None:
             body["expected_base_head"] = expected_base_head
         if message is not None:
@@ -271,6 +274,20 @@ class GitdClient:
         if author is not None:
             body["author"] = author
         return self._json("POST", f"/v1/repos/{repo}/merges", body)
+
+    def check_merge_conflicts(
+        self,
+        repo: str,
+        *,
+        base: str,
+        heads: list[str],
+        include_file_overlaps: bool = False,
+    ) -> dict[str, Any]:
+        return self._json(
+            "POST",
+            f"/v1/repos/{repo}/merges/check",
+            {"base": base, "heads": heads, "include_file_overlaps": include_file_overlaps},
+        )
 
     # ---- Grep, Archive, Sync ----
 

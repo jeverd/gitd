@@ -1003,6 +1003,47 @@ expect_eq "recreate rules repo" 201 "$(admin -X POST "$BASE/v1/repos" -d '{"name
 expect_eq "rules cleared after repo delete" 0 "$(admin "$RB/rules" >/dev/null; json '["rules"].__len__()')"
 expect_eq "delete temporary rules repo" 204 "$(admin -X DELETE "$RB")"
 
+echo "== dry-run merge and conflict radar"
+admin -X POST "$BASE/v1/repos" -d '{"name":"acme/radar"}' >/dev/null
+RDB="$BASE/v1/repos/acme/radar"
+RDR_RO="$(mint acme/radar '["git:read"]')"
+expect_eq "radar seed main" 201 "$(admin -X POST "$RDB/commits" -d '{"branch":"main","expected_head":null,"message":"init","changes":[{"path":"auth.py","content":"line1\nline2\nline3\nline4\n"},{"path":"docs.md","content":"docs\n"}]}')"
+RADAR_MAIN="$(admin "$RDB/branches" >/dev/null; python3 -c "import json; print(next(b['commit'] for b in json.load(open('$WORK/body'))['branches'] if b['name']=='main'))")"
+expect_eq "radar agent a" 201 "$(admin -X POST "$RDB/commits" -d '{"branch":"radar/a","expected_head":null,"from":"main","message":"a","changes":[{"path":"auth.py","content":"LINE1_A\nline2\nline3\nline4\n"}]}')"
+expect_eq "radar agent b" 201 "$(admin -X POST "$RDB/commits" -d '{"branch":"radar/b","expected_head":null,"from":"main","message":"b","changes":[{"path":"auth.py","content":"LINE1_B\nline2\nline3\nline4\n"}]}')"
+expect_eq "radar agent c" 201 "$(admin -X POST "$RDB/commits" -d '{"branch":"radar/c","expected_head":null,"from":"main","message":"c","changes":[{"path":"docs.md","content":"docs updated\n"}]}')"
+expect_eq "radar agent d non-conflicting same file" 201 "$(admin -X POST "$RDB/commits" -d '{"branch":"radar/d","expected_head":null,"from":"main","message":"d","changes":[{"path":"auth.py","content":"line1\nline2\nline3\nLINE4_D\n"}]}')"
+
+expect_eq "read-only token runs dry_run fast_forward" 200 "$(status -H "authorization: Bearer $RDR_RO" -X POST "$RDB/merges" -d '{"base":"main","head":"radar/a","dry_run":true}')"
+expect_eq "dry_run result" "True fast_forward" "$(json '["mergeable"]') $(json '["result"]')"
+admin -X PUT "$RDB/branches/main/lock" -d '{"reason":"freeze"}' >/dev/null
+expect_eq "dry_run sees branch_locked" 200 "$(status -H "authorization: Bearer $RDR_RO" -X POST "$RDB/merges" -d '{"base":"main","head":"radar/a","dry_run":true}')"
+expect_eq "dry_run locked blocked_by" "False branch_locked" "$(json '["mergeable"]') $(json '["blocked_by"]')"
+admin -X DELETE "$RDB/branches/main/lock" >/dev/null
+admin -X POST "$RDB/rules" -d '{"pattern":"refs/heads/main","required_merge_strategy":"squash"}' >/dev/null
+expect_eq "dry_run sees rule_violation" 200 "$(status -H "authorization: Bearer $RDR_RO" -X POST "$RDB/merges" -d '{"base":"main","head":"radar/a","strategy":"merge","dry_run":true}')"
+expect_eq "dry_run rule blocked_by" "False rule_violation" "$(json '["mergeable"]') $(json '["blocked_by"]')"
+
+# Check multi-branch conflict matrix (a, b, c, d vs main)
+expect_eq "merges/check validation rejects duplicates" 400 "$(status -H "authorization: Bearer $RDR_RO" -X POST "$RDB/merges/check" -d '{"base":"main","heads":["radar/a","radar/a"]}')"
+expect_eq "merges/check multi-branch matrix" 200 "$(status -H "authorization: Bearer $RDR_RO" -X POST "$RDB/merges/check" -d '{"base":"main","heads":["radar/a","radar/b","radar/c","radar/d"],"include_file_overlaps":true}')"
+python3 - "$WORK/body" <<'PY' || fail "merges/check result unexpected: $(cat "$WORK/body")"
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert all(b["mergeable"] is True for b in d["branches"]), d["branches"]
+pairs = {(p["a"], p["b"]): p["conflicts"] for p in d["pair_conflicts"]}
+assert pairs == {("radar/a", "radar/b"): ["auth.py"]}, pairs
+overlaps = {(o["a"], o["b"]): o["paths"] for o in d["file_overlaps"]}
+assert ("radar/a", "radar/d") in overlaps and overlaps[("radar/a", "radar/d")] == ["auth.py"], overlaps
+assert ("radar/b", "radar/d") in overlaps and overlaps[("radar/b", "radar/d")] == ["auth.py"], overlaps
+assert all("radar/c" not in pair for pair in overlaps), overlaps
+PY
+pass "merges/check catches pairwise collision and non-conflicting file overlap"
+expect_eq "radar main untouched" "$RADAR_MAIN" "$(admin "$RDB/branches" >/dev/null; python3 -c "import json; print(next(b['commit'] for b in json.load(open('$WORK/body'))['branches'] if b['name']=='main'))")"
+expect_eq "dry_run + check generated zero merge events" 0 "$(count_events repo=acme/radar kind=merge)"
+expect_eq "dry_run + check generated zero conflict events" 0 "$(count_events repo=acme/radar kind=merge_conflict)"
+expect_eq "delete temporary radar repo" 204 "$(admin -X DELETE "$RDB")"
+
 echo "== SDKs (TypeScript and Python)"
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 if [[ -d "$ROOT_DIR/sdk/python" ]]; then

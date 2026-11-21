@@ -243,4 +243,5 @@ test {
     _ = @import("webhooks.zig");
     _ = @import("sync.zig");
     _ = @import("rules.zig");
+    _ = @import("merge_check.zig");
 }

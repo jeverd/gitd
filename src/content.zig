@@ -155,6 +155,7 @@ pub fn serve(
         if (std.mem.eql(u8, rest, "archive")) return readArchive(app, request, &repo, name, query, access);
     }
     if (method == .POST and std.mem.eql(u8, rest, "merges")) return merge(app, request, &repo, name, access);
+    if (method == .POST and std.mem.eql(u8, rest, "merges/check")) return @import("merge_check.zig").serveApi(app, request, &repo, name, access);
     if (method == .POST and std.mem.eql(u8, rest, "commits")) return createCommit(app, request, &repo, name, access);
     if (method == .POST and std.mem.eql(u8, rest, "branches")) return createBranch(app, request, &repo, name, access);
     if (std.mem.startsWith(u8, rest, "branches/") and std.mem.endsWith(u8, rest, "/lock")) {
@@ -202,7 +203,7 @@ fn commitFromQuery(app: *server.App, request: *http.Server.Request, repo: *const
 
 /// Checks `rev` (a validated full ref or oid) against `access.read_refs`.
 /// Responds with 403 and returns false when forbidden.
-fn checkReadableRev(request: *http.Server.Request, rev: []const u8, access: Access) Error!bool {
+pub fn checkReadableRev(request: *http.Server.Request, rev: []const u8, access: Access) Error!bool {
     if (!access.isReadRefRestricted()) return true;
     if (receive_pack.isOid(rev)) {
         _ = try api.respondError(request, .forbidden, "forbidden", "this token may not read commits by raw SHA");
@@ -239,7 +240,7 @@ fn pathFromUrl(request: *http.Server.Request, raw: []const u8, out: *[repo_path.
     return decoded;
 }
 
-fn gitError(request: *http.Server.Request, err: anyerror) Error!http.Status {
+pub fn gitError(request: *http.Server.Request, err: anyerror) Error!http.Status {
     if (err == error.Canceled) return error.Canceled;
     if (err == error.OutputTooLarge) return api.respondError(request, .payload_too_large, "too_large", "the result is too large");
     if (err == error.PathRejected) return api.respondError(request, .bad_request, "invalid_path", "git refused one of the paths");
@@ -836,7 +837,7 @@ fn unlockBranch(app: *server.App, request: *http.Server.Request, name: repo_name
 
 /// Resolves a branch name, full ref, or oid to a commit; responds with
 /// 400/403/404 and returns null when it cannot.
-fn resolveNamed(request: *http.Server.Request, repo: *const repo_git.Repo, text: []const u8, what: []const u8, access: Access, out: *[64]u8) Error!?[]const u8 {
+pub fn resolveNamed(request: *http.Server.Request, repo: *const repo_git.Repo, text: []const u8, what: []const u8, access: Access, out: *[64]u8) Error!?[]const u8 {
     var full: [ref_name.max_len]u8 = undefined;
     const rev = revFromName(text, &full) orelse {
         var buf: [96]u8 = undefined;
@@ -893,12 +894,36 @@ fn compare(app: *server.App, request: *http.Server.Request, repo: *const repo_gi
     });
 }
 
+fn respondDryRunMerge(
+    app: *server.App,
+    request: *http.Server.Request,
+    mergeable: bool,
+    result: ?[]const u8,
+    blocked_by: ?[]const u8,
+    conflicts: []const []const u8,
+) Error!http.Status {
+    const Resp = struct {
+        dry_run: bool = true,
+        mergeable: bool,
+        result: ?[]const u8,
+        blocked_by: ?[]const u8,
+        conflicts: []const []const u8,
+    };
+    return api.respondJson(app.gpa, request, .ok, Resp{
+        .mergeable = mergeable,
+        .result = result,
+        .blocked_by = blocked_by,
+        .conflicts = conflicts,
+    });
+}
+
 fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, name: repo_name.Name, access: Access) Error!http.Status {
     const Strategy = enum { merge, squash, @"fast-forward" };
     const Body = struct {
         base: []const u8,
         head: []const u8,
         strategy: Strategy = .merge,
+        dry_run: bool = false,
         /// Only merge if base is still here.
         expected_base_head: ?[]const u8 = null,
         message: ?[]const u8 = null,
@@ -911,13 +936,27 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
     var ref_buf: [ref_name.max_len]u8 = undefined;
     const base_ref = ref_name.validateBranch(body.base, &ref_buf) catch
         return api.respondError(request, .bad_request, "invalid_branch", "base must be a branch name");
-    if (!access.canWrite(base_ref)) return forbiddenRef(request, base_ref);
+    var b_buf: [64]u8 = undefined;
+    var h_buf: [64]u8 = undefined;
+    var base: []const u8 = "";
+    var head: []const u8 = "";
+    if (body.dry_run) {
+        if (!access.canRead()) return api.respondError(request, .forbidden, "forbidden", "this token lacks git:read");
+        if (!try checkReadableRev(request, base_ref, access)) return .forbidden;
+        base = (try resolveNamed(request, repo, body.base, "base", access, &b_buf)) orelse return .not_found;
+        head = (try resolveNamed(request, repo, body.head, "head", access, &h_buf)) orelse return .not_found;
+    } else if (!access.canWrite(base_ref)) {
+        return forbiddenRef(request, base_ref);
+    }
+
     if (app.db.isBranchLocked(app.io, name.full, base_ref) catch return api.internal(request)) {
+        if (body.dry_run) return respondDryRunMerge(app, request, false, null, "branch_locked", &.{});
         return api.respondError(request, .locked, "branch_locked", "this branch is locked");
     }
     const repo_rules = app.db.listBranchRules(app.io, app.gpa, name.full) catch return api.internal(request);
     defer Db.freeBranchRules(app.gpa, repo_rules);
     if (!rules.mergeAllowed(rules.evaluate(repo_rules, base_ref), @tagName(body.strategy))) {
+        if (body.dry_run) return respondDryRunMerge(app, request, false, null, "rule_violation", &.{});
         events.record(app, .{
             .repo = name.full,
             .kind = "rule_rejected",
@@ -933,10 +972,10 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
     } else .{ .name = "gitd", .email = "gitd@localhost" };
     if (body.message) |m| if (m.len == 0 or m.len > max_message) return api.respondError(request, .bad_request, "invalid_message", "message must be 1-65536 bytes");
 
-    var b_buf: [64]u8 = undefined;
-    var h_buf: [64]u8 = undefined;
-    const base = (try resolveNamed(request, repo, body.base, "base", access, &b_buf)) orelse return .not_found;
-    const head = (try resolveNamed(request, repo, body.head, "head", access, &h_buf)) orelse return .not_found;
+    if (!body.dry_run) {
+        base = (try resolveNamed(request, repo, body.base, "base", access, &b_buf)) orelse return .not_found;
+        head = (try resolveNamed(request, repo, body.head, "head", access, &h_buf)) orelse return .not_found;
+    }
     if (body.expected_base_head) |e| {
         if (!std.mem.eql(u8, e, base)) return staleHead(app, request, repo, name, base_ref, e);
     }
@@ -944,6 +983,7 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
     var detail_buf: [2 * ref_name.max_len + 32]u8 = undefined;
 
     if (repo.isAncestor(head, base) catch |err| return gitError(request, err)) {
+        if (body.dry_run) return respondDryRunMerge(app, request, true, "up_to_date", null, &.{});
         return api.respondJson(app.gpa, request, .ok, .{ .result = "up_to_date", .sha = base });
     }
     if (access.isPathRestricted()) {
@@ -959,7 +999,11 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
     }
     const can_ff = repo.isAncestor(base, head) catch |err| return gitError(request, err);
     if (body.strategy == .@"fast-forward" or (can_ff and body.strategy == .merge)) {
-        if (!can_ff) return api.respondError(request, .conflict, "not_fast_forward", "base has commits head does not; use strategy merge or squash");
+        if (!can_ff) {
+            if (body.dry_run) return respondDryRunMerge(app, request, false, null, "not_fast_forward", &.{});
+            return api.respondError(request, .conflict, "not_fast_forward", "base has commits head does not; use strategy merge or squash");
+        }
+        if (body.dry_run) return respondDryRunMerge(app, request, true, "fast_forward", null, &.{});
         const outcome = repo.updateRef(base_ref, head, base) catch |err| return gitError(request, err);
         if (outcome == .stale) return staleHead(app, request, repo, name, base_ref, base);
         const detail = std.mem.print(&detail_buf, "{s} into {s} (fast-forward)", .{ body.head, body.base }) catch "fast-forward";
@@ -973,6 +1017,7 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
         .conflicts => |c| {
             defer app.gpa.free(c.raw);
             defer app.gpa.free(c.paths);
+            if (body.dry_run) return respondDryRunMerge(app, request, false, null, "merge_conflict", c.paths);
             var list_buf: [512]u8 = undefined;
             var list: std.Io.Writer = .fixed(&list_buf);
             for (c.paths, 0..) |p, i| {
@@ -988,6 +1033,16 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
             });
         },
         .clean => |tree| {
+            if (body.dry_run) {
+                return respondDryRunMerge(
+                    app,
+                    request,
+                    true,
+                    if (body.strategy == .squash) "squashed" else "merged",
+                    null,
+                    &.{},
+                );
+            }
             var msg_buf: [2 * ref_name.max_len + 32]u8 = undefined;
             const message = body.message orelse (std.mem.print(&msg_buf, "Merge {s} into {s}", .{ body.head, body.base }) catch "Merge");
             const parents: []const []const u8 = if (body.strategy == .squash) &.{base} else &.{ base, head };

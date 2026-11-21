@@ -134,11 +134,40 @@ class GitdSdkTest(unittest.TestCase):
         with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tf:
             self.assertIn("app.py", tf.getnames())
 
-        # Compare & Merge
+        # Compare & Merge (including dry_run & conflict radar)
+        dry_ok = agent.merge(repo, base="main", head="agent/py/work", dry_run=True)
+        self.assertTrue(dry_ok["dry_run"])
+        self.assertTrue(dry_ok["mergeable"])
+        self.assertEqual(dry_ok["result"], "fast_forward")
+
         diff = admin.compare(repo, "main", "agent/py/work")
         self.assertEqual(diff["ahead"], 3)
         merged = admin.merge(repo, base="main", head="agent/py/work")
         self.assertEqual(merged["result"], "fast_forward")
+
+        admin.commit(
+            repo,
+            branch="agent/py/c1",
+            expected_head=None,
+            from_ref="main",
+            message="c1",
+            changes=[{"path": "README.md", "content": "# c1\n"}],
+        )
+        admin.commit(
+            repo,
+            branch="agent/py/c2",
+            expected_head=None,
+            from_ref="main",
+            message="c2",
+            changes=[{"path": "README.md", "content": "# c2\n"}],
+        )
+        radar = agent.check_merge_conflicts(
+            repo, base="main", heads=["agent/py/c1", "agent/py/c2"], include_file_overlaps=True
+        )
+        self.assertTrue(all(b["mergeable"] for b in radar["branches"]))
+        self.assertEqual(len(radar["pair_conflicts"]), 1)
+        self.assertEqual(radar["pair_conflicts"][0]["conflicts"], ["README.md"])
+        self.assertEqual(len(radar["file_overlaps"]), 1)
 
         # Branch lock visibility + protection rules
         admin.lock_branch(repo, "main", reason="freeze")
