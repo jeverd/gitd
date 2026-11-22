@@ -36,7 +36,7 @@ pub fn validatePattern(pattern: []const u8) Error!void {
 /// Whether `pattern` covers file `path`.
 pub fn matchesPattern(pattern: []const u8, path: []const u8) bool {
     if (std.mem.endsWith(u8, pattern, "/*")) {
-        const prefix = pattern[0 .. pattern.len - 1]; // keeps trailing '/'
+        const prefix = pattern[0 .. pattern.len - 1];
         return std.mem.startsWith(u8, path, prefix);
     }
     return std.mem.eql(u8, pattern, path);

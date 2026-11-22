@@ -1,5 +1,3 @@
-//! HTTP helpers shared by the API and the git proxy.
-
 const std = @import("std");
 const http = std.http;
 const Io = std.Io;
@@ -62,7 +60,6 @@ pub const PeerLimit = struct {
         if (count.* == 0) _ = p.counts.remove(k);
     }
 
-    /// IPv4 addresses map into IPv6 (`::ffff:a.b.c.d`); ports are ignored.
     fn key(address: Io.net.IpAddress) [16]u8 {
         return switch (address) {
             .ip6 => |a| a.bytes,

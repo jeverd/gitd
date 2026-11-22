@@ -26,7 +26,6 @@ const store_mod = @import("store.zig");
 pub const max_commands = 512;
 /// Commands must fit in this many leading bytes of the body.
 pub const max_commands_bytes = 1024 * 1024;
-/// Pushes up to this size stay purely in RAM (no temp file I/O).
 const in_mem_body_limit: usize = 4 * 1024 * 1024;
 /// Hard cap on a single push body (R3.4).
 pub const max_body_bytes: u64 = 2 * 1024 * 1024 * 1024;
@@ -189,8 +188,6 @@ pub fn isZero(oid: []const u8) bool {
     return true;
 }
 
-// ---- Native HTTP RPC Handler ----
-
 const PushBody = struct {
     mem: std.ArrayList(u8) = .empty,
     file: ?Io.File = null,
@@ -247,8 +244,6 @@ const PushBody = struct {
         return b;
     }
 
-    /// Returns the leading bytes (up to `max_commands_bytes`) for command parsing.
-    /// When backed by a file, writes into `scratch_out` (allocated by caller).
     fn headSlice(b: *const PushBody, io: Io, scratch: []u8) error{IoFailed}![]const u8 {
         if (b.file) |f| {
             const want: usize = @intCast(@min(b.total_len, scratch.len));
@@ -307,7 +302,6 @@ pub fn serveRpc(
     const commands = parsed.commands;
     const caps = parsed.caps;
 
-    // Empty probe push (`0000`).
     if (commands.len == 0) {
         try request.respond("", .{
             .keep_alive = http_util.keepAlive(request),
@@ -319,7 +313,6 @@ pub fn serveRpc(
         return .ok;
     }
 
-    // ---- Pre-write security & policy gates (R2.1, R2.2) ----
     for (commands) |cmd| {
         if (!claims.allowsRef(cmd.ref)) {
             return rejectRefAcl(app, request, commands, caps, claims, name);
@@ -362,7 +355,6 @@ pub fn serveRpc(
         }
     }
 
-    // ---- Verify and index incoming packfile (R2.3) ----
     const has_pack = body.total_len > parsed.pack_offset;
     if (has_pack) {
         const index_res = if (body.file) |f|
@@ -377,7 +369,6 @@ pub fn serveRpc(
         };
     }
 
-    // ---- Validate targets, force-push rules, and apply CAS ref updates (R3.2) ----
     const is_atomic = hasCapability(caps, "atomic");
     const now = api.unixNow(app.io);
     var results: [max_commands]RefResult = undefined;
@@ -397,7 +388,6 @@ pub fn serveRpc(
                 continue;
             }
         }
-        // Check current ref value for early validation (authoritative check is still CAS below).
         var cur_buf: [64]u8 = undefined;
         const current = git_repo.refValue(cmd.ref, &cur_buf) catch |err| return switch (err) {
             error.Canceled => error.Canceled,
@@ -474,7 +464,6 @@ pub fn serveRpc(
     }
 
     if (atomic_aborted) {
-        // Best-effort rollback of refs updated earlier in this atomic batch.
         var j: usize = commands.len;
         while (j > 0) {
             j -= 1;
@@ -482,7 +471,14 @@ pub fn serveRpc(
             const cmd = commands[j];
             const restore_new: ?[]const u8 = if (cmd.isCreate()) null else cmd.old;
             const restore_old: ?[]const u8 = if (cmd.isDelete()) null else cmd.new;
-            _ = git_repo.updateRef(cmd.ref, restore_new, restore_old) catch {};
+            const rollback = git_repo.updateRef(cmd.ref, restore_new, restore_old) catch |err| {
+                std.log.warn("atomic push rollback failed for {s}: {t}", .{ cmd.ref, err });
+                applied[j] = false;
+                continue;
+            };
+            if (rollback == .stale) {
+                std.log.warn("atomic push rollback stale for {s}", .{cmd.ref});
+            }
             applied[j] = false;
         }
         for (0..commands.len) |i| {
@@ -713,8 +709,8 @@ test "rejects malformed pushes" {
         "00",
         "zzzz",
         "0003",
-        testPkt(oid_a ++ " " ++ oid_b ++ " refs/heads/main"), // no flush
-        testPkt(oid_a ++ " " ++ oid_b ++ " main") ++ "0000", // not under refs/
+        testPkt(oid_a ++ " " ++ oid_b ++ " refs/heads/main"),
+        testPkt(oid_a ++ " " ++ oid_b ++ " main") ++ "0000",
         testPkt(oid_a ++ " " ++ oid_b ++ " refs/heads/../x") ++ "0000",
         testPkt(oid_a ++ " " ++ oid_b[0..39] ++ " refs/heads/x") ++ "0000",
         testPkt("push-cert\x00caps") ++ "0000",

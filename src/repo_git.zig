@@ -792,8 +792,6 @@ pub const Repo = struct {
                 switch (cur.children.items[idx].state) {
                     .dir => |sub| cur = sub,
                     .file, .delete => {
-                        // File replaced or subtree deleted earlier in this same commit:
-                        // start the directory fresh instead of inheriting old base_tree children.
                         const sub = try arena.create(DirNode);
                         sub.* = .{ .ignore_base = true };
                         cur.children.items[idx].state = .{ .dir = sub };
@@ -856,7 +854,6 @@ pub const Repo = struct {
                             return error.PathRejected;
                         }
                     } else if (was_tree and git2.git_treebuilder_get(bld.?, name_z.ptr) != null) {
-                        // Deleting the last entry in an existing directory prunes the empty subtree.
                         if (git2.git_treebuilder_remove(bld.?, name_z.ptr) != git2.ok) return error.GitFailed;
                     }
                 },
@@ -997,7 +994,6 @@ pub const Repo = struct {
         }
     }
 
-    /// Returns null only when `.lock` contention (`GIT_ELOCKED`) asks for retry.
     fn updateRefOnce(
         repo: *git2.Repository,
         ref_z: [:0]const u8,
@@ -1209,7 +1205,6 @@ pub const Repo = struct {
                 (p_info != null and ci.mode == p_info.?.mode and std.mem.eql(u8, &ci.oid.id, &p_info.?.oid.id))
             else
                 p_info == null;
-            // TREESAME to any parent means this commit did not introduce a change to `path`.
             if (same) return false;
         }
         return true;
@@ -1418,8 +1413,6 @@ pub const Repo = struct {
         return true;
     }
 
-    /// Flags for every diff gitd runs: no external diff or textconv
-    /// programs (R2.4), no color, no rename detection.
     const diff_flags = [_][]const u8{ "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames" };
 
     pub const FileChange = struct {
@@ -1790,20 +1783,17 @@ test "libgit2 buildCommit, lsTree, readBlob, log, listBranches, updateRef, and g
     const repo = try Repo.open(io, gpa, &store, name);
 
     var ref_buf: [64]u8 = undefined;
-    // Unborn main/HEAD returns null.
     try std.testing.expect((try repo.refValue("refs/heads/main", &ref_buf)) == null);
     try std.testing.expect((try repo.refValue("HEAD", &ref_buf)) == null);
     try std.testing.expect((try repo.resolveCommit("refs/heads/main", &ref_buf)) == null);
 
     const author: Repo.Author = .{ .name = "Agent One", .email = "a1@example.com" };
 
-    // Path safety: `.git` segment rejected without touching repo.
     try std.testing.expectError(
         error.PathRejected,
         repo.buildCommit(null, &.{.{ .path = ".git/config", .content = "bad" }}, "bad", author, &ref_buf),
     );
 
-    // Root commit with nested directories and an empty blob.
     var c1_buf: [64]u8 = undefined;
     const c1 = try repo.buildCommit(null, &.{
         .{ .path = "README.md", .content = "hello\n" },
@@ -1813,25 +1803,19 @@ test "libgit2 buildCommit, lsTree, readBlob, log, listBranches, updateRef, and g
     }, "initial commit\n\nDetailed body.", author, &c1_buf);
     try std.testing.expectEqual(@as(usize, 40), c1.len);
 
-    // CAS create + stale second create.
     try std.testing.expectEqual(Repo.RefUpdate.updated, try repo.updateRef("refs/heads/main", c1, null));
     try std.testing.expectEqual(Repo.RefUpdate.stale, try repo.updateRef("refs/heads/main", c1, null));
 
-    // refValue & resolveCommit work through HEAD and refs/heads/main.
     var h_buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings(c1, (try repo.refValue("HEAD", &h_buf)).?);
     try std.testing.expectEqualStrings(c1, (try repo.resolveCommit("HEAD", &h_buf)).?);
     try std.testing.expectEqualStrings(c1, (try repo.resolveCommit("main", &h_buf)).?);
 
-    // Non-existent ref CAS update returns .stale, never recreates missing branch.
     try std.testing.expectEqual(Repo.RefUpdate.stale, try repo.updateRef("refs/heads/ghost", c1, c1));
     try std.testing.expect((try repo.refValue("refs/heads/ghost", &h_buf)) == null);
 
-    // Same-OID CAS update succeeds cleanly.
     try std.testing.expectEqual(Repo.RefUpdate.updated, try repo.updateRef("refs/heads/main", c1, c1));
 
-    // Commit 2: update file, delete last file in `docs/guide`, replace file<->dir, duplicate path in slice,
-    // plus no-op deletion under a blob path (`README.md/nope` must NOT delete `README.md`).
     var c2_buf: [64]u8 = undefined;
     const c2 = try repo.buildCommit(c1, &.{
         .{ .path = "docs/guide/intro.md", .content = null },
@@ -1844,7 +1828,6 @@ test "libgit2 buildCommit, lsTree, readBlob, log, listBranches, updateRef, and g
     }, "second commit", author, &c2_buf);
     try std.testing.expectEqual(Repo.RefUpdate.updated, try repo.updateRef("refs/heads/main", c2, c1));
 
-    // Deleting a non-empty subtree via missing parent dir/tree: verify `docs/guide` was pruned!
     const root_entries = try repo.lsTree(c2, null, false);
     defer root_entries.deinit(gpa);
     var saw_docs = false;
@@ -1862,32 +1845,27 @@ test "libgit2 buildCommit, lsTree, readBlob, log, listBranches, updateRef, and g
     try std.testing.expect(saw_docs);
     try std.testing.expect(saw_readme);
 
-    // Note `c1` commit tree still works, and `docs` at `c2` only contains `v2.md` (`docs/guide` pruned).
     const docs_entries = try repo.lsTree(c2, "docs", false);
     defer docs_entries.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 1), docs_entries.items.len);
     try std.testing.expectEqualStrings("docs/v2.md", docs_entries.items[0].path);
 
-    // Exact entry & non-exact on a blob path returns empty, missing returns empty.
     const exact_nested = try repo.lsTree(c2, "src/empty.txt/nested.txt", true);
     defer exact_nested.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 1), exact_nested.items.len);
     try std.testing.expectEqual(Repo.EntryKind.blob, exact_nested.items[0].kind);
     try std.testing.expectEqual(@as(?u64, 7), exact_nested.items[0].size);
 
-    // Blob size limits: exact max succeeds, max - 1 returns OutputTooLarge.
     const readme_bytes = try repo.readBlob(readme_oid, 6);
     defer gpa.free(readme_bytes);
     try std.testing.expectEqualStrings("hello\n", readme_bytes);
     try std.testing.expectError(error.OutputTooLarge, repo.readBlob(readme_oid, 5));
-    // resolveCommit rejects blob OID.
     try std.testing.expect((try repo.resolveCommit(readme_oid, &h_buf)) == null);
 
     const blob_as_dir = try repo.lsTree(c2, "README.md", false);
     defer blob_as_dir.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 0), blob_as_dir.items.len);
 
-    // Branch listing ordered alphabetically, with commit metadata.
     var c_feat_buf: [64]u8 = undefined;
     const c_feat = try repo.buildCommit(c1, &.{
         .{ .path = "feat.txt", .content = "feature" },
@@ -1904,7 +1882,6 @@ test "libgit2 buildCommit, lsTree, readBlob, log, listBranches, updateRef, and g
     try std.testing.expectEqualStrings(c2, branches.items[1].commit);
     try std.testing.expectEqualStrings("second commit", branches.items[1].subject);
 
-    // Two-parent commit via commitTree + path-filtered log + single log.
     const c2_tree = (try repo.lsTree(c2, null, false));
     c2_tree.deinit(gpa);
     const rev_tree_raw = try repo.gitOutput(&.{ "rev-parse", "--verify", "main^{tree}" }, .{});
@@ -1923,15 +1900,12 @@ test "libgit2 buildCommit, lsTree, readBlob, log, listBranches, updateRef, and g
     try std.testing.expectEqualStrings("initial commit", single_log.items[0].subject);
     try std.testing.expectEqualStrings("Detailed body.", single_log.items[0].body);
 
-    // Path-filtered log on `docs` dir finds both c2 (`docs/v2.md` + deleted `docs/guide`) and c1 (`docs/guide/intro.md`),
-    // skipping merge_sha because merge_sha's `docs` tree matches `c2`!
     const docs_log = try repo.log(merge_sha, 10, "docs", false);
     defer docs_log.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 2), docs_log.items.len);
     try std.testing.expectEqualStrings(c2, docs_log.items[0].sha);
     try std.testing.expectEqualStrings(c1, docs_log.items[1].sha);
 
-    // Annotated tag resolves cleanly by ref name and by raw tag OID, and works with lsTree.
     gpa.free(try repo.gitOutput(
         &.{ "tag", "-a", "v1", "-m", "release", c1 },
         .{ .env = &.{ .{ "GIT_COMMITTER_NAME", "gitd" }, .{ "GIT_COMMITTER_EMAIL", "gitd@localhost" } } },
@@ -1945,13 +1919,11 @@ test "libgit2 buildCommit, lsTree, readBlob, log, listBranches, updateRef, and g
     defer tag_tree.deinit(gpa);
     try std.testing.expect(tag_tree.items.len > 0);
 
-    // CAS delete & unconditional delete.
     try std.testing.expectEqual(Repo.RefUpdate.stale, try repo.updateRef("refs/heads/alpha", null, c1));
     try std.testing.expectEqual(Repo.RefUpdate.updated, try repo.updateRef("refs/heads/alpha", null, c_feat));
     try std.testing.expect((try repo.refValue("refs/heads/alpha", &h_buf)) == null);
     try std.testing.expectEqual(Repo.RefUpdate.updated, try repo.updateRef("refs/heads/alpha", null, null));
 
-    // Real git fsck verifies every tree/blob/commit created in-process is 100% valid.
     const fsck_out = try repo.gitOutput(&.{ "fsck", "--strict", "--full" }, .{});
     gpa.free(fsck_out);
 }
@@ -1983,8 +1955,6 @@ test "indexPackSlice accepts valid pack containing a 160000 submodule gitlink" {
     const src_repo = try Repo.open(io, gpa, &store, src_name);
     const dst_repo = try Repo.open(io, gpa, &store, dst_name);
 
-    // Create a tree containing a 160000 submodule gitlink pointing to an external commit OID
-    // not present in the repo, commit it, and pack it with `git pack-objects --stdout`.
     const tree_raw = try src_repo.gitOutput(&.{"mktree"}, .{
         .stdin = "160000 commit 1111111111111111111111111111111111111111\tsubmod\n",
     });

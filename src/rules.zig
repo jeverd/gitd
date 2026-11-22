@@ -258,7 +258,7 @@ test "evaluate combines matching rules with deny-wins and strategy checks" {
 
     const main = evaluate(&rules, "refs/heads/main");
     try testing.expect(!main.allow_direct_push);
-    try testing.expect(!main.allow_force_push); // denied by rule 1 even though rule 2 allows
+    try testing.expect(!main.allow_force_push);
     try testing.expect(!main.allow_delete);
     try testing.expectEqualStrings("squash", main.required_merge_strategy.?);
     try testing.expect(!main.strategy_conflict);

@@ -9,7 +9,6 @@
 const std = @import("std");
 
 pub const max_part_len = 64;
-/// Longest valid name: two parts and the slash.
 pub const max_len = max_part_len * 2 + 1;
 
 pub const Error = error{InvalidRepoName};
@@ -66,9 +65,7 @@ test "invalid names" {
         "acme/web/extra", "../web",          "acme/..",                              "acme/.hidden",
         "Acme/web",       "acme/web.git",    "acme/web.lock",                        "acme/we b",
         "acme/web%2f",    "acme/-web",       "acme/_web",                            "acme//web",
-        "acme/web\x00",   "acme/w\xc3\xa9b", &repeat(max_part_len + 1, 'x') ++ "/y",
-            // Found by fuzzing: `..` inside a part.
-        "eb..b/b",
+        "acme/web\x00",   "acme/w\xc3\xa9b", &repeat(max_part_len + 1, 'x') ++ "/y", "eb..b/b",
     };
     for (bad) |name| {
         try std.testing.expectError(error.InvalidRepoName, parse(name));
@@ -83,7 +80,6 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) anyerror!void {
     var buf: [max_len + 8]u8 = undefined;
     const input = buf[0..smith.slice(&buf)];
     const name = parse(input) catch return;
-    // A valid name never contains a path traversal or a second slash.
     try std.testing.expect(std.mem.find(u8, name.full, "..") == null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.countScalar(u8, name.full, '/'));
     try std.testing.expect(name.full[0] != '.' and name.repo[0] != '.');

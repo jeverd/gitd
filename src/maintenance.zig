@@ -21,7 +21,7 @@ const events = @import("events.zig");
 const Db = @import("db.zig").Db;
 
 pub const max_quota_branches: u64 = 1_000_000;
-pub const max_quota_bytes: u64 = 1024 * 1024 * 1024 * 1024; // 1 TiB
+pub const max_quota_bytes: u64 = 1024 * 1024 * 1024 * 1024;
 pub const max_prune_seconds: u32 = 7 * 24 * 60 * 60;
 
 /// Synchronizes garbage collection and repo deletion/recreation per repo.
@@ -112,8 +112,6 @@ pub const Coordinator = struct {
     }
 };
 
-// ---- Quotas ----
-
 pub const EffectiveQuota = struct {
     configured_max_branches: u64,
     configured_max_repo_bytes: u64,
@@ -172,8 +170,6 @@ pub fn checkDiskQuota(app: *server.App, name: repo_name.Name, incoming_bytes: u6
     }
     return .ok;
 }
-
-// ---- GC execution & background reaper ----
 
 pub const GcResult = struct {
     before_bytes: u64,
@@ -262,8 +258,6 @@ pub fn sweepDue(app: *server.App) Io.Cancelable!void {
         _ = try runGcOnce(app, name, repo_row.id, app.gc_prune_seconds);
     }
 }
-
-// ---- Admin API ----
 
 pub fn serveApi(
     app: *server.App,
@@ -394,14 +388,13 @@ test "coordinator blocks duplicate gc and releases on delete cleanup" {
     defer app.maint.deinit(gpa);
 
     try std.testing.expect(try app.maint.beginGc(&app, "acme/web", "id1"));
-    try std.testing.expect(!try app.maint.beginGc(&app, "acme/web", "id1")); // busy
-    try std.testing.expect(!try app.maint.beginGc(&app, "acme/web", "wrong")); // mismatched incarnation
+    try std.testing.expect(!try app.maint.beginGc(&app, "acme/web", "id1"));
+    try std.testing.expect(!try app.maint.beginGc(&app, "acme/web", "wrong"));
     app.maint.endGc(&app, "acme/web", "id1", 200, true);
     const m = (try db.getRepoMaint(io, gpa, "acme/web")).?;
     defer m.deinit(gpa);
     try std.testing.expectEqual(@as(i64, 200), m.last_gc_at);
 
-    // Deleting when GC ran cleanly leaves zero leaked entries.
     try std.testing.expect(try app.maint.beginGc(&app, "acme/web", "id1"));
     try app.repo_lock.lock(io);
     defer app.repo_lock.unlock(io);

@@ -511,33 +511,67 @@ pub const Db = struct {
         return list.toOwnedSlice(gpa);
     }
 
+    const DeliveryCol = enum(c_int) {
+        id = 0,
+        webhook_id = 1,
+        status = 2,
+        attempts = 3,
+        last_status = 4,
+        last_error = 5,
+        updated_at = 6,
+        url = 7,
+        event_id = 8,
+        event_repo = 9,
+        event_kind = 10,
+        event_ref = 11,
+        event_old = 12,
+        event_new = 13,
+        event_detail = 14,
+        event_created_at = 15,
+        secret = 16,
+    };
+
     fn readDelivery(stmt: *sqlite3_stmt, gpa: std.mem.Allocator) Error!Delivery {
-        // Text columns: 2 status, 5 last_error, 7 url, 9-14 event, 16 secret.
-        const cols = [_]c_int{ 2, 5, 7, 9, 10, 11, 12, 13, 14, 16 };
-        var texts: [cols.len][]const u8 = undefined;
-        var done: usize = 0;
-        errdefer for (texts[0..done]) |t| gpa.free(t);
-        while (done < cols.len) : (done += 1) texts[done] = try columnText(stmt, cols[done], gpa);
+        const status = try columnText(stmt, @backingInt(DeliveryCol.status), gpa);
+        errdefer gpa.free(status);
+        const last_error = try columnText(stmt, @backingInt(DeliveryCol.last_error), gpa);
+        errdefer gpa.free(last_error);
+        const url = try columnText(stmt, @backingInt(DeliveryCol.url), gpa);
+        errdefer gpa.free(url);
+        const event_repo = try columnText(stmt, @backingInt(DeliveryCol.event_repo), gpa);
+        errdefer gpa.free(event_repo);
+        const event_kind = try columnText(stmt, @backingInt(DeliveryCol.event_kind), gpa);
+        errdefer gpa.free(event_kind);
+        const event_ref = try columnText(stmt, @backingInt(DeliveryCol.event_ref), gpa);
+        errdefer gpa.free(event_ref);
+        const event_old = try columnText(stmt, @backingInt(DeliveryCol.event_old), gpa);
+        errdefer gpa.free(event_old);
+        const event_new = try columnText(stmt, @backingInt(DeliveryCol.event_new), gpa);
+        errdefer gpa.free(event_new);
+        const event_detail = try columnText(stmt, @backingInt(DeliveryCol.event_detail), gpa);
+        errdefer gpa.free(event_detail);
+        const secret = try columnText(stmt, @backingInt(DeliveryCol.secret), gpa);
+        errdefer gpa.free(secret);
         return .{
-            .id = sqlite3_column_int64(stmt, 0),
-            .webhook_id = sqlite3_column_int64(stmt, 1),
-            .status = texts[0],
-            .attempts = sqlite3_column_int64(stmt, 3),
-            .last_status = sqlite3_column_int64(stmt, 4),
-            .last_error = texts[1],
-            .updated_at = sqlite3_column_int64(stmt, 6),
-            .url = texts[2],
+            .id = sqlite3_column_int64(stmt, @backingInt(DeliveryCol.id)),
+            .webhook_id = sqlite3_column_int64(stmt, @backingInt(DeliveryCol.webhook_id)),
+            .status = status,
+            .attempts = sqlite3_column_int64(stmt, @backingInt(DeliveryCol.attempts)),
+            .last_status = sqlite3_column_int64(stmt, @backingInt(DeliveryCol.last_status)),
+            .last_error = last_error,
+            .updated_at = sqlite3_column_int64(stmt, @backingInt(DeliveryCol.updated_at)),
+            .url = url,
             .event = .{
-                .id = sqlite3_column_int64(stmt, 8),
-                .repo = texts[3],
-                .kind = texts[4],
-                .ref = texts[5],
-                .old = texts[6],
-                .new = texts[7],
-                .detail = texts[8],
-                .created_at = sqlite3_column_int64(stmt, 15),
+                .id = sqlite3_column_int64(stmt, @backingInt(DeliveryCol.event_id)),
+                .repo = event_repo,
+                .kind = event_kind,
+                .ref = event_ref,
+                .old = event_old,
+                .new = event_new,
+                .detail = event_detail,
+                .created_at = sqlite3_column_int64(stmt, @backingInt(DeliveryCol.event_created_at)),
             },
-            .secret = texts[9],
+            .secret = secret,
         };
     }
 
@@ -1379,7 +1413,7 @@ test "webhooks queue a delivery per event, and deleting cleans up" {
     const hook = try db.insertWebhook(io, "a/b", "http://x/hook", "whsec_1", 1);
     _ = try db.insertWebhook(io, "a/c", "http://y/hook", "whsec_2", 1);
     _ = try db.insertEvent(io, .{ .repo = "a/b", .kind = "push", .ref = "refs/heads/main", .created_at = 5 });
-    _ = try db.insertEvent(io, .{ .repo = "a/z", .kind = "push", .created_at = 6 }); // no webhook
+    _ = try db.insertEvent(io, .{ .repo = "a/z", .kind = "push", .created_at = 6 });
 
     const due = try db.dueDeliveries(io, gpa, 0, 10);
     defer Db.freeDeliveries(gpa, due);
@@ -1393,7 +1427,7 @@ test "webhooks queue a delivery per event, and deleting cleans up" {
     try std.testing.expectEqual(@as(usize, 1), claimed.len);
     const again = try db.claimDueDeliveries(io, gpa, 0, 10);
     defer Db.freeDeliveries(gpa, again);
-    try std.testing.expectEqual(@as(usize, 0), again.len); // in flight
+    try std.testing.expectEqual(@as(usize, 0), again.len);
     try db.requeueSending(io);
     try db.updateDelivery(io, due[0].id, "pending", 1, 5000, 500, "HTTP 500", 7);
     const later = try db.dueDeliveries(io, gpa, 4999, 10);
@@ -1430,7 +1464,7 @@ test "branch expiries" {
     try db.setBranchTtl(io, "a/b", "id1", "refs/heads/x", 100);
     try db.setBranchTtl(io, "a/b", "id1", "refs/heads/y", 50);
     try db.setBranchTtl(io, "a/c", "id2", "refs/heads/z", 300);
-    try db.setBranchTtl(io, "a/b", "id1", "refs/heads/x", 200); // replaces
+    try db.setBranchTtl(io, "a/b", "id1", "refs/heads/x", 200);
 
     const due = try db.listBranchTtls(io, gpa, "", 200, 10);
     defer Db.freeBranchTtls(gpa, due);
@@ -1581,7 +1615,6 @@ test "commit checks round-trip and branch_rules schema upgrade" {
     defer Db.freeCommitChecks(gpa, cleared);
     try std.testing.expectEqual(@as(usize, 0), cleared.len);
 
-    // Ensure idempotent column check succeeds repeatedly.
     try db.ensureBranchRuleColumns();
 }
 

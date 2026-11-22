@@ -66,7 +66,6 @@ pub const GitError = extern struct {
     klass: c_int,
 };
 
-// Error codes from <git2/errors.h>
 pub const ok: c_int = 0;
 pub const err_not_found: c_int = -3;
 pub const err_exists: c_int = -4;
@@ -79,7 +78,6 @@ pub const err_modified: c_int = -15;
 pub const err_invalid: c_int = -21;
 pub const err_iter_over: c_int = -31;
 
-// Object types from <git2/types.h>
 pub const obj_any: c_int = -2;
 pub const obj_invalid: c_int = -1;
 pub const obj_commit: c_int = 1;
@@ -87,32 +85,26 @@ pub const obj_tree: c_int = 2;
 pub const obj_blob: c_int = 3;
 pub const obj_tag: c_int = 4;
 
-// File modes from <git2/types.h>
 pub const mode_tree: c_int = 0o040000;
 pub const mode_blob: c_int = 0o100644;
 pub const mode_blob_executable: c_int = 0o100755;
 pub const mode_link: c_int = 0o120000;
 pub const mode_commit: c_int = 0o160000;
 
-// Reference types from <git2/types.h>
 pub const ref_direct: c_int = 1;
 pub const ref_symbolic: c_int = 2;
 
-// Revwalk sort modes from <git2/revwalk.h>
 pub const sort_none: c_uint = 0;
 pub const sort_topological: c_uint = 1 << 0;
 pub const sort_time: c_uint = 1 << 1;
 
-// Feature flags from <git2/common.h>
 pub const feature_threads: c_int = 1 << 0;
 
-// Global option keys from <git2/common.h>
 pub const opt_set_search_path: c_int = 5;
 pub const opt_enable_strict_object_creation: c_int = 14;
 pub const opt_enable_strict_hash_verification: c_int = 22;
 pub const opt_set_owner_validation: c_int = 36;
 
-// Config levels from <git2/config.h>
 pub const config_programdata: c_int = 1;
 pub const config_system: c_int = 2;
 pub const config_xdg: c_int = 3;
@@ -336,8 +328,6 @@ pub fn ensureInit() Error!void {
 
                 if ((git_libgit2_features() & feature_threads) == 0) return error.Git2InitFailed;
 
-                // Disable system/global/XDG/ProgramData gitconfig and attributes
-                // so host configuration cannot affect server behavior (R2.4).
                 for ([_]c_int{
                     config_programdata,
                     config_system,
