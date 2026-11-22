@@ -344,12 +344,10 @@ test "applyUnifiedPatch handles multi-hunk, EOF newline, and mismatches" {
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("a\nB_NEW\nc\nd\ne\nf\ng\n", out);
 
-    // Inserting into an empty file
     const added = try applyUnifiedPatch(testing.allocator, "", "@@ -0,0 +1,2 @@\n+hello\n+world\n", 1024);
     defer testing.allocator.free(added);
     try testing.expectEqualStrings("hello\nworld\n", added);
 
-    // Preserving no-trailing-newline when modified
     const no_nl = try applyUnifiedPatch(testing.allocator, "a\nb", "@@ -1,2 +1,2 @@\n a\n-b\n\\ No newline at end of file\n+B\n\\ No newline at end of file\n", 1024);
     defer testing.allocator.free(no_nl);
     try testing.expectEqualStrings("a\nB", no_nl);

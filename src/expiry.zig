@@ -54,7 +54,6 @@ fn reapOne(app: *server.App, ttl: Db.BranchTtl, now: i64) Io.Cancelable!void {
         }
     }.f;
 
-    // The repo may have been deleted since the expiry was set.
     const name = repo_name.parse(ttl.repo) catch return forget(app, ttl);
     const exists = (app.db.getRepo(io, app.gpa, ttl.repo) catch |err| {
         std.log.err("checking repo {s}: {t}", .{ ttl.repo, err });
@@ -62,7 +61,6 @@ fn reapOne(app: *server.App, ttl: Db.BranchTtl, now: i64) Io.Cancelable!void {
     }) orelse return forget(app, ttl);
     const same = std.mem.eql(u8, exists.id, ttl.repo_id);
     exists.deinit(app.gpa);
-    // The expiry belongs to a deleted repo that has since been made again.
     if (!same) return forget(app, ttl);
 
     const repo = repo_git.Repo.open(io, app.gpa, app.store, name) catch return forget(app, ttl);
@@ -82,7 +80,6 @@ fn reapOne(app: *server.App, ttl: Db.BranchTtl, now: i64) Io.Cancelable!void {
                 return;
             },
         };
-        // A push moved it in between: keep the expiry and try next round.
         if (outcome == .stale) return;
         events.record(app, .{ .repo = ttl.repo, .kind = "branch_expired", .ref = ttl.ref, .old = oid, .detail = "lifetime ended", .created_at = now });
         app.db.recordBranchExpired(io, ttl.repo) catch |err| std.log.err("recording expired count of {s}: {t}", .{ ttl.repo, err });

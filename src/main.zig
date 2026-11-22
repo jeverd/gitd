@@ -1,5 +1,3 @@
-//! gitd entry point. Wires modules together; no feature logic (R1.1).
-
 const std = @import("std");
 const Io = std.Io;
 const auth = @import("auth.zig");
@@ -85,8 +83,6 @@ fn usageError() u8 {
     return 2;
 }
 
-/// Reads a timeout from the environment, or returns `default`. Returns
-/// null, after logging, when the value is not 1-3600.
 fn secondsFromEnv(init: std.process.Init, name: []const u8, default: u32) ?u32 {
     const text = init.environ_map.get(name) orelse return default;
     const seconds = std.fmt.parseInt(u32, text, 10) catch 0;
@@ -97,8 +93,6 @@ fn secondsFromEnv(init: std.process.Init, name: []const u8, default: u32) ?u32 {
     return seconds;
 }
 
-/// Reads a duration in milliseconds from the environment, or returns
-/// `default`. Returns null, after logging, when the value is not 1-600000.
 fn msFromEnv(init: std.process.Init, name: []const u8, default: i64) ?i64 {
     const text = init.environ_map.get(name) orelse return default;
     const ms = std.fmt.parseInt(i64, text, 10) catch 0;
@@ -141,10 +135,6 @@ fn createKey(init: std.process.Init, opts: Options) !u8 {
     return 0;
 }
 
-/// Registers an admin key read from stdin, so a deployment can choose the
-/// key up front (a container's environment, say). The key is never an
-/// argument, where other processes could read it. Adding a key that is
-/// already there does nothing.
 fn addKey(init: std.process.Init, opts: Options) !u8 {
     const io = init.io;
     var buf: [256]u8 = undefined;

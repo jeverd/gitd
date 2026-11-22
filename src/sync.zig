@@ -170,7 +170,6 @@ pub fn serveApi(
 }
 
 fn handleSyncFailure(request: *http.Server.Request, dir: []const u8, code: u8, stderr: []const u8, has_token: bool) api.HandleError!http.Status {
-    // Never log raw stderr when a token was sent (R2.5).
     if (has_token) {
         std.log.info("git {s} failed with exit code {d}", .{ dir, code });
     } else {
@@ -226,7 +225,6 @@ fn validToken(tok: []const u8) bool {
     return true;
 }
 
-/// Formats `Authorization: Basic base64(user:token)` into `out`.
 fn formatBasicAuthHeader(out: []u8, user: []const u8, tok: []const u8) ?[]const u8 {
     var raw_buf: [max_username_len + 1 + max_token_len]u8 = undefined;
     const raw = std.mem.print(&raw_buf, "{s}:{s}", .{ user, tok }) catch return null;

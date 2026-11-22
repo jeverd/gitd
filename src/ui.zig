@@ -80,8 +80,8 @@ fn state(app: *server.App, request: *http.Server.Request) api.HandleError!http.S
         const r = repo_git.Repo.open(app.io, arena, app.store, name) catch return api.internal(request);
         const branches = r.listBranches() catch |err| switch (err) {
             error.Canceled => return error.Canceled,
-            // The repo may be mid-delete; show it without branches.
-            else => repo_git.Repo.Branches{ .raw = &.{}, .items = &.{} },
+            error.GitFailed => repo_git.Repo.Branches{ .raw = &.{}, .items = &.{} },
+            else => return api.internal(request),
         };
         const ttls = app.db.listBranchTtls(app.io, arena, repo.name, 0, 10_000) catch return api.internal(request);
         const locks = app.db.listBranchLocks(app.io, arena, repo.name) catch return api.internal(request);

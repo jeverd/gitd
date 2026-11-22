@@ -1,13 +1,3 @@
-//! Admin API keys and signed repo tokens (R2.1).
-//!
-//! A repo token is `gitd_t_<payload>.<mac>`: base64url JSON claims, then an
-//! HMAC-SHA256 over `gitd_t_<payload>`. The server keeps no token state, so
-//! a token cannot be revoked early; keep expiries short. Claims name the
-//! repo's random id as well as its name, so deleting a repo ends its tokens.
-//!
-//! An admin key is `gitd_k_` plus 32 random bytes in hex. The database
-//! stores only its SHA-256, so a leaked database does not leak keys.
-
 const std = @import("std");
 const repo_name = @import("repo_name.zig");
 const ref_name = @import("ref_name.zig");
@@ -22,17 +12,11 @@ pub const Secret = [secret_len]u8;
 
 pub const token_prefix = "gitd_t_";
 pub const key_prefix = "gitd_k_";
-/// Longer tokens are rejected before decoding (R2.3).
 pub const max_token_len = 4096;
-/// A token can limit writes to at most this many ref patterns (R2.2).
 pub const max_ref_patterns = 4;
-/// Total bytes of all ref patterns in one token.
 pub const max_ref_patterns_bytes = 600;
-/// A token can limit access to at most this many path patterns.
 pub const max_path_patterns = 4;
-/// Total bytes of all path patterns in one token.
 pub const max_path_patterns_bytes = 600;
-/// Upper bound on a token's lifetime, in seconds.
 pub const max_ttl_seconds = 24 * 60 * 60;
 pub const default_ttl_seconds = 15 * 60;
 
@@ -218,7 +202,6 @@ pub const Claims = struct {
     }
 };
 
-/// The JSON shape inside a token.
 const Payload = struct {
     v: u8,
     repo: []const u8,
@@ -304,7 +287,6 @@ pub fn verify(secret: *const Secret, token: []const u8, now: i64) VerifyError!Cl
     HmacSha256.create(&want_mac, signed, secret);
     if (!std.crypto.timing_safe.eql([HmacSha256.mac_length]u8, given_mac, want_mac)) return error.InvalidToken;
 
-    // Signed by us from here on, but still parsed defensively.
     const payload_text = signed[token_prefix.len..];
     var json_buf: [max_token_len]u8 = undefined;
     const json_len = b64.Decoder.calcSizeForSlice(payload_text) catch return error.InvalidToken;
@@ -446,7 +428,6 @@ test "expired, tampered, and foreign tokens are rejected" {
     const other_secret: Secret = @splat(8);
     try std.testing.expectError(error.InvalidToken, verify(&other_secret, token, 0));
 
-    // Flip one byte in the payload, the separator, and the MAC.
     for ([_]usize{ token_prefix.len + 2, std.mem.findScalarLast(u8, token, '.').?, token.len - 2 }) |i| {
         var copy: [max_token_len]u8 = undefined;
         @memcpy(copy[0..token.len], token);
@@ -511,7 +492,6 @@ test "ref patterns survive mint and verify, and limit writes" {
     try big.addRefPattern(long);
     try big.addRefPattern(long);
     try std.testing.expectError(error.TooManyRefPatterns, big.addRefPattern(long));
-    // The largest allowed token still fits.
     _ = try mint(&test_secret, &big, &buf);
 }
 
@@ -573,11 +553,10 @@ test "admin keys hash stably and differ from the key" {
 
 test "authorization header parsing" {
     var scratch: [max_token_len + 256]u8 = undefined;
-    // base64("t:secret-token")
     try std.testing.expectEqualStrings("secret-token", basicPassword("Basic dDpzZWNyZXQtdG9rZW4=", &scratch).?);
     try std.testing.expectEqual(null, basicPassword("Basic !!!", &scratch));
     try std.testing.expectEqual(null, basicPassword("Bearer x", &scratch));
-    try std.testing.expectEqual(null, basicPassword("Basic dXNlcg==", &scratch)); // "user", no colon
+    try std.testing.expectEqual(null, basicPassword("Basic dXNlcg==", &scratch));
     try std.testing.expectEqualStrings("abc", bearer("Bearer abc").?);
     try std.testing.expectEqual(null, bearer("Bearer "));
     try std.testing.expectEqual(null, bearer("Basic abc"));
@@ -590,7 +569,6 @@ test "fuzz verify" {
 fn fuzzVerify(_: void, smith: *std.testing.Smith) anyerror!void {
     var buf: [max_token_len + 16]u8 = undefined;
     const input = buf[0..smith.slice(&buf)];
-    // Without the secret, no input may verify.
     _ = verify(&test_secret, input, 0) catch return;
     return error.ForgedTokenAccepted;
 }

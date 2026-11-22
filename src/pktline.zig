@@ -179,7 +179,7 @@ test "writers and side-band chunking round-trip through reader" {
 
     try writeLine(&out.writer, "# service=git-upload-pack");
     try writeFlush(&out.writer);
-    try writeSideband(&out.writer, .pack, "abcdefghij", 5); // 4 payload bytes per chunk
+    try writeSideband(&out.writer, .pack, "abcdefghij", 5);
     try writeFlush(&out.writer);
 
     var r = Reader.init(out.written());

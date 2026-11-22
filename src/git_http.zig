@@ -71,8 +71,6 @@ pub fn match(method: std.http.Method, path: []const u8, query: []const u8) Match
     return error.BadGitRequest;
 }
 
-/// The query must be exactly `service=<name>`; anything else is rejected so
-/// nothing unexpected reaches the CGI's QUERY_STRING.
 fn serviceFromQuery(query: []const u8) ?Service {
     const prefix = "service=";
     if (!std.mem.startsWith(u8, query, prefix)) return null;

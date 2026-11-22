@@ -113,13 +113,25 @@ fn validKind(kind: []const u8) bool {
     return true;
 }
 
+const EventTarget = union(enum) {
+    repo_wide,
+    ref: []const u8,
+    commit_oid,
+};
+
+fn classifyEventTarget(ref: []const u8) EventTarget {
+    if (ref.len == 0) return .repo_wide;
+    if (std.mem.startsWith(u8, ref, "refs/")) return .{ .ref = ref };
+    return .commit_oid;
+}
+
 pub fn eventVisible(e: Event, access: content.Access) bool {
     if (!access.isReadRefRestricted()) return true;
-    if (std.mem.startsWith(u8, e.ref, "refs/")) return access.canReadRef(e.ref);
-    // Events with no branch ref (e.g. gc_completed) are visible to any reader
-    // of the repo; commit-sha check events remain hidden to read_refs-limited
-    // tokens so they cannot probe unpermitted branches.
-    return e.ref.len == 0;
+    return switch (classifyEventTarget(e.ref)) {
+        .repo_wide => true,
+        .ref => |r| access.canReadRef(r),
+        .commit_oid => false,
+    };
 }
 
 pub fn serveApi(
@@ -136,7 +148,6 @@ pub fn serveApi(
         return api.respondError(request, .forbidden, "forbidden", "this token lacks git:read");
     }
 
-    // Copy headers before sending any response (R3.5).
     const accept = api.findHeader(request, "accept") orelse "";
     const wants_sse_header = std.mem.find(u8, accept, "text/event-stream") != null;
     var last_event_id_buf: [32]u8 = undefined;

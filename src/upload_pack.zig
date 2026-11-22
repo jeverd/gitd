@@ -28,11 +28,7 @@ pub const max_wants: usize = 4096;
 pub const max_haves: usize = 16384;
 pub const max_ref_prefixes: usize = 256;
 pub const max_shallow_commits: usize = 65536;
-/// Repos with packfiles larger than this use `git pack-objects` delta reuse
-/// when Tier 1 direct `.pack` pass-through does not apply (e.g. shallow/dirty clones).
 const pack_reuse_threshold: u64 = 16 * 1024 * 1024;
-
-// ---- Ref discovery: GET /info/refs ----
 
 /// Serves `GET /{ns}/{repo}.git/info/refs?service=git-upload-pack|git-receive-pack`
 /// directly in-process using libgit2 ref enumeration and pkt-line framing.
@@ -47,9 +43,6 @@ pub fn serveInfoRefs(
     var out: std.Io.Writer.Allocating = .init(app.gpa);
     defer out.deinit();
 
-    // Protocol v2 discovery is static and requires no ref scan. Because
-    // POST /git-upload-pack is served natively, read_refs isolation is enforced
-    // in both v1 and v2 (ls-refs + fetch reachability).
     if (service == .upload_pack and pktline.hasProtocolV2(git_protocol)) {
         writeUploadPackV2Advertisement(&out.writer) catch return api.internal(request);
     } else {
@@ -176,8 +169,6 @@ fn writeRefLine(w: *std.Io.Writer, oid: []const u8, name: []const u8, caps: ?[]c
         try w.writeByte('\n');
     }
 }
-
-// ---- Pure Request Parsers (v1 and v2) ----
 
 pub const ParseError = error{ InvalidRequest, UnsupportedCommand, TooManyItems, OutOfMemory };
 
@@ -428,8 +419,6 @@ pub fn parseV2Request(gpa: std.mem.Allocator, bytes: []const u8) ParseError!V2Re
     }
 }
 
-// ---- Native POST /git-upload-pack Handler ----
-
 const ReadBodyError = error{ BodyTooLarge, ClientGone, InvalidGzip, IoFailed, OutOfMemory };
 
 fn readUploadBody(gpa: std.mem.Allocator, request: *http.Server.Request, is_gzip: bool) ReadBodyError![]u8 {
@@ -589,12 +578,10 @@ fn handleV2Fetch(
     const git2_repo = git2.openBare(repo.gitDir()) orelse return api.internal(request);
     defer git2.git_repository_free(git2_repo);
 
-    // Enforce read_refs reachability and object existence for every want (R2.1).
     if (!(checkWantsAllowed(app.gpa, repo, git2_repo, args.wants.items, claims) catch return api.internal(request))) {
         return respondUploadErr(app, request, "not our ref");
     }
 
-    // Determine which `have`s exist locally.
     var common: std.ArrayList(git2.Oid) = .empty;
     defer common.deinit(app.gpa);
     try collectCommonHaves(app.gpa, git2_repo, args.haves.items, &common);
@@ -858,8 +845,6 @@ fn respondUploadErr(app: *server.App, request: *http.Server.Request, msg: []cons
     return .ok;
 }
 
-// ---- Reachability, Negotiation, Shallow & Pack Streaming ----
-
 fn checkWantsAllowed(
     gpa: std.mem.Allocator,
     repo: *const repo_git.Repo,
@@ -879,8 +864,6 @@ fn checkWantsAllowed(
         return true;
     }
 
-    // Restricted read_refs: every want must be an advertised visible tip (or its peeled target)
-    // or an ancestor commit of an advertised visible commit (R2.1).
     const refs = try repo.listRefs(true);
     defer refs.deinit(gpa);
 
@@ -1018,8 +1001,6 @@ const StreamCtx = struct {
 };
 
 fn writePackChunk(writer: *std.Io.Writer, band_max: usize, data: []const u8) std.Io.Writer.Error!void {
-    // Write in bounded 16 KiB chunks so TimedWriter checks the per-write
-    // idle timeout before each chunk instead of blocking inside one large send (R3.4).
     var rest = data;
     while (rest.len > 0) {
         const n = @min(rest.len, 16 * 1024);
@@ -1130,8 +1111,6 @@ fn wantsCoverAllBranches(gpa: std.mem.Allocator, repo: *const repo_git.Repo, wan
     return true;
 }
 
-/// Tier 1: Zero-copy pass-through of a single clean `.pack` file on disk.
-/// Returns true if streamed, false if caller should fall back to Tier 2/3.
 fn tryStreamSinglePack(
     io: Io,
     git_dir: []const u8,
@@ -1161,9 +1140,6 @@ fn tryStreamSinglePack(
     return true;
 }
 
-/// Tier 3: Streams a delta-reusing pack from `git pack-objects --stdout` for large
-/// dirty or shallow repositories (>16 MiB) while keeping wire protocol, auth, and
-/// `read_refs` enforcement native in Zig (R2.1, R2.4, R3.4).
 fn streamGitPackObjects(
     gpa: std.mem.Allocator,
     repo: *const repo_git.Repo,
@@ -1317,8 +1293,6 @@ fn streamPack(
 ) error{ PackFailed, OutOfMemory }!void {
     const pack_info = inspectPackDir(repo.io, repo.gitDir());
 
-    // Tier 1: Clean single-pack full clone — stream the on-disk `.pack` directly
-    // with zero decompression, zero RAM spike, and zero subprocesses.
     if (ofs_delta and !claims.isReadRefRestricted() and common_haves.len == 0 and
         client_shallows.len == 0 and shallow_commits == null and !pack_info.has_loose)
     {
@@ -1329,8 +1303,6 @@ fn streamPack(
         }
     }
 
-    // Tier 3: Large dirty/multi-pack/shallow clones (>16 MiB) — delegate only pack
-    // generation to `git pack-objects` so existing on-disk pack deltas are reused.
     if (pack_info.total_pack_bytes > pack_reuse_threshold and common_haves.len == 0) {
         return streamGitPackObjects(
             gpa,
@@ -1348,14 +1320,11 @@ fn streamPack(
         );
     }
 
-    // Tier 2: In-process libgit2 packbuilder (small/medium repos & incremental fetches).
     var pb: ?*git2.Packbuilder = null;
     if (git2.git_packbuilder_new(&pb, git2_repo) != git2.ok) return error.PackFailed;
     defer git2.git_packbuilder_free(pb.?);
-    // Bounded parallelism for deltafication without unbounded thread fan-out (R3.4).
     _ = git2.git_packbuilder_set_threads(pb.?, 4);
 
-    // Track included commits when include-tag is requested.
     var packed_commits: std.array_hash_map.Auto([20]u8, void) = .empty;
     defer packed_commits.deinit(gpa);
 
@@ -1364,7 +1333,6 @@ fn streamPack(
             if (git2.git_packbuilder_insert_commit(pb.?, &c_oid) != git2.ok) return error.PackFailed;
             if (include_tag) try packed_commits.put(gpa, c_oid.id, {});
         }
-        // Also insert any wanted annotated tag objects directly.
         for (wants) |w_hex| {
             const oid = git2.parseOid(&w_hex) orelse continue;
             var obj: ?*git2.Object = null;
@@ -1403,7 +1371,6 @@ fn streamPack(
         for (common_haves) |h| {
             _ = git2.git_revwalk_hide(walk.?, &h);
         }
-        // Respect client's existing shallow boundary parents by hiding parents of shallow commits.
         for (client_shallows) |s_hex| {
             const s_oid = git2.parseOid(&s_hex) orelse continue;
             var sc: ?*git2.Commit = null;
@@ -1654,12 +1621,10 @@ test "Tier 1 direct single-pack streaming and Tier 3 git pack-objects shallow re
     }, "c2", author, &c2_buf);
     try testing.expectEqual(repo_git.Repo.RefUpdate.updated, try repo.updateRef("refs/heads/main", c2, null));
 
-    // Before gc: loose objects exist, no packs yet.
     const dirty_info = inspectPackDir(io, repo.gitDir());
     try testing.expect(dirty_info.has_loose);
     try testing.expectEqual(@as(usize, 0), dirty_info.pack_count);
 
-    // After gc: exactly 1 pack and 0 loose objects -> Tier 1 eligible.
     try repo.gc(0);
     const clean_info = inspectPackDir(io, repo.gitDir());
     try testing.expect(!clean_info.has_loose);
@@ -1670,7 +1635,6 @@ test "Tier 1 direct single-pack streaming and Tier 3 git pack-objects shallow re
     @memcpy(&c2_hex, c2[0..40]);
     try testing.expect(wantsCoverAllBranches(gpa, &repo, &.{c2_hex}));
 
-    // Tier 1 streams the pack directly and the resulting pack indexes cleanly.
     var t1_out: std.Io.Writer.Allocating = .init(gpa);
     defer t1_out.deinit();
     const streamed = try tryStreamSinglePack(io, repo.gitDir(), clean_info.singlePackName().?, &t1_out.writer, 0);
@@ -1679,7 +1643,6 @@ test "Tier 1 direct single-pack streaming and Tier 3 git pack-objects shallow re
     try dst.indexPackSlice(t1_out.written());
     try testing.expect(try dst.verifyPushedTarget(c2, true));
 
-    // Tier 3 shallow pack excludes c1 while keeping c2 and its unchanged `keep.txt` blob.
     const claims: auth.Claims = .{
         .repo_id = @splat('a'),
         .scopes = .{ .git_read = true },
@@ -1695,7 +1658,6 @@ test "Tier 1 direct single-pack streaming and Tier 3 git pack-objects shallow re
     const shallow_dst = try repo_git.Repo.open(io, gpa, &store, shallow_dst_name);
     try shallow_dst.indexPackSlice(t3_out.written());
     try testing.expect(try shallow_dst.verifyPushedTarget(c2, true));
-    // c1 must NOT be in the shallow pack, while keep.txt at c2 MUST be readable.
     try testing.expect(!(try shallow_dst.verifyPushedTarget(c1, true)));
     const entries = try shallow_dst.lsTree(c2, "keep.txt", true);
     defer entries.deinit(gpa);
