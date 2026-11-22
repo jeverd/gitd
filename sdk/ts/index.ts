@@ -177,6 +177,7 @@ export interface MergeOptions {
   head: string;
   strategy?: "merge" | "squash" | "fast-forward";
   dry_run?: boolean;
+  delete_head?: boolean;
   expected_base_head?: string;
   message?: string;
   author?: { name: string; email: string };
@@ -185,6 +186,25 @@ export interface MergeOptions {
 export interface MergeResult {
   result: "fast_forward" | "merged" | "squashed" | "up_to_date";
   sha: string;
+  head_deleted?: boolean;
+}
+
+export interface BatchMergeOptions {
+  base: string;
+  heads: string[];
+  strategy?: "merge" | "squash";
+  dry_run?: boolean;
+  delete_heads?: boolean;
+  expected_base_head?: string;
+  message?: string;
+  author?: { name: string; email: string };
+}
+
+export interface BatchMergeResult {
+  result: "merged" | "squashed" | "up_to_date";
+  sha: string;
+  merged_heads: string[];
+  deleted_heads: string[];
 }
 
 export interface DryRunMergeResult {
@@ -206,7 +226,9 @@ export interface MergeCheckBranch {
   head: string;
   sha: string;
   mergeable: boolean;
+  blocked_by?: string | null;
   conflicts: string[];
+  missing_checks?: string[];
 }
 
 export interface MergeCheckPair {
@@ -221,12 +243,47 @@ export interface MergeCheckOverlap {
   paths: string[];
 }
 
+export interface ConflictCluster {
+  heads: string[];
+  files: string[];
+}
+
+export interface BlockedHead {
+  head: string;
+  blocked_by: string;
+  conflicts: string[];
+  missing_checks: string[];
+}
+
 export interface MergeCheckResult {
   base: string;
   base_sha: string;
   branches: MergeCheckBranch[];
   pair_conflicts: MergeCheckPair[];
   file_overlaps: MergeCheckOverlap[];
+  clean_heads: string[];
+  conflict_clusters: ConflictCluster[];
+  blocked_heads: BlockedHead[];
+}
+
+export interface IntegrateWaveOptions {
+  base: string;
+  heads: string[];
+  strategy?: "merge" | "squash";
+  deleteHeads?: boolean;
+  requiredChecks?: string[];
+  timeoutMs?: number;
+  resolveCluster?: (cluster: ConflictCluster) => Promise<string | null> | string | null;
+}
+
+export interface IntegrateWaveResult {
+  base: string;
+  sha: string | null;
+  batchMerged: string[];
+  clusterMerged: string[];
+  deletedHeads: string[];
+  unresolvedClusters: ConflictCluster[];
+  blockedHeads: BlockedHead[];
 }
 
 export interface GrepOptions {
@@ -576,6 +633,170 @@ export class GitdClient {
     opts: { base: string; heads: string[]; include_file_overlaps?: boolean },
   ): Promise<MergeCheckResult> {
     return this.#json("POST", `/v1/repos/${repo}/merges/check`, opts);
+  }
+
+  batchMerge(repo: string, opts: BatchMergeOptions): Promise<BatchMergeResult> {
+    return this.#json("POST", `/v1/repos/${repo}/merges/batch`, opts);
+  }
+
+  /** Wait over live SSE until every SHA in `shas` has all `requiredChecks` passing. */
+  async waitForChecks(
+    repo: string,
+    shas: string[],
+    opts: { requiredChecks?: string[]; timeoutMs?: number } = {},
+  ): Promise<Record<string, CommitChecksResult>> {
+    const required = opts.requiredChecks ?? [];
+    const unique = [...new Set(shas)];
+    const results: Record<string, CommitChecksResult> = {};
+    const satisfied = (res: CommitChecksResult): boolean => {
+      if (required.length === 0) return res.rollup === "passed";
+      const byName = new Map(res.checks.map((c) => [c.name, c.status]));
+      return required.every((name) => byName.get(name) === "passed");
+    };
+    const failed = (res: CommitChecksResult): boolean => {
+      if (required.length === 0) return res.rollup === "failed";
+      const byName = new Map(res.checks.map((c) => [c.name, c.status]));
+      return required.some((name) => byName.get(name) === "failed");
+    };
+
+    const history = await this.listEvents(repo, { limit: 1 });
+    const afterId = history.events.length > 0 ? history.events[history.events.length - 1].id : 0;
+
+    const pending = new Set<string>();
+    for (const sha of unique) {
+      const res = await this.listChecks(repo, sha);
+      results[sha] = res;
+      if (failed(res)) {
+        throw new Error(`checks failed on ${sha.slice(0, 10)}`);
+      }
+      if (!satisfied(res)) pending.add(sha);
+    }
+    if (pending.size === 0) return results;
+
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), opts.timeoutMs ?? 60_000);
+    try {
+      for await (const ev of this.streamEvents(repo, { after: afterId, kind: "check_updated", signal: ac.signal })) {
+        const sha = ev.new;
+        if (!pending.has(sha)) continue;
+        const res = await this.listChecks(repo, sha);
+        results[sha] = res;
+        if (failed(res)) {
+          throw new Error(`checks failed on ${sha.slice(0, 10)}`);
+        }
+        if (satisfied(res)) {
+          pending.delete(sha);
+          if (pending.size === 0) {
+            ac.abort();
+            return results;
+          }
+        }
+      }
+    } catch (err) {
+      if (pending.size === 0) return results;
+      if (ac.signal.aborted) throw new Error(`timed out waiting for checks on ${[...pending].join(", ")}`);
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+    return results;
+  }
+
+  planWaveMerge(
+    repo: string,
+    base: string,
+    heads: string[],
+    opts: { includeFileOverlaps?: boolean } = {},
+  ): Promise<MergeCheckResult> {
+    return this.checkMergeConflicts(repo, {
+      base,
+      heads,
+      include_file_overlaps: opts.includeFileOverlaps ?? true,
+    });
+  }
+
+  /**
+   * Integrate a wave of parallel agent branches into `base`:
+   * 1. Optionally waits over SSE for `requiredChecks` on all heads.
+   * 2. Plans clean heads vs conflict clusters via Conflict Radar (`/merges/check`).
+   * 3. Atomically batch-merges all `clean_heads` in one CAS call (`/merges/batch`).
+   * 4. Invokes `resolveCluster` (if supplied) for each conflict cluster and merges the result.
+   */
+  async integrateWave(repo: string, opts: IntegrateWaveOptions): Promise<IntegrateWaveResult> {
+    const deleteHeads = opts.deleteHeads ?? true;
+    const strategy = opts.strategy ?? "merge";
+
+    if (opts.requiredChecks && opts.requiredChecks.length > 0) {
+      const branches = await this.listBranches(repo);
+      const byName = new Map(branches.map((b) => [b.name, b.commit]));
+      const shas = opts.heads.map((h) => byName.get(h)).filter((s): s is string => Boolean(s));
+      if (shas.length > 0) {
+        await this.waitForChecks(repo, shas, {
+          requiredChecks: opts.requiredChecks,
+          timeoutMs: opts.timeoutMs,
+        });
+      }
+    }
+
+    const plan = await this.planWaveMerge(repo, opts.base, opts.heads);
+    const batchMerged: string[] = [];
+    const clusterMerged: string[] = [];
+    const deletedHeads: string[] = [];
+    const unresolvedClusters: ConflictCluster[] = [];
+    let latestSha: string | null = plan.base_sha;
+
+    if (plan.clean_heads.length > 0) {
+      const res = await this.batchMerge(repo, {
+        base: opts.base,
+        heads: plan.clean_heads,
+        strategy,
+        delete_heads: deleteHeads,
+      });
+      latestSha = res.sha;
+      batchMerged.push(...res.merged_heads);
+      deletedHeads.push(...res.deleted_heads);
+    }
+
+    for (const cluster of plan.conflict_clusters) {
+      if (!opts.resolveCluster) {
+        unresolvedClusters.push(cluster);
+        continue;
+      }
+      const resolvedBranch = await opts.resolveCluster(cluster);
+      if (!resolvedBranch) {
+        unresolvedClusters.push(cluster);
+        continue;
+      }
+      if (opts.requiredChecks && opts.requiredChecks.length > 0) {
+        const branches = await this.listBranches(repo);
+        const sha = branches.find((b) => b.name === resolvedBranch)?.commit;
+        if (sha) {
+          await this.waitForChecks(repo, [sha], {
+            requiredChecks: opts.requiredChecks,
+            timeoutMs: opts.timeoutMs,
+          });
+        }
+      }
+      const res = await this.merge(repo, {
+        base: opts.base,
+        head: resolvedBranch,
+        strategy,
+        delete_head: deleteHeads,
+      });
+      latestSha = res.sha;
+      clusterMerged.push(resolvedBranch);
+      if (res.head_deleted) deletedHeads.push(resolvedBranch);
+    }
+
+    return {
+      base: opts.base,
+      sha: latestSha,
+      batchMerged,
+      clusterMerged,
+      deletedHeads,
+      unresolvedClusters,
+      blockedHeads: plan.blocked_heads,
+    };
   }
 
   // ---- Grep, Archive, Sync ----

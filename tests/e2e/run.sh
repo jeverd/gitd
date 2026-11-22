@@ -1469,6 +1469,94 @@ assert b"refs/heads/main" in resp2 and b"spill5m" not in resp2, resp2
 PY
 pass "native upload-pack v2 enforces read_refs isolation and supports gzip bodies"
 
+echo "== delete_head, conflict clusters, and atomic batch merge"
+expect_eq "create batch repo" 201 "$(admin -X POST "$BASE/v1/repos" -d '{"name":"acme/batch"}')"
+expect_eq "seed batch main" 201 "$(admin -X POST "$BASE/v1/repos/acme/batch/commits" \
+  -d '{"branch":"main","expected_head":null,"message":"seed","changes":[{"path":"shared.txt","content":"base\n"}]}')"
+BM_MAIN="$(json '["sha"]')"
+
+# delete_head on single merge deletes head branch, and refuses if head is locked.
+expect_eq "batch del branch" 201 "$(admin -X POST "$BASE/v1/repos/acme/batch/commits" \
+  -d '{"branch":"agent/single","expected_head":null,"from":"main","message":"single","changes":[{"path":"single.txt","content":"one\n"}]}')"
+expect_eq "lock head blocks delete_head" 200 "$(admin -X PUT "$BASE/v1/repos/acme/batch/branches/agent/single/lock" -d '{"reason":"hold"}')"
+expect_eq "merge delete_head refused when head locked" 423 "$(admin -X POST "$BASE/v1/repos/acme/batch/merges" \
+  -d '{"base":"main","head":"agent/single","delete_head":true}')"
+expect_eq "unlock head" 204 "$(admin -X DELETE "$BASE/v1/repos/acme/batch/branches/agent/single/lock")"
+expect_eq "merge with delete_head succeeds" 201 "$(admin -X POST "$BASE/v1/repos/acme/batch/merges" \
+  -d '{"base":"main","head":"agent/single","delete_head":true}')"
+expect_eq "head_deleted true" "True" "$(json '["head_deleted"]')"
+BM_MAIN="$(json '["sha"]')"
+
+# Create 2 clean branches + 2 colliding branches + 1 check-blocked branch.
+expect_eq "wave clean1" 201 "$(admin -X POST "$BASE/v1/repos/acme/batch/commits" \
+  -d '{"branch":"agent/clean1","expected_head":null,"from":"main","message":"c1","changes":[{"path":"f1.txt","content":"1\n"}]}')"
+W_C1="$(json '["sha"]')"
+expect_eq "wave clean2" 201 "$(admin -X POST "$BASE/v1/repos/acme/batch/commits" \
+  -d '{"branch":"agent/clean2","expected_head":null,"from":"main","message":"c2","changes":[{"path":"f2.txt","content":"2\n"}]}')"
+W_C2="$(json '["sha"]')"
+expect_eq "wave coll1" 201 "$(admin -X POST "$BASE/v1/repos/acme/batch/commits" \
+  -d '{"branch":"agent/coll1","expected_head":null,"from":"main","message":"x1","changes":[{"path":"shared.txt","content":"x1\n"}]}')"
+W_X1="$(json '["sha"]')"
+expect_eq "wave coll2" 201 "$(admin -X POST "$BASE/v1/repos/acme/batch/commits" \
+  -d '{"branch":"agent/coll2","expected_head":null,"from":"main","message":"x2","changes":[{"path":"shared.txt","content":"x2\n"}]}')"
+W_X2="$(json '["sha"]')"
+expect_eq "wave unverified" 201 "$(admin -X POST "$BASE/v1/repos/acme/batch/commits" \
+  -d '{"branch":"agent/wip","expected_head":null,"from":"main","message":"wip","changes":[{"path":"wip.txt","content":"wip\n"}]}')"
+
+# Add required check rule on main and pass checks on clean1, clean2, coll1, coll2 (NOT wip).
+expect_eq "batch required check rule" 201 "$(admin -X POST "$BASE/v1/repos/acme/batch/rules" \
+  -d '{"pattern":"refs/heads/main","required_checks":["ci"]}')"
+for S in "$W_C1" "$W_C2" "$W_X1" "$W_X2"; do
+  expect_eq "pass ci on $S" 200 "$(admin -X POST "$BASE/v1/repos/acme/batch/commits/$S/checks" \
+    -d '{"name":"ci","status":"passed"}')"
+done
+
+# Conflict radar returns clean_heads, conflict_clusters, and blocked_heads.
+expect_eq "wave plan check" 200 "$(admin -X POST "$BASE/v1/repos/acme/batch/merges/check" \
+  -d '{"base":"main","heads":["agent/clean1","agent/clean2","agent/coll1","agent/coll2","agent/wip"],"include_file_overlaps":true}')"
+python3 - "$WORK/body" <<'PY' || fail "wave plan clustering mismatch"
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["clean_heads"] == ["agent/clean1", "agent/clean2"], d
+assert len(d["conflict_clusters"]) == 1, d
+assert d["conflict_clusters"][0]["heads"] == ["agent/coll1", "agent/coll2"], d
+assert d["conflict_clusters"][0]["files"] == ["shared.txt"], d
+assert len(d["blocked_heads"]) == 1 and d["blocked_heads"][0]["head"] == "agent/wip", d
+assert d["blocked_heads"][0]["blocked_by"] == "missing_required_check", d
+PY
+pass "merges/check returns clean_heads, conflict_clusters, and blocked_heads"
+
+# Batch merge rejects missing required check before mutating main.
+expect_eq "batch merge rejects missing check" 403 "$(admin -X POST "$BASE/v1/repos/acme/batch/merges/batch" \
+  -d '{"base":"main","heads":["agent/clean1","agent/wip"]}')"
+# Batch merge rolls back atomically on conflict without touching main.
+expect_eq "batch merge conflict leaves main intact" 409 "$(admin -X POST "$BASE/v1/repos/acme/batch/merges/batch" \
+  -d '{"base":"main","heads":["agent/clean1","agent/coll1","agent/coll2"]}')"
+expect_eq "main unchanged after batch conflict" 200 "$(admin "$BASE/v1/repos/acme/batch/log?ref=main&limit=1")"
+expect_eq "main sha unchanged" "$BM_MAIN" "$(json '["commits"][0]["sha"]')"
+# Stale expected_base_head rejected with 409.
+expect_eq "batch merge stale expected_base_head" 409 "$(admin -X POST "$BASE/v1/repos/acme/batch/merges/batch" \
+  -d '{"base":"main","heads":["agent/clean1","agent/clean2"],"expected_base_head":"0000000000000000000000000000000000000000"}')"
+# Atomic batch merge of clean1 + clean2 with delete_heads: true succeeds!
+expect_eq "batch merge clean heads with delete_heads" 201 "$(admin -X POST "$BASE/v1/repos/acme/batch/merges/batch" \
+  -d '{"base":"main","heads":["agent/clean1","agent/clean2"],"expected_base_head":"'"$BM_MAIN"'","delete_heads":true}')"
+python3 - "$WORK/body" <<'PY' || fail "batch merge response mismatch"
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["merged_heads"] == ["agent/clean1", "agent/clean2"], d
+assert d["deleted_heads"] == ["agent/clean1", "agent/clean2"], d
+PY
+expect_eq "f1 on main after batch merge" 200 "$(admin "$BASE/v1/repos/acme/batch/files/f1.txt?ref=main")"
+expect_eq "f2 on main after batch merge" 200 "$(admin "$BASE/v1/repos/acme/batch/files/f2.txt?ref=main")"
+expect_eq "clean1 branch deleted" 200 "$(admin "$BASE/v1/repos/acme/batch/branches")"
+python3 - "$WORK/body" <<'PY' || fail "deleted branches still listed"
+import json, sys
+names = {b["name"] for b in json.load(open(sys.argv[1]))["branches"]}
+assert "agent/single" not in names and "agent/clean1" not in names and "agent/clean2" not in names, names
+PY
+expect_eq "delete temporary batch repo" 204 "$(admin -X DELETE "$BASE/v1/repos/acme/batch")"
+pass "atomic POST /merges/batch and delete_head verified end to end"
+
 # Stop while a slow clone is mid-transfer: gitd must still exit promptly and
 # take its git processes with it.
 head -c 4000000 /dev/urandom >"$SRC/big2.bin"

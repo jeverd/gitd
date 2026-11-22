@@ -159,8 +159,10 @@ test("TypeScript SDK end-to-end", async () => {
 
     const diff = await admin.compare(repoName, "main", "agent/ts/work");
     assert.equal(diff.ahead, 5);
-    const merged = await admin.merge(repoName, { base: "main", head: "agent/ts/work" });
+    const merged = await admin.merge(repoName, { base: "main", head: "agent/ts/work", delete_head: true });
     assert.equal(merged.result, "fast_forward");
+    assert.equal(merged.head_deleted, true);
+    assert.equal((await admin.listBranches(repoName)).some((b) => b.name === "agent/ts/work"), false);
 
     await admin.commit(repoName, {
       branch: "agent/ts/c1",
@@ -176,15 +178,57 @@ test("TypeScript SDK end-to-end", async () => {
       message: "Edit README c2",
       changes: [{ path: "README.md", content: "# C2\n" }],
     });
+    await admin.commit(repoName, {
+      branch: "agent/ts/clean1",
+      expected_head: null,
+      from: "main",
+      message: "Add clean1",
+      changes: [{ path: "clean1.txt", content: "ok1\n" }],
+    });
+    await admin.commit(repoName, {
+      branch: "agent/ts/clean2",
+      expected_head: null,
+      from: "main",
+      message: "Add clean2",
+      changes: [{ path: "clean2.txt", content: "ok2\n" }],
+    });
     const radar = await agent.checkMergeConflicts(repoName, {
       base: "main",
-      heads: ["agent/ts/c1", "agent/ts/c2"],
+      heads: ["agent/ts/c1", "agent/ts/c2", "agent/ts/clean1", "agent/ts/clean2"],
       include_file_overlaps: true,
     });
     assert.equal(radar.branches.every((b) => b.mergeable), true);
     assert.equal(radar.pair_conflicts.length, 1);
     assert.deepEqual(radar.pair_conflicts[0].conflicts, ["README.md"]);
     assert.equal(radar.file_overlaps.length, 1);
+    assert.deepEqual(radar.clean_heads, ["agent/ts/clean1", "agent/ts/clean2"]);
+    assert.equal(radar.conflict_clusters.length, 1);
+    assert.deepEqual(radar.conflict_clusters[0].heads, ["agent/ts/c1", "agent/ts/c2"]);
+    assert.deepEqual(radar.conflict_clusters[0].files, ["README.md"]);
+
+    const waveRes = await admin.integrateWave(repoName, {
+      base: "main",
+      heads: ["agent/ts/c1", "agent/ts/c2", "agent/ts/clean1", "agent/ts/clean2"],
+      deleteHeads: true,
+      resolveCluster: async (cluster) => {
+        assert.deepEqual(cluster.heads, ["agent/ts/c1", "agent/ts/c2"]);
+        await admin.commit(repoName, {
+          branch: "agent/ts/resolved",
+          expected_head: null,
+          from: "main",
+          message: "Resolve README cluster",
+          changes: [{ path: "README.md", content: "# C1 + C2\n" }],
+        });
+        return "agent/ts/resolved";
+      },
+    });
+    assert.deepEqual(waveRes.batchMerged, ["agent/ts/clean1", "agent/ts/clean2"]);
+    assert.deepEqual(waveRes.clusterMerged, ["agent/ts/resolved"]);
+    assert.equal(await admin.readTextFile(repoName, "clean1.txt", "main"), "ok1\n");
+    assert.equal(await admin.readTextFile(repoName, "clean2.txt", "main"), "ok2\n");
+    assert.equal(await admin.readTextFile(repoName, "README.md", "main"), "# C1 + C2\n");
+    assert.equal((await admin.listBranches(repoName)).some((b) => b.name === "agent/ts/clean1"), false);
+    assert.equal((await admin.listBranches(repoName)).some((b) => b.name === "agent/ts/resolved"), false);
 
     // Branch lock visibility + protection rules
     await admin.lockBranch(repoName, "main", "freeze");
@@ -216,6 +260,11 @@ test("TypeScript SDK end-to-end", async () => {
     assert.equal(dryBlocked.blocked_by, "missing_required_check");
     assert.deepEqual(dryBlocked.missing_checks, ["tests"]);
     await checker.postCheck(repoName, c1Info.commit, { name: "tests", status: "passed", summary: "all green" });
+    const waited = await agent.waitForChecks(repoName, [c1Info.commit], {
+      requiredChecks: ["tests"],
+      timeoutMs: 5000,
+    });
+    assert.equal(waited[c1Info.commit].rollup, "passed");
     const chkList = await agent.listChecks(repoName, c1Info.commit);
     assert.equal(chkList.rollup, "passed");
     assert.equal(chkList.checks[0].name, "tests");
@@ -233,7 +282,7 @@ test("TypeScript SDK end-to-end", async () => {
       token: upToken,
     });
     assert.equal(fetched.direction, "fetch");
-    assert.equal(fetched.new_sha, merged.sha);
+    assert.equal(fetched.new_sha, waveRes.sha);
 
     // Quotas, stats & GC
     const quotas = await admin.setQuotas(repoName, { max_branches: 10, max_repo_bytes: 5_000_000 });
