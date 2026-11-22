@@ -187,10 +187,6 @@ pub fn serve(
     return api.respondError(request, .not_found, "not_found", "no such repo route");
 }
 
-// ---- Helpers ----
-
-/// Turns the `ref` query value (default `main`) into a commit oid, or
-/// responds with 400/403/404 and returns null.
 fn commitFromQuery(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, query: []const u8, access: Access, out: *[64]u8) Error!?[]const u8 {
     var decoded: [ref_name.max_len]u8 = undefined;
     const ref = if (std.mem.find(u8, query, "ref=") != null)
@@ -246,7 +242,6 @@ pub fn revFromName(text: []const u8, buf: *[ref_name.max_len]u8) ?[]const u8 {
     return ref_name.validateBranch(text, buf) catch null;
 }
 
-/// Decodes and validates a path taken from the URL.
 fn pathFromUrl(request: *http.Server.Request, raw: []const u8, out: *[repo_path.max_len]u8) Error!?[]const u8 {
     const decoded = api.percentDecode(out, raw, false) orelse {
         _ = try api.respondError(request, .bad_request, "invalid_path", "the path is not valid");
@@ -266,8 +261,6 @@ pub fn gitError(request: *http.Server.Request, err: anyerror) Error!http.Status 
     if (err == error.GitTimedOut) return api.respondError(request, .service_unavailable, "timeout", "the operation took too long");
     return api.internal(request);
 }
-
-// ---- Reads ----
 
 pub const BranchJson = struct {
     name: []const u8,
@@ -336,7 +329,6 @@ fn listBranches(app: *server.App, request: *http.Server.Request, repo: *const re
     return api.respondJson(app.gpa, request, .ok, .{ .branches = visible.items });
 }
 
-/// Validates an optional `ttl_seconds` and records the expiry of `ref`.
 fn ttlInvalid(ttl: ?i64) bool {
     const t = ttl orelse return false;
     return t < 1 or t > expiry.max_ttl_seconds;
@@ -384,7 +376,6 @@ fn readTree(app: *server.App, request: *http.Server.Request, repo: *const repo_g
     const commit = (try commitFromQuery(app, request, repo, query, access, &oid_buf)) orelse return .not_found;
 
     if (dir) |d| {
-        // A path that is missing or is not a directory is a 404.
         const self = repo.lsTree(commit, d, true) catch |err| return gitError(request, err);
         defer self.deinit(app.gpa);
         if (self.items.len != 1 or self.items[0].kind != .tree) {
@@ -596,8 +587,6 @@ fn readArchive(app: *server.App, request: *http.Server.Request, repo: *const rep
     return .ok;
 }
 
-// ---- Writes ----
-
 const AuthorJson = struct { name: []const u8, email: []const u8 };
 
 fn validAuthorField(text: []const u8) bool {
@@ -680,17 +669,13 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
     };
     const Body = struct {
         branch: []const u8,
-        /// The head this commit is built on; null to create the branch.
         expected_head: ?[]const u8,
-        /// Base for a new branch (a ref or oid). Omitted: a root commit.
         from: ?[]const u8 = null,
         message: []const u8,
         author: ?AuthorJson = null,
         changes: []const ChangeJson,
-        /// When creating the branch: delete it after this many seconds.
         ttl_seconds: ?i64 = null,
     };
-    // Refuse before buffering up to 16 MiB for a caller that cannot write.
     if (!access.canWriteAny()) return api.respondError(request, .forbidden, "forbidden", "this token lacks git:write");
     var parsed = api.readJsonLimit(Body, app.gpa, request, max_commit_body) catch |err| return api.respondBodyError(request, err);
     defer parsed.deinit();
@@ -805,7 +790,6 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
     const outcome = repo.updateRef(ref, sha, body.expected_head) catch |err| return gitError(request, err);
     if (outcome == .stale) return staleHead(app, request, repo, name, ref, body.expected_head);
 
-    // A branch made by commit gets the token's lifetime like a pushed one.
     setTtl(app, name, access.repo_id, ref, if (body.expected_head == null) access.branchTtl(body.ttl_seconds) else null);
     const subject = body.message[0 .. std.mem.findScalar(u8, body.message, '\n') orelse body.message.len];
     events.record(app, .{
@@ -820,8 +804,6 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
     return api.respondJson(app.gpa, request, .created, .{ .sha = sha, .branch = body.branch, .parent = parent });
 }
 
-/// Answers a commit that lost the race: 409 with the branch's real head,
-/// so the caller can rebuild on it. Logged as commit_conflict.
 fn staleHead(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, name: repo_name.Name, ref: []const u8, expected: ?[]const u8) Error!http.Status {
     var buf: [64]u8 = undefined;
     const current = repo.refValue(ref, &buf) catch |err| return gitError(request, err);
@@ -933,8 +915,6 @@ fn unlockBranch(app: *server.App, request: *http.Server.Request, name: repo_name
     return .no_content;
 }
 
-// ---- Diff and merge ----
-
 /// Resolves a branch name, full ref, or oid to a commit; responds with
 /// 400/403/404 and returns null when it cannot.
 pub fn resolveNamed(request: *http.Server.Request, repo: *const repo_git.Repo, text: []const u8, what: []const u8, access: Access, out: *[64]u8) Error!?[]const u8 {
@@ -968,7 +948,6 @@ fn compare(app: *server.App, request: *http.Server.Request, repo: *const repo_gi
     var mb_buf: [64]u8 = undefined;
     const merge_base = repo.mergeBase(base, head, &mb_buf) catch |err| return gitError(request, err);
     const counts = repo.aheadBehind(base, head) catch |err| return gitError(request, err);
-    // Like a pull request: what head changed since it left base.
     const from = merge_base orelse base;
     const files = repo.diffFiles(from, head) catch |err| return gitError(request, err);
     defer files.deinit(app.gpa);
@@ -1027,7 +1006,6 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
         head: []const u8,
         strategy: Strategy = .merge,
         dry_run: bool = false,
-        /// Only merge if base is still here.
         expected_base_head: ?[]const u8 = null,
         message: ?[]const u8 = null,
         author: ?AuthorJson = null,
@@ -1214,7 +1192,7 @@ pub fn truncateUtf8(text: []const u8, max: usize) []const u8 {
 
 test truncateUtf8 {
     try std.testing.expectEqualStrings("ab", truncateUtf8("ab", 5));
-    try std.testing.expectEqualStrings("ab", truncateUtf8("ab\xc3\xa9", 3)); // é is 2 bytes
+    try std.testing.expectEqualStrings("ab", truncateUtf8("ab\xc3\xa9", 3));
     try std.testing.expectEqualStrings("ab\xc3\xa9", truncateUtf8("ab\xc3\xa9x", 4));
 }
 

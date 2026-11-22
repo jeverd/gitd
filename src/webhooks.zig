@@ -30,8 +30,6 @@ pub const max_attempts = 5;
 const max_url_len = 2048;
 const batch = 16;
 
-// ---- API ----
-
 pub fn serveApi(app: *server.App, request: *http.Server.Request, name: repo_name.Name, rest: []const u8, query: []const u8, access: content.Access) api.HandleError!http.Status {
     if (access.claims != null or access.read_only) return api.respondError(request, .forbidden, "forbidden", "webhooks need the admin key");
     const method = request.head.method;
@@ -129,10 +127,6 @@ pub fn recent(app: *server.App, request: *http.Server.Request, repo: []const u8,
     return api.respondJson(app.gpa, request, .ok, .{ .deliveries = items });
 }
 
-// ---- Delivery worker ----
-
-/// Deliveries in flight at once. A slow endpoint holds one slot, never
-/// the whole queue.
 const max_in_flight = 16;
 
 /// Sends due deliveries until canceled. Each runs as its own task, so a
@@ -156,7 +150,6 @@ pub fn run(app: *server.App) Io.Cancelable!void {
                 group.concurrent(io, deliverTask, .{ app, d, &in_flight }) catch |err| {
                     std.log.err("starting webhook delivery: {t}", .{err});
                     _ = in_flight.fetchSub(1, .acq_rel);
-                    // Leave it pending for the next round.
                     app.db.updateDelivery(io, d.id, "pending", d.attempts, nowMs(io) + app.webhook_backoff_ms, d.last_status, d.last_error, api.unixNow(io)) catch |db_err| {
                         std.log.err("requeueing delivery {d}: {t}", .{ d.id, db_err });
                     };
@@ -172,15 +165,12 @@ fn nowMs(io: Io) i64 {
     return @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
 }
 
-/// Owns `d`; counts itself out of `in_flight` when done.
 fn deliverTask(app: *server.App, d: Db.Delivery, in_flight: *std.atomic.Value(u32)) Io.Cancelable!void {
     defer _ = in_flight.fetchSub(1, .acq_rel);
     defer d.deinit(app.gpa);
     var client: http.Client = .{ .allocator = app.gpa, .io = app.io };
     defer client.deinit();
     if (!try deliverOne(app, &client, d)) {
-        // It could not even be tried; put it back rather than leave it
-        // claimed until the next restart.
         app.db.updateDelivery(app.io, d.id, "pending", d.attempts, nowMs(app.io) + app.webhook_backoff_ms, d.last_status, d.last_error, api.unixNow(app.io)) catch |err| {
             std.log.err("requeueing delivery {d}: {t}", .{ d.id, err });
         };
@@ -208,8 +198,6 @@ const Outcome = union(enum) {
     timeout: Io.Cancelable!void,
 };
 
-/// Tries one delivery and records the outcome. Returns false when it
-/// could not be attempted at all, so the caller requeues it.
 fn deliverOne(app: *server.App, client: *http.Client, d: Db.Delivery) Io.Cancelable!bool {
     const io = app.io;
     const body = payload(app.gpa, d) catch return false;
@@ -258,7 +246,6 @@ fn deliverOne(app: *server.App, client: *http.Client, d: Db.Delivery) Io.Cancela
     app.db.updateDelivery(io, d.id, new_status, attempts, if (final) 0 else next, status, err_text, api.unixNow(io)) catch |err| {
         std.log.err("recording delivery {d}: {t}", .{ d.id, err });
     };
-    // The URL is not logged: webhook URLs often carry credentials (R2.5).
     if (!ok and final) std.log.info("webhook delivery {d} (webhook {d}) failed after {d} attempts: {s}", .{ d.id, d.webhook_id, attempts, err_text });
     return true;
 }

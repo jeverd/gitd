@@ -81,9 +81,10 @@ const head_buffer_len = 16 * 1024;
 pub fn run(app: *App, listener: *Io.net.Server) Io.Cancelable!void {
     const io = app.io;
     var group: Io.Group = .init;
-    defer group.cancel(io);
-    // Wake sleeping SSE streams before group.cancel waits for connection tasks (R3.4).
-    defer app.event_hub.shutdown(io);
+    defer {
+        app.event_hub.shutdown(io);
+        group.cancel(io);
+    }
     group.concurrent(io, expiry.run, .{app}) catch |err| {
         std.log.err("starting the branch reaper: {t}", .{err});
     };
@@ -102,8 +103,6 @@ pub fn run(app: *App, listener: *Io.net.Server) Io.Cancelable!void {
                 error.ConnectionAborted => continue,
                 else => {
                     std.log.err("accept: {t}", .{err});
-                    // Out of file descriptors and similar: back off briefly
-                    // instead of spinning.
                     try io.sleep(.fromMilliseconds(100), .awake);
                     continue;
                 },
@@ -131,8 +130,6 @@ fn serveConnection(app: *App, stream: Io.net.Stream) Io.Cancelable!void {
     defer stream.close(io);
     var in_buf: [head_buffer_len]u8 = undefined;
     var out_buf: [16 * 1024]u8 = undefined;
-    // Every read and write times out, so a client that stalls or stops
-    // reading frees its slot and its git processes (R3.4).
     const idle: Io.Duration = .fromSeconds(app.idle_timeout_seconds);
     var net_reader: timed.TimedReader = .init(stream, io, &in_buf, idle);
     var net_writer: timed.TimedWriter = .init(stream, io, &out_buf, idle);
@@ -151,8 +148,6 @@ fn serveConnection(app: *App, stream: Io.net.Stream) Io.Cancelable!void {
         };
         handle(app, &request, stream.socket.address) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
-            // The client went away or the response broke midway; nothing
-            // more can be sent on this connection.
             else => return,
         };
     }
@@ -178,12 +173,10 @@ fn handle(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress) Hand
     // name or path taken from `request.head.target` would change under a
     // handler that reads a body (it fits: the head is at most this big).
     var target_buf: [head_buffer_len]u8 = undefined;
-    const target = copyBounded(&target_buf, request.head.target) orelse unreachable; // head <= head_buffer_len
+    const target = copyBounded(&target_buf, request.head.target) orelse unreachable;
 
     const status = route(app, request, peer, target) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
-        // Clients hang up mid-transfer routinely (a canceled clone or
-        // push), so these are not errors.
         error.ResponseBroken, error.ClientGone => |e| {
             std.log.info("{t} {s}: client went away ({t})", .{ method, logged_target, e });
             return e;
@@ -194,7 +187,6 @@ fn handle(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress) Hand
     std.log.info("{t} {s} {d} {d}ms", .{ method, logged_target, @backingInt(status), elapsed.toMilliseconds() });
 }
 
-/// Handles one request and returns the status it sent.
 fn route(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress, target: []const u8) HandleError!http.Status {
     const path = pathOf(target);
     const query = if (std.mem.findScalar(u8, target, '?')) |q| target[q + 1 ..] else "";
@@ -228,10 +220,7 @@ fn route(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress, targe
     return respondError(request, .not_found, "not_found", "no such route");
 }
 
-// ---- Admin API ----
-
 fn serveApi(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress, path: []const u8, query: []const u8) HandleError!http.Status {
-    // Per-repo content routes accept a repo token as well as the admin key.
     if (std.mem.startsWith(u8, path, "/v1/repos/")) {
         if (splitRepoPath(path["/v1/repos/".len..])) |parts| return serveContent(app, request, peer, parts.name, parts.rest, query);
     }
@@ -283,8 +272,6 @@ pub fn splitRepoPath(text: []const u8) ?RepoPath {
     return .{ .name = name, .rest = text[second + 1 ..] };
 }
 
-/// Authenticates a per-repo content request: the admin key, or a repo
-/// token for this repo (by name and id) sent as `Authorization: Bearer`.
 fn serveContent(app: *App, request: *http.Server.Request, peer: Io.net.IpAddress, name: repo_name.Name, rest: []const u8, query: []const u8) HandleError!http.Status {
     const header = findHeader(request, "authorization") orelse
         return respondError(request, .unauthorized, "unauthorized", "send Authorization: Bearer <admin key or repo token>");
@@ -349,7 +336,6 @@ fn createRepo(app: *App, request: *http.Server.Request) HandleError!http.Status 
     };
     const now = unixNow(io);
     app.db.insertRepo(io, name.full, &id, now) catch |err| {
-        // Keep disk and database in step: remove the repo we just made.
         app.store.delete(io, name) catch |del_err| std.log.err("cleaning up {s}: {t}", .{ name.full, del_err });
         return switch (err) {
             error.AlreadyExists => respondError(request, .conflict, "already_exists", "a repo with this name exists"),
@@ -382,8 +368,6 @@ fn deleteRepo(app: *App, request: *http.Server.Request, name: repo_name.Name) Ha
     defer app.repo_lock.unlock(io);
     app.maint.beginDeleteLocked(&app.repo_lock, io, name.full);
     defer app.maint.endDeleteLocked(io, app.gpa, name.full);
-    // Database first: once the row is gone the repo is unreachable, and a
-    // leftover directory is cleared by the next create of the same name.
     const deleted = app.db.deleteRepo(io, name.full) catch return internal(request);
     if (!deleted) return respondError(request, .not_found, "not_found", "no such repo");
     app.db.clearBranchTtl(io, name.full, "") catch |err| std.log.err("clearing expiries of {s}: {t}", .{ name.full, err });
@@ -407,16 +391,9 @@ fn createToken(app: *App, request: *http.Server.Request) HandleError!http.Status
         repo: []const u8,
         scopes: []const []const u8,
         ttl_seconds: i64 = auth.default_ttl_seconds,
-        /// Ref patterns the token may write, like "refs/heads/agent/7/*".
-        /// Omitted means any ref.
         refs: []const []const u8 = &.{},
-        /// Ref patterns the token may read, like "refs/heads/main".
-        /// Omitted means any ref.
         read_refs: []const []const u8 = &.{},
-        /// Path patterns the token may read or write, like "docs/*" or "README.md".
-        /// Omitted means any path.
         paths: []const []const u8 = &.{},
-        /// Branches this token creates by push expire after this long.
         branch_ttl_seconds: i64 = 0,
     };
     var parsed = api.readJson(Body, app.gpa, request) catch |err| return api.respondBodyError(request, err);
@@ -466,7 +443,6 @@ fn createToken(app: *App, request: *http.Server.Request) HandleError!http.Status
 
 fn revokeToken(app: *App, request: *http.Server.Request, jti: []const u8) HandleError!http.Status {
     if (!auth.isJti(jti)) return respondError(request, .bad_request, "invalid_jti", "jti must be 32 lowercase hex characters");
-    // Keep the revocation record for the maximum token lifetime; the reaper prunes it after.
     const expires_at = unixNow(app.io) + auth.max_ttl_seconds;
     app.db.revokeToken(app.io, jti, expires_at) catch return internal(request);
     try request.respond("", .{ .status = .no_content, .keep_alive = keepAlive(request) });
@@ -478,8 +454,6 @@ const RepoJson = struct {
     id: []const u8,
     created_at: i64,
 };
-
-// ---- Git ----
 
 fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route) HandleError!http.Status {
     var scratch: [auth.max_token_len + 256]u8 = undefined;
@@ -498,8 +472,6 @@ fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route)
         return respondError(request, .not_found, "not_found", "no such repo");
     const same_repo = std.mem.eql(u8, repo.id, &claims.repo_id);
     repo.deinit(app.gpa);
-    // The name matches but the repo was deleted and made again since the
-    // token was minted.
     if (!same_repo) return respondError(request, .forbidden, "forbidden", "this token is for a deleted repo");
 
     const allowed = switch (git_route.service) {
@@ -523,14 +495,11 @@ fn serveGit(app: *App, request: *http.Server.Request, git_route: git_http.Route)
         return upload_pack.serveInfoRefs(app, request, git_route.repo, git_route.service, git_proto, &claims);
     }
 
-    // `git_route.repo` borrows the request target, which reading the body
-    // overwrites; copy it before reading any body (R3.5).
     var name_buf: [repo_name.max_len]u8 = undefined;
-    const repo_copy = repo_name.parse(copyBounded(&name_buf, git_route.repo.full) orelse unreachable) catch unreachable; // already valid and in bounds
+    const repo_copy = repo_name.parse(copyBounded(&name_buf, git_route.repo.full) orelse unreachable) catch unreachable;
 
     if (git_route.service == .receive_pack) {
         if (request.head.transfer_compression != .identity) {
-            // gitd must read a push's commands to check and record them.
             return respondError(request, .unsupported_media_type, "unsupported_encoding", "push bodies must not be compressed");
         }
         return receive_pack.serveRpc(app, request, repo_copy, &claims);

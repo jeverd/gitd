@@ -94,7 +94,6 @@ pub fn serveApi(
     @memset(virtuals, null);
     @memset(touched, &.{});
 
-    // Pass 1: resolve heads and test each individually against base.
     for (body.heads, 0..) |head_name, i| {
         if (overBudget(app.io, start)) {
             return api.respondError(request, .service_unavailable, "timeout", "conflict check exceeded time budget");
@@ -145,7 +144,6 @@ pub fn serveApi(
         }
     }
 
-    // Pass 2: test every pair of clean branches against their shared base.
     var pairs: std.ArrayList(PairConflict) = .empty;
     var overlaps: std.ArrayList(FileOverlap) = .empty;
     for (0..n) |i| {

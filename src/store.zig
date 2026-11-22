@@ -1,13 +1,3 @@
-//! Repo storage on local disk (R1.2).
-//!
-//! Each repo is a bare git repo at `<root>/<ns>/<repo>.git`. Callers go
-//! through `Store` so disk can later be swapped for object storage.
-//! `git http-backend` still needs a real directory, so `repoPath` is part
-//! of the interface for now.
-//!
-//! Every `git` that gitd runs gets an environment from `gitEnv`, which
-//! turns off hooks and every config source except our own (R2.4).
-
 const std = @import("std");
 const Io = std.Io;
 const repo_name = @import("repo_name.zig");
@@ -25,7 +15,6 @@ pub const DataDir = struct {
     pub fn prepare(io: Io, arena: std.mem.Allocator, data_dir: []const u8) !DataDir {
         const cwd = Io.Dir.cwd();
         try cwd.createDirPath(io, data_dir);
-        // Repos, the database, and the signing secret are for gitd only.
         {
             // Not an O_PATH handle (what Linux opens without `iterate`): fchmod
             // on one fails with EBADF.
@@ -166,18 +155,12 @@ fn storageError(what: []const u8, path: []const u8, err: anyerror) error{ Storag
     return error.StorageError;
 }
 
-/// Config that gitd forces on every git process. Command-line config, which
-/// these become, outranks anything in a repo's own config.
 const forced_config = [_][2][]const u8{
-    // No hooks run, whatever a repo's config or hooks directory says (R2.4).
     .{ "core.hooksPath", "/dev/null" },
-    // Pushes are checked for malformed objects before refs move (R2.3).
     .{ "receive.fsckObjects", "true" },
-    // gitd checks auth itself; git must not ask for REMOTE_USER.
     .{ "http.receivepack", "true" },
     .{ "http.uploadpack", "true" },
     .{ "http.getanyfile", "false" },
-    // A repo's config must not name a program for git to run (R2.4).
     .{ "core.fsmonitor", "false" },
     .{ "gpg.program", "/usr/bin/false" },
     .{ "gpg.ssh.program", "/usr/bin/false" },
@@ -207,7 +190,6 @@ pub fn gitEnv(gpa: std.mem.Allocator, path_env: []const u8) std.mem.Allocator.Er
     for (forced_config, 0..) |kv, i| {
         var key_buf: [32]u8 = undefined;
         var value_buf: [32]u8 = undefined;
-        // `i` is below forced_config.len, so these always fit.
         try env.put(std.mem.print(&key_buf, "GIT_CONFIG_KEY_{d}", .{i}) catch unreachable, kv[0]);
         try env.put(std.mem.print(&value_buf, "GIT_CONFIG_VALUE_{d}", .{i}) catch unreachable, kv[1]);
     }

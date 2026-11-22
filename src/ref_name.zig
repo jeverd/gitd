@@ -57,7 +57,7 @@ pub fn validatePattern(pattern: []const u8) Error!void {
 /// Whether `ref` matches `pattern`. Both must already be valid.
 pub fn matches(pattern: []const u8, ref: []const u8) bool {
     if (std.mem.endsWith(u8, pattern, "/*")) {
-        const prefix = pattern[0 .. pattern.len - 1]; // keep the slash
+        const prefix = pattern[0 .. pattern.len - 1];
         return ref.len > prefix.len and std.mem.startsWith(u8, ref, prefix);
     }
     return std.mem.eql(u8, pattern, ref);
@@ -113,7 +113,6 @@ fn fuzzRefs(_: void, smith: *std.testing.Smith) anyerror!void {
         try testing.expect(matches("refs/*", input));
     } else |_| {}
     if (validatePattern(input)) |_| {
-        // A pattern never matches a ref outside refs/.
         try testing.expect(!matches(input, "HEAD"));
     } else |_| {}
 }

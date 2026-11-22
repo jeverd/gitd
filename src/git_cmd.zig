@@ -62,7 +62,6 @@ pub fn run(
     var env = try store_mod.gitEnv(gpa, store.path_env);
     defer env.deinit();
     try env.put("GIT_DIR", git_dir);
-    // Paths are literal: no `:(glob)` or other pathspec magic from callers.
     try env.put("GIT_LITERAL_PATHSPECS", "1");
     if (options.git_config.len > 0) {
         var count_buf: [16]u8 = undefined;
