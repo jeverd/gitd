@@ -161,8 +161,10 @@ class GitdSdkTest(unittest.TestCase):
 
         diff = admin.compare(repo, "main", "agent/py/work")
         self.assertEqual(diff["ahead"], 5)
-        merged = admin.merge(repo, base="main", head="agent/py/work")
+        merged = admin.merge(repo, base="main", head="agent/py/work", delete_head=True)
         self.assertEqual(merged["result"], "fast_forward")
+        self.assertTrue(merged["head_deleted"])
+        self.assertFalse(any(b["name"] == "agent/py/work" for b in admin.list_branches(repo)))
 
         admin.commit(
             repo,
@@ -180,13 +182,63 @@ class GitdSdkTest(unittest.TestCase):
             message="c2",
             changes=[{"path": "README.md", "content": "# c2\n"}],
         )
+        admin.commit(
+            repo,
+            branch="agent/py/clean1",
+            expected_head=None,
+            from_ref="main",
+            message="clean1",
+            changes=[{"path": "clean1.txt", "content": "p1\n"}],
+        )
+        admin.commit(
+            repo,
+            branch="agent/py/clean2",
+            expected_head=None,
+            from_ref="main",
+            message="clean2",
+            changes=[{"path": "clean2.txt", "content": "p2\n"}],
+        )
         radar = agent.check_merge_conflicts(
-            repo, base="main", heads=["agent/py/c1", "agent/py/c2"], include_file_overlaps=True
+            repo,
+            base="main",
+            heads=["agent/py/c1", "agent/py/c2", "agent/py/clean1", "agent/py/clean2"],
+            include_file_overlaps=True,
         )
         self.assertTrue(all(b["mergeable"] for b in radar["branches"]))
         self.assertEqual(len(radar["pair_conflicts"]), 1)
         self.assertEqual(radar["pair_conflicts"][0]["conflicts"], ["README.md"])
         self.assertEqual(len(radar["file_overlaps"]), 1)
+        self.assertEqual(radar["clean_heads"], ["agent/py/clean1", "agent/py/clean2"])
+        self.assertEqual(len(radar["conflict_clusters"]), 1)
+        self.assertEqual(radar["conflict_clusters"][0]["heads"], ["agent/py/c1", "agent/py/c2"])
+
+        def resolve_cluster(cluster: dict) -> str:
+            self.assertEqual(cluster["heads"], ["agent/py/c1", "agent/py/c2"])
+            admin.commit(
+                repo,
+                branch="agent/py/resolved",
+                expected_head=None,
+                from_ref="main",
+                message="resolve cluster",
+                changes=[{"path": "README.md", "content": "# c1 + c2\n"}],
+            )
+            return "agent/py/resolved"
+
+        wave = admin.integrate_wave(
+            repo,
+            base="main",
+            heads=["agent/py/c1", "agent/py/c2", "agent/py/clean1", "agent/py/clean2"],
+            delete_heads=True,
+            resolve_cluster=resolve_cluster,
+        )
+        self.assertEqual(wave["batch_merged"], ["agent/py/clean1", "agent/py/clean2"])
+        self.assertEqual(wave["cluster_merged"], ["agent/py/resolved"])
+        self.assertEqual(admin.read_text_file(repo, "clean1.txt", ref="main"), "p1\n")
+        self.assertEqual(admin.read_text_file(repo, "clean2.txt", ref="main"), "p2\n")
+        self.assertEqual(admin.read_text_file(repo, "README.md", ref="main"), "# c1 + c2\n")
+        names = {b["name"] for b in admin.list_branches(repo)}
+        self.assertNotIn("agent/py/clean1", names)
+        self.assertNotIn("agent/py/resolved", names)
 
         # Branch lock visibility + protection rules
         admin.lock_branch(repo, "main", reason="freeze")
@@ -216,6 +268,8 @@ class GitdSdkTest(unittest.TestCase):
         self.assertEqual(dry_blocked["blocked_by"], "missing_required_check")
         self.assertEqual(dry_blocked["missing_checks"], ["tests"])
         checker.post_check(repo, c1_sha, name="tests", status="passed", summary="all green")
+        waited = agent.wait_for_checks(repo, [c1_sha], required_checks=["tests"], timeout=5.0)
+        self.assertEqual(waited[c1_sha]["rollup"], "passed")
         chk_list = agent.list_checks(repo, c1_sha)
         self.assertEqual(chk_list["rollup"], "passed")
         self.assertEqual(chk_list["checks"][0]["name"], "tests")
@@ -230,7 +284,7 @@ class GitdSdkTest(unittest.TestCase):
             branch="main",
             token=up_tok,
         )
-        self.assertEqual(fetched["new_sha"], merged["sha"])
+        self.assertEqual(fetched["new_sha"], wave["sha"])
 
         # Quotas, stats & GC
         quotas = admin.set_quotas(repo, max_branches=10, max_repo_bytes=5_000_000)

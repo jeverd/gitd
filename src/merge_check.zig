@@ -1,12 +1,13 @@
-//! Multi-branch conflict radar (R1.1, R2.1, R3.4):
+//! Multi-branch conflict radar & wave merge planner (R1.1, R2.1, R3.4):
 //!
 //!   POST /v1/repos/{ns}/{repo}/merges/check
 //!     {"base": "main", "heads": ["agent/a", "agent/b", ...], "include_file_overlaps": false}
 //!
 //! Simulates merging each head into `base` in memory using `git merge-tree`,
 //! builds unreferenced single-parent virtual commits `C_i` on `base` (compatible
-//! with Git 2.38+, no refs mutated, no events recorded), and checks every clean
-//! pair `(C_i, C_j)` for pairwise conflicts.
+//! with Git 2.38+, no refs mutated, no events recorded), checks every clean
+//! pair `(C_i, C_j)` for pairwise conflicts, and groups ready branches into
+//! `clean_heads`, `conflict_clusters`, and `blocked_heads`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -14,20 +15,25 @@ const http = std.http;
 const api = @import("api.zig");
 const server = @import("server.zig");
 const repo_name = @import("repo_name.zig");
+const ref_name = @import("ref_name.zig");
 const repo_git = @import("repo_git.zig");
 const content = @import("content.zig");
+const rules = @import("rules.zig");
+const Db = @import("db.zig").Db;
 
 pub const max_heads = 16;
 const check_budget_ms: i64 = 15_000;
 
-const BranchStatus = struct {
+pub const BranchStatus = struct {
     head: []const u8,
     sha: []const u8,
     mergeable: bool,
+    blocked_by: ?[]const u8 = null,
     conflicts: []const []const u8,
+    missing_checks: []const []const u8 = &.{},
 };
 
-const PairConflict = struct {
+pub const PairConflict = struct {
     a: []const u8,
     b: []const u8,
     conflicts: []const []const u8,
@@ -37,6 +43,24 @@ const FileOverlap = struct {
     a: []const u8,
     b: []const u8,
     paths: []const []const u8,
+};
+
+pub const ConflictCluster = struct {
+    heads: []const []const u8,
+    files: []const []const u8,
+};
+
+pub const BlockedHead = struct {
+    head: []const u8,
+    blocked_by: []const u8,
+    conflicts: []const []const u8 = &.{},
+    missing_checks: []const []const u8 = &.{},
+};
+
+pub const WavePlan = struct {
+    clean_heads: []const []const u8,
+    conflict_clusters: []const ConflictCluster,
+    blocked_heads: []const BlockedHead,
 };
 
 fn overBudget(io: Io, start: Io.Timestamp) bool {
@@ -50,7 +74,6 @@ pub fn serveApi(
     name: repo_name.Name,
     access: content.Access,
 ) api.HandleError!http.Status {
-    _ = name;
     if (!access.canRead()) {
         return api.respondError(request, .forbidden, "forbidden", "this token lacks git:read");
     }
@@ -87,6 +110,16 @@ pub fn serveApi(
     const base_sha = (try content.resolveNamed(request, repo, body.base, "base", access, &base_buf)) orelse return .not_found;
     const base_sha_owned = arena.dupe(u8, base_sha) catch return api.internal(request);
 
+    var base_ref_buf: [ref_name.max_len]u8 = undefined;
+    const maybe_base_ref: ?[]const u8 = ref_name.validateBranch(body.base, &base_ref_buf) catch null;
+    const repo_rules = app.db.listBranchRules(app.io, app.gpa, name.full) catch return api.internal(request);
+    defer Db.freeBranchRules(app.gpa, repo_rules);
+    const req_checks: []const []const u8 = if (maybe_base_ref) |bref|
+        (rules.collectRequiredChecks(app.gpa, repo_rules, bref) catch return api.internal(request))
+    else
+        &.{};
+    defer if (maybe_base_ref != null) app.gpa.free(req_checks);
+
     const n = body.heads.len;
     const statuses = arena.alloc(BranchStatus, n) catch return api.internal(request);
     const virtuals = arena.alloc(?[]const u8, n) catch return api.internal(request);
@@ -107,6 +140,8 @@ pub fn serveApi(
             continue;
         }
 
+        const missing_checks = findMissingChecks(app, arena, name.full, head_sha_owned, req_checks) catch return api.internal(request);
+
         var tree_buf: [64]u8 = undefined;
         const merged = repo.mergeTree(base_sha_owned, head_sha_owned, &tree_buf) catch |err| return content.gitError(request, err);
         switch (merged) {
@@ -117,11 +152,21 @@ pub fn serveApi(
                     .head = head_name,
                     .sha = head_sha_owned,
                     .mergeable = false,
+                    .blocked_by = "merge_conflict",
                     .conflicts = dupeStrings(arena, c.paths) catch return api.internal(request),
+                    .missing_checks = missing_checks,
                 };
             },
             .clean => |tree| {
-                statuses[i] = .{ .head = head_name, .sha = head_sha_owned, .mergeable = true, .conflicts = &.{} };
+                const blocked_by: ?[]const u8 = if (missing_checks.len > 0) "missing_required_check" else null;
+                statuses[i] = .{
+                    .head = head_name,
+                    .sha = head_sha_owned,
+                    .mergeable = missing_checks.len == 0,
+                    .blocked_by = blocked_by,
+                    .conflicts = &.{},
+                    .missing_checks = missing_checks,
+                };
                 var commit_buf: [64]u8 = undefined;
                 const virt = repo.commitTree(
                     tree,
@@ -180,13 +225,140 @@ pub fn serveApi(
         }
     }
 
+    const plan = computeWavePlan(arena, statuses, pairs.items) catch return api.internal(request);
+
     return api.respondJson(app.gpa, request, .ok, .{
         .base = body.base,
         .base_sha = base_sha_owned,
         .branches = statuses,
         .pair_conflicts = pairs.items,
         .file_overlaps = overlaps.items,
+        .clean_heads = plan.clean_heads,
+        .conflict_clusters = plan.conflict_clusters,
+        .blocked_heads = plan.blocked_heads,
     });
+}
+
+fn findMissingChecks(
+    app: *server.App,
+    arena: std.mem.Allocator,
+    repo_full: []const u8,
+    head_sha: []const u8,
+    req_checks: []const []const u8,
+) ![]const []const u8 {
+    if (req_checks.len == 0) return &.{};
+    const commit_checks = try app.db.listCommitChecks(app.io, app.gpa, repo_full, head_sha);
+    defer Db.freeCommitChecks(app.gpa, commit_checks);
+    var missing: std.ArrayList([]const u8) = .empty;
+    for (req_checks) |req_name| {
+        var passed = false;
+        for (commit_checks) |c| {
+            if (std.mem.eql(u8, c.name, req_name) and std.mem.eql(u8, c.status, "passed")) {
+                passed = true;
+                break;
+            }
+        }
+        if (!passed) try missing.append(arena, try arena.dupe(u8, req_name));
+    }
+    return missing.items;
+}
+
+pub fn computeWavePlan(
+    arena: std.mem.Allocator,
+    statuses: []const BranchStatus,
+    pairs: []const PairConflict,
+) std.mem.Allocator.Error!WavePlan {
+    const n = statuses.len;
+    var clean: std.ArrayList([]const u8) = .empty;
+    var clusters: std.ArrayList(ConflictCluster) = .empty;
+    var blocked: std.ArrayList(BlockedHead) = .empty;
+
+    const ready = try arena.alloc(bool, n);
+    for (statuses, ready) |st, *r| {
+        if (st.mergeable and st.blocked_by == null) {
+            r.* = true;
+        } else {
+            r.* = false;
+            try blocked.append(arena, .{
+                .head = st.head,
+                .blocked_by = st.blocked_by orelse "merge_conflict",
+                .conflicts = st.conflicts,
+                .missing_checks = st.missing_checks,
+            });
+        }
+    }
+
+    const visited = try arena.alloc(bool, n);
+    @memset(visited, false);
+    const queue = try arena.alloc(usize, n);
+
+    for (0..n) |start_idx| {
+        if (!ready[start_idx] or visited[start_idx]) continue;
+
+        var q_head: usize = 0;
+        var q_tail: usize = 0;
+        visited[start_idx] = true;
+        queue[q_tail] = start_idx;
+        q_tail += 1;
+
+        var comp_indices: std.ArrayList(usize) = .empty;
+        while (q_head < q_tail) {
+            const cur = queue[q_head];
+            q_head += 1;
+            try comp_indices.append(arena, cur);
+
+            for (pairs) |p| {
+                const other_name: ?[]const u8 = if (std.mem.eql(u8, p.a, statuses[cur].head))
+                    p.b
+                else if (std.mem.eql(u8, p.b, statuses[cur].head))
+                    p.a
+                else
+                    null;
+                const oname = other_name orelse continue;
+                for (0..n) |k| {
+                    if (ready[k] and !visited[k] and std.mem.eql(u8, statuses[k].head, oname)) {
+                        visited[k] = true;
+                        queue[q_tail] = k;
+                        q_tail += 1;
+                    }
+                }
+            }
+        }
+
+        if (comp_indices.items.len == 1) {
+            try clean.append(arena, statuses[comp_indices.items[0]].head);
+        } else {
+            std.mem.sort(usize, comp_indices.items, {}, std.sort.asc(usize));
+            const cheads = try arena.alloc([]const u8, comp_indices.items.len);
+            for (comp_indices.items, cheads) |idx, *dst| dst.* = statuses[idx].head;
+
+            var cfiles: std.ArrayList([]const u8) = .empty;
+            for (pairs) |p| {
+                if (containsStr(cheads, p.a) and containsStr(cheads, p.b)) {
+                    for (p.conflicts) |f| {
+                        if (!containsStr(cfiles.items, f)) try cfiles.append(arena, f);
+                    }
+                }
+            }
+            try clusters.append(arena, .{
+                .heads = cheads,
+                .files = cfiles.items,
+            });
+        }
+    }
+
+    return .{
+        .clean_heads = clean.items,
+        .conflict_clusters = clusters.items,
+        .blocked_heads = blocked.items,
+    };
+}
+
+fn containsStr(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |item| {
+        if (std.mem.eql(u8, item, needle)) return true;
+    }
+    return false;
 }
 
 fn dupeStrings(arena: std.mem.Allocator, items: []const []const u8) std.mem.Allocator.Error![]const []const u8 {
@@ -222,4 +394,53 @@ test intersectPaths {
     try std.testing.expectEqual(@as(usize, 2), common.len);
     try std.testing.expectEqualStrings("README.md", common[0]);
     try std.testing.expectEqualStrings("src/auth.zig", common[1]);
+}
+
+test "computeWavePlan separates clean heads, connected conflict clusters, and blocked heads" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const statuses = [_]BranchStatus{
+        .{ .head = "agent/a", .sha = "1", .mergeable = true, .conflicts = &.{} },
+        .{ .head = "agent/b", .sha = "2", .mergeable = true, .conflicts = &.{} },
+        .{ .head = "agent/c", .sha = "3", .mergeable = true, .conflicts = &.{} },
+        .{ .head = "agent/clean", .sha = "4", .mergeable = true, .conflicts = &.{} },
+        .{ .head = "agent/d", .sha = "5", .mergeable = true, .conflicts = &.{} },
+        .{ .head = "agent/e", .sha = "6", .mergeable = true, .conflicts = &.{} },
+        .{
+            .head = "agent/wip",
+            .sha = "7",
+            .mergeable = false,
+            .blocked_by = "missing_required_check",
+            .conflicts = &.{},
+            .missing_checks = &.{"pytest"},
+        },
+    };
+    const pairs = [_]PairConflict{
+        .{ .a = "agent/a", .b = "agent/b", .conflicts = &.{"app/main.py"} },
+        .{ .a = "agent/b", .b = "agent/c", .conflicts = &.{ "app/main.py", "app/db.py" } },
+        .{ .a = "agent/d", .b = "agent/e", .conflicts = &.{"static/app.js"} },
+    };
+
+    const plan = try computeWavePlan(arena, &statuses, &pairs);
+    try std.testing.expectEqual(@as(usize, 1), plan.clean_heads.len);
+    try std.testing.expectEqualStrings("agent/clean", plan.clean_heads[0]);
+
+    try std.testing.expectEqual(@as(usize, 2), plan.conflict_clusters.len);
+    try std.testing.expectEqual(@as(usize, 3), plan.conflict_clusters[0].heads.len);
+    try std.testing.expectEqualStrings("agent/a", plan.conflict_clusters[0].heads[0]);
+    try std.testing.expectEqualStrings("agent/b", plan.conflict_clusters[0].heads[1]);
+    try std.testing.expectEqualStrings("agent/c", plan.conflict_clusters[0].heads[2]);
+    try std.testing.expectEqual(@as(usize, 2), plan.conflict_clusters[0].files.len);
+    try std.testing.expectEqualStrings("app/main.py", plan.conflict_clusters[0].files[0]);
+    try std.testing.expectEqualStrings("app/db.py", plan.conflict_clusters[0].files[1]);
+
+    try std.testing.expectEqual(@as(usize, 2), plan.conflict_clusters[1].heads.len);
+    try std.testing.expectEqualStrings("agent/d", plan.conflict_clusters[1].heads[0]);
+    try std.testing.expectEqualStrings("agent/e", plan.conflict_clusters[1].heads[1]);
+
+    try std.testing.expectEqual(@as(usize, 1), plan.blocked_heads.len);
+    try std.testing.expectEqualStrings("agent/wip", plan.blocked_heads[0].head);
+    try std.testing.expectEqualStrings("missing_required_check", plan.blocked_heads[0].blocked_by);
 }

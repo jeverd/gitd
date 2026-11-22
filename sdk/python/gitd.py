@@ -281,6 +281,7 @@ class GitdClient:
         head: str,
         strategy: str | None = None,
         dry_run: bool = False,
+        delete_head: bool = False,
         expected_base_head: str | None = None,
         message: str | None = None,
         author: dict[str, str] | None = None,
@@ -290,6 +291,8 @@ class GitdClient:
             body["strategy"] = strategy
         if dry_run:
             body["dry_run"] = True
+        if delete_head:
+            body["delete_head"] = True
         if expected_base_head is not None:
             body["expected_base_head"] = expected_base_head
         if message is not None:
@@ -297,6 +300,34 @@ class GitdClient:
         if author is not None:
             body["author"] = author
         return self._json("POST", f"/v1/repos/{repo}/merges", body)
+
+    def batch_merge(
+        self,
+        repo: str,
+        *,
+        base: str,
+        heads: list[str],
+        strategy: str | None = None,
+        dry_run: bool = False,
+        delete_heads: bool = False,
+        expected_base_head: str | None = None,
+        message: str | None = None,
+        author: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"base": base, "heads": heads}
+        if strategy is not None:
+            body["strategy"] = strategy
+        if dry_run:
+            body["dry_run"] = True
+        if delete_heads:
+            body["delete_heads"] = True
+        if expected_base_head is not None:
+            body["expected_base_head"] = expected_base_head
+        if message is not None:
+            body["message"] = message
+        if author is not None:
+            body["author"] = author
+        return self._json("POST", f"/v1/repos/{repo}/merges/batch", body)
 
     def check_merge_conflicts(
         self,
@@ -311,6 +342,144 @@ class GitdClient:
             f"/v1/repos/{repo}/merges/check",
             {"base": base, "heads": heads, "include_file_overlaps": include_file_overlaps},
         )
+
+    def plan_wave_merge(
+        self,
+        repo: str,
+        *,
+        base: str,
+        heads: list[str],
+        include_file_overlaps: bool = True,
+    ) -> dict[str, Any]:
+        return self.check_merge_conflicts(
+            repo, base=base, heads=heads, include_file_overlaps=include_file_overlaps
+        )
+
+    def wait_for_checks(
+        self,
+        repo: str,
+        shas: list[str],
+        *,
+        required_checks: list[str] | None = None,
+        timeout: float = 60.0,
+    ) -> dict[str, dict[str, Any]]:
+        required = required_checks or []
+        results: dict[str, dict[str, Any]] = {}
+
+        def _is_passed(res: dict[str, Any]) -> bool:
+            if not required:
+                return res.get("rollup") == "passed"
+            by_name = {c["name"]: c["status"] for c in res.get("checks", [])}
+            return all(by_name.get(name) == "passed" for name in required)
+
+        def _is_failed(res: dict[str, Any]) -> bool:
+            if not required:
+                return res.get("rollup") == "failed"
+            by_name = {c["name"]: c["status"] for c in res.get("checks", [])}
+            return any(by_name.get(name) == "failed" for name in required)
+
+        hist = self.list_events(repo, limit=1).get("events", [])
+        after_id = hist[-1]["id"] if hist else 0
+
+        pending: set[str] = set()
+        for sha in dict.fromkeys(shas):
+            res = self.list_checks(repo, sha)
+            results[sha] = res
+            if _is_failed(res):
+                raise RuntimeError(f"checks failed on {sha[:10]}")
+            if not _is_passed(res):
+                pending.add(sha)
+        if not pending:
+            return results
+
+        for ev in self.stream_events(repo, after=after_id, kind="check_updated", timeout=timeout):
+            sha = ev.get("new", "")
+            if sha not in pending:
+                continue
+            res = self.list_checks(repo, sha)
+            results[sha] = res
+            if _is_failed(res):
+                raise RuntimeError(f"checks failed on {sha[:10]}")
+            if _is_passed(res):
+                pending.remove(sha)
+                if not pending:
+                    return results
+        if pending:
+            raise TimeoutError(f"timed out waiting for checks on {sorted(pending)}")
+        return results
+
+    def integrate_wave(
+        self,
+        repo: str,
+        *,
+        base: str,
+        heads: list[str],
+        strategy: str = "merge",
+        delete_heads: bool = True,
+        required_checks: list[str] | None = None,
+        timeout: float = 60.0,
+        resolve_cluster: Callable[[dict[str, Any]], str | None] | None = None,
+    ) -> dict[str, Any]:
+        if required_checks:
+            by_name = {b["name"]: b["commit"] for b in self.list_branches(repo)}
+            shas = [by_name[h] for h in heads if h in by_name]
+            if shas:
+                self.wait_for_checks(repo, shas, required_checks=required_checks, timeout=timeout)
+
+        plan = self.plan_wave_merge(repo, base=base, heads=heads)
+        batch_merged: list[str] = []
+        cluster_merged: list[str] = []
+        deleted_heads: list[str] = []
+        unresolved_clusters: list[dict[str, Any]] = []
+        latest_sha: str | None = plan.get("base_sha")
+
+        if plan.get("clean_heads"):
+            res = self.batch_merge(
+                repo,
+                base=base,
+                heads=plan["clean_heads"],
+                strategy=strategy,
+                delete_heads=delete_heads,
+            )
+            latest_sha = res["sha"]
+            batch_merged.extend(res.get("merged_heads", []))
+            deleted_heads.extend(res.get("deleted_heads", []))
+
+        for cluster in plan.get("conflict_clusters", []):
+            if resolve_cluster is None:
+                unresolved_clusters.append(cluster)
+                continue
+            resolved_branch = resolve_cluster(cluster)
+            if not resolved_branch:
+                unresolved_clusters.append(cluster)
+                continue
+            if required_checks:
+                by_name = {b["name"]: b["commit"] for b in self.list_branches(repo)}
+                if resolved_branch in by_name:
+                    self.wait_for_checks(
+                        repo, [by_name[resolved_branch]], required_checks=required_checks, timeout=timeout
+                    )
+            res = self.merge(
+                repo,
+                base=base,
+                head=resolved_branch,
+                strategy=strategy,
+                delete_head=delete_heads,
+            )
+            latest_sha = res["sha"]
+            cluster_merged.append(resolved_branch)
+            if res.get("head_deleted"):
+                deleted_heads.append(resolved_branch)
+
+        return {
+            "base": base,
+            "sha": latest_sha,
+            "batch_merged": batch_merged,
+            "cluster_merged": cluster_merged,
+            "deleted_heads": deleted_heads,
+            "unresolved_clusters": unresolved_clusters,
+            "blocked_heads": plan.get("blocked_heads", []),
+        }
 
     # ---- Grep, Archive, Sync ----
 
