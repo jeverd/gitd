@@ -639,7 +639,6 @@ export class GitdClient {
     return this.#json("POST", `/v1/repos/${repo}/merges/batch`, opts);
   }
 
-  /** Wait over live SSE until every SHA in `shas` has all `requiredChecks` passing. */
   async waitForChecks(
     repo: string,
     shas: string[],
@@ -715,13 +714,6 @@ export class GitdClient {
     });
   }
 
-  /**
-   * Integrate a wave of parallel agent branches into `base`:
-   * 1. Optionally waits over SSE for `requiredChecks` on all heads.
-   * 2. Plans clean heads vs conflict clusters via Conflict Radar (`/merges/check`).
-   * 3. Atomically batch-merges all `clean_heads` in one CAS call (`/merges/batch`).
-   * 4. Invokes `resolveCluster` (if supplied) for each conflict cluster and merges the result.
-   */
   async integrateWave(repo: string, opts: IntegrateWaveOptions): Promise<IntegrateWaveResult> {
     const deleteHeads = opts.deleteHeads ?? true;
     const strategy = opts.strategy ?? "merge";

@@ -263,10 +263,6 @@ fn findMissingChecks(
     return missing.items;
 }
 
-/// Groups ready branches into `clean_heads` (isolated, zero pairwise conflicts)
-/// and `conflict_clusters` (connected components of colliding branches), and
-/// separates unmergeable/check-blocked branches into `blocked_heads`.
-/// Allocates into `arena` (caller owns the arena).
 pub fn computeWavePlan(
     arena: std.mem.Allocator,
     statuses: []const BranchStatus,
@@ -332,7 +328,6 @@ pub fn computeWavePlan(
         if (comp_indices.items.len == 1) {
             try clean.append(arena, statuses[comp_indices.items[0]].head);
         } else {
-            // Preserve original input order for deterministic output.
             std.mem.sort(usize, comp_indices.items, {}, std.sort.asc(usize));
             const cheads = try arena.alloc([]const u8, comp_indices.items.len);
             for (comp_indices.items, cheads) |idx, *dst| dst.* = statuses[idx].head;
@@ -422,7 +417,6 @@ test "computeWavePlan separates clean heads, connected conflict clusters, and bl
             .missing_checks = &.{"pytest"},
         },
     };
-    // Cluster 1: a-b-c via transitive edges (a,b) and (b,c); Cluster 2: d-e; Isolated: clean; Blocked: wip.
     const pairs = [_]PairConflict{
         .{ .a = "agent/a", .b = "agent/b", .conflicts = &.{"app/main.py"} },
         .{ .a = "agent/b", .b = "agent/c", .conflicts = &.{ "app/main.py", "app/db.py" } },

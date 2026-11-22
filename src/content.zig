@@ -1244,11 +1244,6 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
     }
 }
 
-/// Atomic multi-branch batch merge (R2.2, R3.2, R3.4):
-///   POST /v1/repos/{ns}/{repo}/merges/batch
-/// Folds `heads[0..k]` onto `base` in memory using `git merge-tree` and moves
-/// `base` with a single compare-and-swap ref update. If any head fails checks
-/// or conflicts, `base` is untouched.
 fn batchMerge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.Repo, name: repo_name.Name, access: Access) Error!http.Status {
     const Strategy = enum { merge, squash };
     const Body = struct {
@@ -1321,7 +1316,6 @@ fn batchMerge(app: *server.App, request: *http.Server.Request, repo: *const repo
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Validate delete permissions for every head up front before mutating anything (R2.2).
     const delete_refs = arena.alloc(?[]const u8, body.heads.len) catch return api.internal(request);
     @memset(delete_refs, null);
     if (body.delete_heads and !body.dry_run) {

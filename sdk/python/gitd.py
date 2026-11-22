@@ -363,7 +363,6 @@ class GitdClient:
         required_checks: list[str] | None = None,
         timeout: float = 60.0,
     ) -> dict[str, dict[str, Any]]:
-        """Wait over live SSE until every SHA in `shas` passes `required_checks`."""
         required = required_checks or []
         results: dict[str, dict[str, Any]] = {}
 
@@ -421,7 +420,6 @@ class GitdClient:
         timeout: float = 60.0,
         resolve_cluster: Callable[[dict[str, Any]], str | None] | None = None,
     ) -> dict[str, Any]:
-        """Integrate a wave of parallel agent branches into `base`."""
         if required_checks:
             by_name = {b["name"]: b["commit"] for b in self.list_branches(repo)}
             shas = [by_name[h] for h in heads if h in by_name]

@@ -1475,7 +1475,6 @@ expect_eq "seed batch main" 201 "$(admin -X POST "$BASE/v1/repos/acme/batch/comm
   -d '{"branch":"main","expected_head":null,"message":"seed","changes":[{"path":"shared.txt","content":"base\n"}]}')"
 BM_MAIN="$(json '["sha"]')"
 
-# delete_head on single merge deletes head branch, and refuses if head is locked.
 expect_eq "batch del branch" 201 "$(admin -X POST "$BASE/v1/repos/acme/batch/commits" \
   -d '{"branch":"agent/single","expected_head":null,"from":"main","message":"single","changes":[{"path":"single.txt","content":"one\n"}]}')"
 expect_eq "lock head blocks delete_head" 200 "$(admin -X PUT "$BASE/v1/repos/acme/batch/branches/agent/single/lock" -d '{"reason":"hold"}')"
@@ -1487,7 +1486,6 @@ expect_eq "merge with delete_head succeeds" 201 "$(admin -X POST "$BASE/v1/repos
 expect_eq "head_deleted true" "True" "$(json '["head_deleted"]')"
 BM_MAIN="$(json '["sha"]')"
 
-# Create 2 clean branches + 2 colliding branches + 1 check-blocked branch.
 expect_eq "wave clean1" 201 "$(admin -X POST "$BASE/v1/repos/acme/batch/commits" \
   -d '{"branch":"agent/clean1","expected_head":null,"from":"main","message":"c1","changes":[{"path":"f1.txt","content":"1\n"}]}')"
 W_C1="$(json '["sha"]')"
@@ -1503,7 +1501,6 @@ W_X2="$(json '["sha"]')"
 expect_eq "wave unverified" 201 "$(admin -X POST "$BASE/v1/repos/acme/batch/commits" \
   -d '{"branch":"agent/wip","expected_head":null,"from":"main","message":"wip","changes":[{"path":"wip.txt","content":"wip\n"}]}')"
 
-# Add required check rule on main and pass checks on clean1, clean2, coll1, coll2 (NOT wip).
 expect_eq "batch required check rule" 201 "$(admin -X POST "$BASE/v1/repos/acme/batch/rules" \
   -d '{"pattern":"refs/heads/main","required_checks":["ci"]}')"
 for S in "$W_C1" "$W_C2" "$W_X1" "$W_X2"; do
@@ -1511,7 +1508,6 @@ for S in "$W_C1" "$W_C2" "$W_X1" "$W_X2"; do
     -d '{"name":"ci","status":"passed"}')"
 done
 
-# Conflict radar returns clean_heads, conflict_clusters, and blocked_heads.
 expect_eq "wave plan check" 200 "$(admin -X POST "$BASE/v1/repos/acme/batch/merges/check" \
   -d '{"base":"main","heads":["agent/clean1","agent/clean2","agent/coll1","agent/coll2","agent/wip"],"include_file_overlaps":true}')"
 python3 - "$WORK/body" <<'PY' || fail "wave plan clustering mismatch"
@@ -1526,18 +1522,14 @@ assert d["blocked_heads"][0]["blocked_by"] == "missing_required_check", d
 PY
 pass "merges/check returns clean_heads, conflict_clusters, and blocked_heads"
 
-# Batch merge rejects missing required check before mutating main.
 expect_eq "batch merge rejects missing check" 403 "$(admin -X POST "$BASE/v1/repos/acme/batch/merges/batch" \
   -d '{"base":"main","heads":["agent/clean1","agent/wip"]}')"
-# Batch merge rolls back atomically on conflict without touching main.
 expect_eq "batch merge conflict leaves main intact" 409 "$(admin -X POST "$BASE/v1/repos/acme/batch/merges/batch" \
   -d '{"base":"main","heads":["agent/clean1","agent/coll1","agent/coll2"]}')"
 expect_eq "main unchanged after batch conflict" 200 "$(admin "$BASE/v1/repos/acme/batch/log?ref=main&limit=1")"
 expect_eq "main sha unchanged" "$BM_MAIN" "$(json '["commits"][0]["sha"]')"
-# Stale expected_base_head rejected with 409.
 expect_eq "batch merge stale expected_base_head" 409 "$(admin -X POST "$BASE/v1/repos/acme/batch/merges/batch" \
   -d '{"base":"main","heads":["agent/clean1","agent/clean2"],"expected_base_head":"0000000000000000000000000000000000000000"}')"
-# Atomic batch merge of clean1 + clean2 with delete_heads: true succeeds!
 expect_eq "batch merge clean heads with delete_heads" 201 "$(admin -X POST "$BASE/v1/repos/acme/batch/merges/batch" \
   -d '{"base":"main","heads":["agent/clean1","agent/clean2"],"expected_base_head":"'"$BM_MAIN"'","delete_heads":true}')"
 python3 - "$WORK/body" <<'PY' || fail "batch merge response mismatch"
