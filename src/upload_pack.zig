@@ -1303,7 +1303,7 @@ fn streamPack(
         }
     }
 
-    if (pack_info.total_pack_bytes > pack_reuse_threshold and common_haves.len == 0) {
+    if (pack_info.total_pack_bytes > pack_reuse_threshold or (shallow_commits != null and common_haves.len > 0)) {
         return streamGitPackObjects(
             gpa,
             repo,
@@ -1665,4 +1665,20 @@ test "Tier 1 direct single-pack streaming and Tier 3 git pack-objects shallow re
     const blob = try shallow_dst.readBlob(entries.items[0].oid, 64);
     defer gpa.free(blob);
     try testing.expectEqualStrings("from-c1\n", blob);
+
+    // Regression (R5.1): shallow fetch with common_haves excludes unchanged blobs already held by client.
+    var big_blob: [64 * 1024]u8 = undefined;
+    for (&big_blob, 0..) |*b, i| b.* = @truncate((i * 31) ^ (i >> 3));
+    var c3_buf: [64]u8 = undefined;
+    const c3 = try repo.buildCommit(c2, &.{.{ .path = "big.bin", .content = &big_blob }}, "c3", author, &c3_buf);
+    var c4_buf: [64]u8 = undefined;
+    const c4 = try repo.buildCommit(c3, &.{.{ .path = "a.txt", .content = "v4\n" }}, "c4", author, &c4_buf);
+    var c4_hex: [40]u8 = undefined;
+    @memcpy(&c4_hex, c4[0..40]);
+    const c3_oid = git2.parseOid(c3).?;
+    const c4_oid = git2.parseOid(c4).?;
+    var delta_out: std.Io.Writer.Allocating = .init(gpa);
+    defer delta_out.deinit();
+    try streamGitPackObjects(gpa, &repo, &.{c4_hex}, &.{c3_oid}, &.{}, &.{c4_oid}, false, true, true, &claims, &delta_out.writer, 0);
+    try testing.expect(delta_out.written().len > 32 and delta_out.written().len < 4096);
 }
