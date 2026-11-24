@@ -13,8 +13,6 @@ Human Git forges (GitHub, Gitea, Forgejo) carry web UIs, issue trackers, and hea
 - **Safe concurrency:** Compare-and-swap (`expected_head` → `409` with `current_head`), branch locks, branch protection rules, required commit checks, multi-branch conflict radar, and atomic batch merges.
 - **Self-cleaning branches:** Ephemeral branches with `ttl_seconds` and renewable leases (`PUT /branches/{name}/ttl`), plus live SSE events and signed, retried webhooks.
 
-Status: MVP complete. Every feature below works end to end; `tests/demo/agents.sh` runs the whole scenario.
-
 ## Quick start
 
 Needs Zig 0.17.1, git, and `libgit2` (on macOS, `brew install libgit2`; on Linux, `libsqlite3-dev libgit2-dev pkg-config`). SQLite comes with macOS.
@@ -173,30 +171,14 @@ agent.commit_with_retry("acme/web", "agent/1/work", lambda head: {
 })
 ```
 
-## MVP
+## Demo
 
-- **Stack:** Zig, SQLite, in-process `libgit2` + native Zig Git Smart HTTP server (with `git` for diff, merge-tree, grep, archive, and GC). One server, repos on a persistent disk.
-- **Features:**
-  1. ✅ Repos: create, list, delete over an API
-  2. ✅ Git: `git clone` and `git push` work normally
-  3. ✅ Tokens: short-lived, limited to ref patterns
-  4. ✅ Read files, folders, history without cloning
-  5. ✅ Commit through the API, with a 409 when two agents race (TLA+ model in `tests/tla/commit_cas`)
-  6. ✅ Diff and merge branches
-  7. ✅ Branches that delete themselves after a set time
-  8. ✅ Webhooks on every event (signed, retried, survive restarts)
-- ✅ **Done when:** 5 fake agents work on separate branches at once, one is blocked from pushing to `main`, the winner is merged, and the rest expire. Run it:
+Run the multi-agent scenario locally (5 agents push in parallel, one is blocked from pushing to `main`, the winner is merged, the rest expire, and webhooks are delivered):
 
-  ```sh
-  zig build
-  DEMO_PACE=3 AGENT_TTL=20 DEMO_KEEP=1 tests/demo/agents.sh   # then open http://127.0.0.1:18910/ui
-  ```
-
-## After the MVP
-
-1. Repos in S3, metadata in Postgres
-2. ✅ Native Zig Git Smart HTTP protocol server + in-process `libgit2`
-3. ✅ Zero-dependency TypeScript & Python SDKs and read-only `/ui`
+```sh
+zig build
+DEMO_PACE=3 AGENT_TTL=20 DEMO_KEEP=1 tests/demo/agents.sh   # then open http://127.0.0.1:18910/ui
+```
 
 ## Deployment & Security
 
