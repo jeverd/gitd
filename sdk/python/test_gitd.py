@@ -308,6 +308,25 @@ class GitdSdkTest(unittest.TestCase):
             stream.close()
             t.join(timeout=5.0)
 
+        # Branch TTL update (extend, CAS 409, clear)
+        ttl_branch = admin.create_branch(repo, "agent/py/ttl", "main", ttl_seconds=60)
+        extended = admin.update_branch_ttl(repo, "agent/py/ttl", ttl_seconds=300, expected=ttl_branch["commit"])
+        self.assertEqual(extended["branch"], "agent/py/ttl")
+        self.assertEqual(extended["commit"], ttl_branch["commit"])
+        self.assertIsInstance(extended["expires_at"], int)
+        with self.assertRaises(ConflictError) as cm:
+            admin.update_branch_ttl(
+                repo,
+                "agent/py/ttl",
+                ttl_seconds=600,
+                expected="0000000000000000000000000000000000000000",
+            )
+        self.assertEqual(cm.exception.code, "stale_head")
+        self.assertEqual(cm.exception.current_head, ttl_branch["commit"])
+        cleared = admin.update_branch_ttl(repo, "agent/py/ttl", ttl_seconds=None, expected=ttl_branch["commit"])
+        self.assertIsNone(cleared["expires_at"])
+        admin.delete_branch(repo, "agent/py/ttl")
+
         admin.delete_repo(mirror)
         admin.delete_repo(repo)
 

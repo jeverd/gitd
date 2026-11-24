@@ -1,8 +1,9 @@
 //! Deletes branches whose time is up (feature 7).
 //!
 //! A branch gets an expiry when it is created through the API with
-//! `ttl_seconds`, or by a push whose token has `branch_ttl_seconds`. The
-//! expiry is a lifetime from creation: later pushes do not extend it.
+//! `ttl_seconds`, by a push whose token has `branch_ttl_seconds`, or via
+//! `PUT /branches/{name}/ttl`. Later pushes do not extend it automatically;
+//! callers renew or clear an expiry explicitly via `PUT /branches/{name}/ttl`.
 //! Expiries live in the database, so they survive restarts.
 //!
 //! Once a second the reaper deletes due branches, whatever they point at

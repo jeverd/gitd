@@ -1549,6 +1549,90 @@ PY
 expect_eq "delete temporary batch repo" 204 "$(admin -X DELETE "$BASE/v1/repos/acme/batch")"
 pass "atomic POST /merges/batch and delete_head verified end to end"
 
+echo "== branch TTL update (extend, CAS, clear, lock/rule/scope gates)"
+expect_eq "create ttl repo" 201 "$(admin -X POST "$BASE/v1/repos" -d '{"name":"acme/ttltest"}')"
+expect_eq "seed ttl main" 201 "$(admin -X POST "$BASE/v1/repos/acme/ttltest/commits" \
+  -d '{"branch":"main","expected_head":null,"message":"seed","changes":[{"path":"README.md","content":"hi\n"}]}')"
+TTL_MAIN="$(json '["sha"]')"
+expect_eq "create short-lived lease branch" 201 "$(admin -X POST "$BASE/v1/repos/acme/ttltest/branches" \
+  -d '{"name":"lease/1","from":"main","ttl_seconds":2}')"
+LEASE_SHA="$(json '["commit"]')"
+LEASE_TOK="$(admin -X POST "$BASE/v1/tokens" \
+  -d '{"repo":"acme/ttltest","scopes":["git:read","git:write"],"refs":["refs/heads/lease/*"]}' >/dev/null; json '["token"]')"
+
+expect_eq "scoped token extends lease/1 ttl with CAS" 200 "$(status -H "authorization: Bearer $LEASE_TOK" -X PUT "$BASE/v1/repos/acme/ttltest/branches/lease/1/ttl" \
+  -d '{"ttl_seconds":60,"expected":"'"$LEASE_SHA"'"}')"
+python3 - "$WORK/body" "$LEASE_SHA" <<'PY' || fail "ttl update response mismatch"
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["branch"] == "lease/1", d
+assert d["commit"] == sys.argv[2], d
+assert isinstance(d["expires_at"], int) and d["expires_at"] > 0, d
+PY
+expect_eq "scoped token cannot update ttl outside refs" 403 "$(status -H "authorization: Bearer $LEASE_TOK" -X PUT "$BASE/v1/repos/acme/ttltest/branches/main/ttl" \
+  -d '{"ttl_seconds":60}')"
+expect_eq "stale expected returns 409 with current_head" 409 "$(status -H "authorization: Bearer $LEASE_TOK" -X PUT "$BASE/v1/repos/acme/ttltest/branches/lease/1/ttl" \
+  -d '{"ttl_seconds":120,"expected":"0000000000000000000000000000000000000000"}')"
+expect_eq "stale ttl error code" "stale_head" "$(json '["error"]["code"]')"
+expect_eq "stale ttl current_head" "$LEASE_SHA" "$(json '["current_head"]')"
+
+expect_eq "ttl wrong method" 404 "$(admin "$BASE/v1/repos/acme/ttltest/branches/lease/1/ttl")"
+expect_eq "ttl missing field" 400 "$(admin -X PUT "$BASE/v1/repos/acme/ttltest/branches/lease/1/ttl" -d '{}')"
+expect_eq "ttl zero rejected" 400 "$(admin -X PUT "$BASE/v1/repos/acme/ttltest/branches/lease/1/ttl" -d '{"ttl_seconds":0}')"
+expect_eq "ttl over max rejected" 400 "$(admin -X PUT "$BASE/v1/repos/acme/ttltest/branches/lease/1/ttl" -d '{"ttl_seconds":604801}')"
+expect_eq "ttl invalid expected rejected" 400 "$(admin -X PUT "$BASE/v1/repos/acme/ttltest/branches/lease/1/ttl" -d '{"ttl_seconds":60,"expected":"not-a-sha"}')"
+expect_eq "ttl missing branch 404" 404 "$(admin -X PUT "$BASE/v1/repos/acme/ttltest/branches/lease/nope/ttl" -d '{"ttl_seconds":60}')"
+
+sleep 3
+expect_eq "extended lease/1 survived past original 2s ttl" 200 "$(admin "$BASE/v1/repos/acme/ttltest/branches")"
+python3 - "$WORK/body" <<'PY' || fail "lease/1 expired despite renewal"
+import json, sys
+b = next((x for x in json.load(open(sys.argv[1]))["branches"] if x["name"] == "lease/1"), None)
+assert b is not None and isinstance(b["expires_at"], int), b
+PY
+
+expect_eq "clear lease/1 ttl" 200 "$(status -H "authorization: Bearer $LEASE_TOK" -X PUT "$BASE/v1/repos/acme/ttltest/branches/lease/1/ttl" \
+  -d '{"ttl_seconds":null,"expected":"'"$LEASE_SHA"'"}')"
+expect_eq "cleared expires_at is null" "None" "$(json '["expires_at"]')"
+expect_eq "list branches shows cleared expires_at" 200 "$(admin "$BASE/v1/repos/acme/ttltest/branches")"
+python3 - "$WORK/body" <<'PY' || fail "lease/1 still has expires_at after clear"
+import json, sys
+b = next((x for x in json.load(open(sys.argv[1]))["branches"] if x["name"] == "lease/1"), None)
+assert b is not None and b["expires_at"] is None, b
+PY
+
+expect_eq "lock lease/1" 200 "$(admin -X PUT "$BASE/v1/repos/acme/ttltest/branches/lease/1/lock" -d '{"reason":"hold"}')"
+expect_eq "locked branch rejects ttl update" 423 "$(admin -X PUT "$BASE/v1/repos/acme/ttltest/branches/lease/1/ttl" -d '{"ttl_seconds":60}')"
+expect_eq "unlock lease/1" 204 "$(admin -X DELETE "$BASE/v1/repos/acme/ttltest/branches/lease/1/lock")"
+
+expect_eq "create non-deletable rule" 201 "$(admin -X POST "$BASE/v1/repos/acme/ttltest/rules" \
+  -d '{"pattern":"refs/heads/protected/*","allow_delete":false}')"
+expect_eq "create protected branch" 201 "$(admin -X POST "$BASE/v1/repos/acme/ttltest/branches" \
+  -d '{"name":"protected/1","from":"main"}')"
+expect_eq "non-deletable rule blocks setting ttl" 403 "$(admin -X PUT "$BASE/v1/repos/acme/ttltest/branches/protected/1/ttl" \
+  -d '{"ttl_seconds":60}')"
+expect_eq "non-deletable rule still allows clearing ttl" 200 "$(admin -X PUT "$BASE/v1/repos/acme/ttltest/branches/protected/1/ttl" \
+  -d '{"ttl_seconds":null}')"
+
+expect_eq "set short ttl on existing non-expiring branch" 200 "$(admin -X PUT "$BASE/v1/repos/acme/ttltest/branches/lease/1/ttl" \
+  -d '{"ttl_seconds":2}')"
+sleep 3
+expect_eq "re-armed branch expired" 200 "$(admin "$BASE/v1/repos/acme/ttltest/branches")"
+python3 - "$WORK/body" <<'PY' || fail "lease/1 did not expire after setting short ttl"
+import json, sys
+names = {b["name"] for b in json.load(open(sys.argv[1]))["branches"]}
+assert "lease/1" not in names, names
+PY
+
+expect_eq "branch_ttl_updated events recorded" 200 "$(admin "$BASE/v1/repos/acme/ttltest/events?kind=branch_ttl_updated")"
+python3 - "$WORK/body" <<'PY' || fail "missing branch_ttl_updated events"
+import json, sys
+evs = json.load(open(sys.argv[1]))["events"]
+assert len(evs) >= 3, evs
+PY
+expect_eq "delete temporary ttl repo" 204 "$(admin -X DELETE "$BASE/v1/repos/acme/ttltest")"
+pass "PUT /branches/{name}/ttl verified end to end"
+
 # Stop while a slow clone is mid-transfer: gitd must still exit promptly and
 # take its git processes with it.
 head -c 4000000 /dev/urandom >"$SRC/big2.bin"

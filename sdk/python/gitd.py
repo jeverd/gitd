@@ -137,6 +137,19 @@ class GitdClient:
     def unlock_branch(self, repo: str, name: str) -> None:
         self._request("DELETE", f"/v1/repos/{repo}/branches/{_encode_path(name)}/lock")
 
+    def update_branch_ttl(
+        self,
+        repo: str,
+        name: str,
+        *,
+        ttl_seconds: int | None,
+        expected: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"ttl_seconds": ttl_seconds}
+        if expected is not None:
+            body["expected"] = expected
+        return self._json("PUT", f"/v1/repos/{repo}/branches/{_encode_path(name)}/ttl", body)
+
     def create_rule(
         self,
         repo: str,

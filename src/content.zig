@@ -15,6 +15,7 @@
 //! cover the branch):
 //!   POST   commits              {"branch", "expected_head", "message", "changes", ...}
 //!   POST   branches             {"name", "from"}
+//!   PUT    branches/{name}/ttl  {"ttl_seconds", "expected"}
 //!   DELETE branches/{name}?expected=SHA
 //!   POST   merges               {"base", "head", "strategy", "expected_base_head", ...}
 //!
@@ -183,6 +184,10 @@ pub fn serve(
         if (method == .PUT) return lockBranch(app, request, name, raw_branch, access);
         if (method == .DELETE) return unlockBranch(app, request, name, raw_branch, access);
         return api.respondError(request, .method_not_allowed, "method_not_allowed", "use PUT or DELETE");
+    }
+    if (method == .PUT and std.mem.startsWith(u8, rest, "branches/") and std.mem.endsWith(u8, rest, "/ttl")) {
+        const raw_branch = rest["branches/".len .. rest.len - "/ttl".len];
+        return updateBranchTtl(app, request, &repo, name, raw_branch, access);
     }
     if (method == .DELETE and std.mem.startsWith(u8, rest, "branches/")) return deleteBranch(app, request, &repo, name, rest["branches/".len..], query, access);
     return api.respondError(request, .not_found, "not_found", "no such repo route");
@@ -873,6 +878,130 @@ fn deleteBranch(app: *server.App, request: *http.Server.Request, repo: *const re
     events.record(app, .{ .repo = name.full, .kind = "branch_deleted", .ref = ref, .old = current, .created_at = api.unixNow(app.io) });
     try request.respond("", .{ .status = .no_content, .keep_alive = http_util.keepAlive(request) });
     return .no_content;
+}
+
+fn updateBranchTtl(
+    app: *server.App,
+    request: *http.Server.Request,
+    repo: *const repo_git.Repo,
+    name: repo_name.Name,
+    raw: []const u8,
+    access: Access,
+) Error!http.Status {
+    var decoded: [ref_name.max_len]u8 = undefined;
+    const branch = api.percentDecode(&decoded, raw, false) orelse
+        return api.respondError(request, .bad_request, "invalid_branch", "the branch name is not valid");
+    var ref_buf: [ref_name.max_len]u8 = undefined;
+    const ref = ref_name.validateBranch(branch, &ref_buf) catch
+        return api.respondError(request, .bad_request, "invalid_branch", "the branch name is not valid");
+    if (!access.canWrite(ref)) return forbiddenRef(request, ref);
+
+    const Body = struct {
+        ttl_seconds: ?i64,
+        expected: ?[]const u8 = null,
+    };
+    var parsed = api.readJson(Body, app.gpa, request) catch |err| return api.respondBodyError(request, err);
+    defer parsed.deinit();
+    const body = parsed.value;
+
+    if (ttlInvalid(body.ttl_seconds)) {
+        return api.respondError(request, .bad_request, "invalid_ttl", "ttl_seconds must be 1-604800 or null");
+    }
+    if (body.expected) |e| {
+        if (!receive_pack.isOid(e)) {
+            return api.respondError(request, .bad_request, "invalid_expected_head", "expected must be a full commit oid");
+        }
+    }
+
+    if (app.db.isBranchLocked(app.io, name.full, ref) catch return api.internal(request)) {
+        return api.respondError(request, .locked, "branch_locked", "this branch is locked");
+    }
+    if (body.ttl_seconds != null) {
+        const repo_rules = app.db.listBranchRules(app.io, app.gpa, name.full) catch return api.internal(request);
+        defer Db.freeBranchRules(app.gpa, repo_rules);
+        if (!rules.evaluate(repo_rules, ref).allow_delete) {
+            events.record(app, .{
+                .repo = name.full,
+                .kind = "rule_rejected",
+                .ref = ref,
+                .detail = "branch ttl blocked by non-deletable branch rule",
+                .created_at = api.unixNow(app.io),
+            });
+            return api.respondError(request, .forbidden, "rule_violation", "branch rule forbids setting an expiry on a non-deletable branch");
+        }
+    }
+
+    const now = api.unixNow(app.io);
+    const new_expires_at: ?i64 = if (body.ttl_seconds) |t| now + t else null;
+
+    var cur_buf: [64]u8 = undefined;
+    var current: []const u8 = "";
+    var outcome: enum { ok, not_found, stale, db_err, git_err } = .ok;
+    var git_err_val: ?anyerror = null;
+    {
+        // Hold repo_lock across the ref check and DB update so TTL renewal
+        // cannot race with expiry.reapOne deleting the branch or deleteRepo.
+        try app.repo_lock.lock(app.io);
+        defer app.repo_lock.unlock(app.io);
+
+        const cur = repo.refValue(ref, &cur_buf) catch |err| blk: {
+            git_err_val = err;
+            outcome = .git_err;
+            break :blk null;
+        };
+        if (outcome == .ok) {
+            if (cur) |oid| {
+                current = oid;
+                if (body.expected) |e| {
+                    if (!std.mem.eql(u8, e, oid)) outcome = .stale;
+                }
+                if (outcome == .ok) {
+                    const db_res = if (new_expires_at) |exp|
+                        app.db.setBranchTtl(app.io, name.full, access.repo_id, ref, exp)
+                    else
+                        app.db.clearBranchTtl(app.io, name.full, ref);
+                    db_res catch {
+                        outcome = .db_err;
+                    };
+                }
+            } else {
+                outcome = .not_found;
+            }
+        }
+    }
+
+    switch (outcome) {
+        .git_err => return gitError(request, git_err_val.?),
+        .db_err => return api.internal(request),
+        .not_found => return api.respondError(request, .not_found, "not_found", "no such branch"),
+        .stale => {
+            const Err = struct { code: []const u8, message: []const u8 };
+            return api.respondJson(app.gpa, request, .conflict, .{
+                .@"error" = Err{ .code = "stale_head", .message = "the branch is not at expected; retry with current_head" },
+                .current_head = current,
+            });
+        },
+        .ok => {},
+    }
+
+    var detail_buf: [64]u8 = undefined;
+    const detail = if (new_expires_at) |exp|
+        (std.mem.print(&detail_buf, "expires_at={d}", .{exp}) catch "updated")
+    else
+        "cleared";
+    events.record(app, .{
+        .repo = name.full,
+        .kind = "branch_ttl_updated",
+        .ref = ref,
+        .new = current,
+        .detail = detail,
+        .created_at = now,
+    });
+    return api.respondJson(app.gpa, request, .ok, .{
+        .branch = branch,
+        .commit = current,
+        .expires_at = new_expires_at,
+    });
 }
 
 fn lockBranch(app: *server.App, request: *http.Server.Request, name: repo_name.Name, raw: []const u8, access: Access) Error!http.Status {
