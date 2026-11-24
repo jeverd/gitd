@@ -515,6 +515,14 @@ export class GitdClient {
     await this.#request("DELETE", `/v1/repos/${repo}/branches/${encodePath(name)}/lock`);
   }
 
+  updateBranchTtl(
+    repo: string,
+    name: string,
+    opts: { ttl_seconds: number | null; expected?: string },
+  ): Promise<{ branch: string; commit: string; expires_at: number | null }> {
+    return this.#json("PUT", `/v1/repos/${repo}/branches/${encodePath(name)}/ttl`, opts);
+  }
+
   createRule(repo: string, opts: CreateRuleOptions): Promise<BranchRule> {
     return this.#json("POST", `/v1/repos/${repo}/rules`, opts);
   }

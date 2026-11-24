@@ -310,6 +310,30 @@ test("TypeScript SDK end-to-end", async () => {
     await streamTask;
     assert.ok(seen.includes("check_updated"));
 
+    // Branch TTL update (extend, CAS 409, clear)
+    const ttlBranch = await admin.createBranch(repoName, { name: "agent/ts/ttl", from: "main", ttl_seconds: 60 });
+    const extended = await admin.updateBranchTtl(repoName, "agent/ts/ttl", {
+      ttl_seconds: 300,
+      expected: ttlBranch.commit,
+    });
+    assert.equal(extended.branch, "agent/ts/ttl");
+    assert.equal(extended.commit, ttlBranch.commit);
+    assert.ok(typeof extended.expires_at === "number");
+    await assert.rejects(
+      () =>
+        admin.updateBranchTtl(repoName, "agent/ts/ttl", {
+          ttl_seconds: 600,
+          expected: "0000000000000000000000000000000000000000",
+        }),
+      (err: unknown) => err instanceof ConflictError && err.code === "stale_head" && err.currentHead === ttlBranch.commit,
+    );
+    const cleared = await admin.updateBranchTtl(repoName, "agent/ts/ttl", {
+      ttl_seconds: null,
+      expected: ttlBranch.commit,
+    });
+    assert.equal(cleared.expires_at, null);
+    await admin.deleteBranch(repoName, "agent/ts/ttl");
+
     await admin.deleteRepo(mirrorName);
     await admin.deleteRepo(repoName);
   } finally {
