@@ -2,7 +2,16 @@
 
 Open-source git storage for AI agents, written in Zig. Create repos over an API, give each agent a scoped token, and let agents push with plain `git` or commit through the API.
 
-Status: MVP complete. Every feature below works end to end; `tests/demo/agents.sh` runs the whole scenario.
+![gitd multi-agent demo](docs/demo.gif)
+
+## Why gitd?
+
+Human Git forges (GitHub, Gitea, Forgejo) carry web UIs, issue trackers, and heavy runtimes that get in the way when dozens of autonomous agents are branching, committing, and merging every second. `gitd` is a single ~5 MiB RSS binary built specifically as agent code storage:
+
+- **Zero-clone API + real Git:** Read files, grep, patch, commit, diff, and merge over HTTP in <1 ms—or let agents use plain `git clone` and `git push` over native Smart HTTP.
+- **Least-privilege tokens:** Short-lived signed tokens scoped to one repo, ref patterns (`refs` / `read_refs`), file paths (`paths`), and revocable immediately by `jti`.
+- **Safe concurrency:** Compare-and-swap (`expected_head` → `409` with `current_head`), branch locks, branch protection rules, required commit checks, multi-branch conflict radar, and atomic batch merges.
+- **Self-cleaning branches:** Ephemeral branches with `ttl_seconds` and renewable leases (`PUT /branches/{name}/ttl`), plus live SSE events and signed, retried webhooks.
 
 ## Quick start
 
@@ -162,30 +171,18 @@ agent.commit_with_retry("acme/web", "agent/1/work", lambda head: {
 })
 ```
 
-## MVP
+## Demo
 
-- **Stack:** Zig, SQLite, in-process `libgit2` + native Zig Git Smart HTTP server (with `git` for diff, merge-tree, grep, archive, and GC). One server, repos on a persistent disk.
-- **Features:**
-  1. ✅ Repos: create, list, delete over an API
-  2. ✅ Git: `git clone` and `git push` work normally
-  3. ✅ Tokens: short-lived, limited to ref patterns
-  4. ✅ Read files, folders, history without cloning
-  5. ✅ Commit through the API, with a 409 when two agents race (TLA+ model in `tests/tla/commit_cas`)
-  6. ✅ Diff and merge branches
-  7. ✅ Branches that delete themselves after a set time
-  8. ✅ Webhooks on every event (signed, retried, survive restarts)
-- ✅ **Done when:** 5 fake agents work on separate branches at once, one is blocked from pushing to `main`, the winner is merged, and the rest expire. Run it:
+Run the multi-agent scenario locally (5 agents push in parallel, one is blocked from pushing to `main`, the winner is merged, the rest expire, and webhooks are delivered):
 
-  ```sh
-  zig build
-  DEMO_PACE=3 AGENT_TTL=20 DEMO_KEEP=1 tests/demo/agents.sh   # then open http://127.0.0.1:18910/ui
-  ```
+```sh
+zig build
+DEMO_PACE=3 AGENT_TTL=20 DEMO_KEEP=1 tests/demo/agents.sh   # then open http://127.0.0.1:18910/ui
+```
 
-## After the MVP
+## Deployment & Security
 
-1. Repos in S3, metadata in Postgres
-2. ✅ Native Zig Git Smart HTTP protocol server + in-process `libgit2`
-3. ✅ Zero-dependency TypeScript & Python SDKs and read-only `/ui`
+`gitd` speaks plain HTTP and stores repos on local disk with SQLite metadata. In production, run it behind a TLS-terminating reverse proxy, keep admin keys (`gitd_k_...`) on your control plane, and issue short-lived scoped tokens (`gitd_t_...`) to agents. See [`SECURITY.md`](SECURITY.md) for deployment guidance and vulnerability reporting.
 
 ## Development
 
@@ -195,3 +192,7 @@ scripts/verify-linux.sh   # unit tests and e2e on Linux, in Docker
 ```
 
 See `AGENTS.md` and `RULES.md`.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
