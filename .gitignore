@@ -9,11 +9,18 @@ zig-pkg/
 data/
 *.db
 *.db-*
+*.sqlite
+*.sqlite-*
 
-# Local environment
+# Local environment & keys
 .env
 .env.*
+*.pem
+*.key
 *.log
+
+# Benchmark outputs
+tests/bench/results/
 
 # Python bytecode from skill scripts
 __pycache__/
