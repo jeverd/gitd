@@ -1,5 +1,8 @@
 # gitd
 
+[![CI](https://github.com/jeverd/gitd/actions/workflows/ci.yml/badge.svg)](https://github.com/jeverd/gitd/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Open-source git storage for AI agents, written in Zig. Create repos over an API, give each agent a scoped token, and let agents push with plain `git` or commit through the API.
 
 ![gitd multi-agent demo](docs/demo.gif)
@@ -40,10 +43,11 @@ git clone "http://t:$TOKEN@127.0.0.1:8080/acme/web.git"
 ### In Docker
 
 ```sh
-docker build -t gitd .
-docker run -d --name gitd -v gitd-data:/data -p 8080:8080 gitd
+docker run -d --name gitd -v gitd-data:/data -p 8080:8080 ghcr.io/jeverd/gitd:latest
 KEY=$(docker exec gitd cat /data/admin-key)   # made on first start, kept in the volume
 ```
+
+Or build locally: `docker build -t gitd .`
 
 The container listens on 0.0.0.0:8080 with `/ui` off. To choose the admin key up front, pass
 `-e GITD_ADMIN_KEY=gitd_k_...` (any key `gitd admin create-key` printed); the container adds it
