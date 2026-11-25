@@ -10,10 +10,61 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
-    name: Build, test & e2e (Linux)
+  lint:
+    name: Format & Zig 0.17 API check
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+
+      - name: Check formatting & Zig 0.17 APIs
+        run: |
+          zig version
+          zig fmt --check src build.zig
+          python3 .claude/skills/zig/scripts/check_deprecated.py --review src build.zig
+
+  unit:
+    name: Unit tests (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [Debug, ReleaseSafe]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+
+      - name: Install native deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libsqlite3-dev libgit2-dev pkg-config
+
+      - uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-unit-${{ runner.os }}-${{ matrix.mode }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**') }}
+          restore-keys: |
+            zig-unit-${{ runner.os }}-${{ matrix.mode }}-
+
+      - name: Run unit tests (${{ matrix.mode }})
+        run: zig build test -Doptimize=${{ matrix.mode }} --summary all
+
+  e2e:
+    name: End-to-end (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [Debug, ReleaseSafe]
     steps:
       - uses: actions/checkout@v4
 
@@ -25,28 +76,19 @@ jobs:
         with:
           version: 0.17.1
 
-      - name: Install system dependencies
+      - name: Install native deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libsqlite3-dev libgit2-dev pkg-config git curl
+          sudo apt-get install -y -qq --no-install-recommends libsqlite3-dev libgit2-dev pkg-config
 
-      - name: Format & Zig 0.17 API check
-        run: |
-          zig version
-          zig build fmt-check
-          python3 .claude/skills/zig/scripts/check_deprecated.py --review src build.zig
+      - uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-e2e-${{ runner.os }}-${{ matrix.mode }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**') }}
+          restore-keys: |
+            zig-e2e-${{ runner.os }}-${{ matrix.mode }}-
 
-      - name: Unit tests (Debug & ReleaseSafe)
+      - name: Build & run e2e (${{ matrix.mode }})
         run: |
-          timeout 120 zig build test --summary all
-          timeout 120 zig build test -Doptimize=ReleaseSafe --summary all
-
-      - name: End-to-end tests (Debug)
-        run: |
-          zig build
-          tests/e2e/run.sh zig-out/bin/gitd
-
-      - name: End-to-end tests (ReleaseSafe)
-        run: |
-          zig build -Doptimize=ReleaseSafe
+          zig build -Doptimize=${{ matrix.mode }}
           tests/e2e/run.sh zig-out/bin/gitd
