@@ -13,6 +13,7 @@ jobs:
   verify:
     name: Build, test & e2e (Linux)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -20,16 +21,14 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install system dependencies & Zig 0.17.1
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+
+      - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libsqlite3-dev libgit2-dev pkg-config git curl xz-utils
-          ZIG_VERSION="$(sed -n 's/.*\.minimum_zig_version = "\(.*\)".*/\1/p' build.zig.zon)"
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
-          sudo mkdir -p /opt/zig
-          sudo tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
-          rm /tmp/zig.tar.xz
-          echo "/opt/zig" >> "$GITHUB_PATH"
+          sudo apt-get install -y -qq libsqlite3-dev libgit2-dev pkg-config git curl
 
       - name: Format & Zig 0.17 API check
         run: |
@@ -39,8 +38,8 @@ jobs:
 
       - name: Unit tests (Debug & ReleaseSafe)
         run: |
-          zig build test
-          zig build test -Doptimize=ReleaseSafe
+          timeout 120 zig build test --summary all
+          timeout 120 zig build test -Doptimize=ReleaseSafe --summary all
 
       - name: End-to-end tests (Debug)
         run: |
