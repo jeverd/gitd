@@ -104,6 +104,26 @@ pub fn parseWithOffset(bytes: []const u8, out: *[max_commands]Command) ParseErro
     }
 }
 
+fn extractShallows(gpa: std.mem.Allocator, header_bytes: []const u8, out: *std.ArrayList([40]u8)) std.mem.Allocator.Error!void {
+    var r = pktline.Reader.init(header_bytes);
+    while (r.next() catch null) |packet| {
+        switch (packet) {
+            .data => |raw_line| {
+                var line = raw_line;
+                if (line.len > 0 and line[line.len - 1] == '\n') line = line[0 .. line.len - 1];
+                if (!std.mem.startsWith(u8, line, "shallow ")) break;
+                const hex = line["shallow ".len..];
+                if (hex.len == 40 and isOid(hex)) {
+                    var oid: [40]u8 = undefined;
+                    @memcpy(&oid, hex);
+                    try out.append(gpa, oid);
+                }
+            },
+            else => break,
+        }
+    }
+}
+
 fn parseCommand(line: []const u8) ParseError!Command {
     const first = std.mem.findScalar(u8, line, ' ') orelse return error.InvalidPush;
     const old = line[0..first];
@@ -366,6 +386,16 @@ pub fn serveRpc(
             error.InvalidPack => return respondUnpackFailure(app, request, commands, caps, "invalid packfile"),
             error.PackTooManyObjects => return respondUnpackFailure(app, request, commands, caps, "pack has too many objects"),
             error.GitFailed, error.OutOfMemory => return api.internal(request),
+        };
+    }
+
+    var shallows: std.ArrayList([40]u8) = .empty;
+    defer shallows.deinit(app.gpa);
+    extractShallows(app.gpa, head_bytes[0..parsed.pack_offset], &shallows) catch return api.internal(request);
+    if (shallows.items.len > 0) {
+        git_repo.recordShallows(shallows.items) catch |err| return switch (err) {
+            error.Canceled => error.Canceled,
+            else => api.internal(request),
         };
     }
 
