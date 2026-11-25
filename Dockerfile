@@ -11,7 +11,15 @@ ARG ZIG_VERSION=0.17.1
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils libsqlite3-dev libgit2-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 RUN arch="$(uname -m)" \
-    && curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${arch}-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz \
+    && tarball="zig-${arch}-linux-${ZIG_VERSION}.tar.xz" \
+    && for base in \
+        https://ziglang.freetls.fastly.net \
+        https://zig.chainsafe.dev \
+        https://pkg.hexops.org/zig \
+        https://zigmirror.hryx.net/zig \
+        "https://ziglang.org/download/${ZIG_VERSION}"; do \
+        curl -fsSL --connect-timeout 10 --max-time 90 "${base}/${tarball}" -o /tmp/zig.tar.xz && break; \
+      done \
     && mkdir /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 && rm /tmp/zig.tar.xz
 WORKDIR /src
 COPY build.zig build.zig.zon ./
