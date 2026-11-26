@@ -897,7 +897,8 @@ fn checkWantsAllowed(
         }
         if (!allowed) {
             for (visible_oids.items) |vis| {
-                if (git2.git_graph_descendant_of(git2_repo, &vis, &want_oid) == 1) {
+                const is_desc = repo_git.Repo.isDescendantOf(gpa, git2_repo, &vis, &want_oid) catch false;
+                if (is_desc) {
                     allowed = true;
                     break;
                 }

@@ -1633,6 +1633,36 @@ PY
 expect_eq "delete temporary ttl repo" 204 "$(admin -X DELETE "$BASE/v1/repos/acme/ttltest")"
 pass "PUT /branches/{name}/ttl verified end to end"
 
+echo "== shallow-pushed repo (compare, log, merges)"
+expect_eq "create shallow repo" 201 "$(admin -X POST "$BASE/v1/repos" -d '{"name":"acme/shallow"}')"
+SHALLOW_TOK="$(mint acme/shallow '["git:read","git:write"]')"
+SHALLOW_ORIGIN="$WORK/shallow-origin"
+SHALLOW_CLONE="$WORK/shallow-clone"
+mkdir -p "$SHALLOW_ORIGIN"
+git "${GIT_ID[@]}" -C "$SHALLOW_ORIGIN" init -q
+printf 'v1\n' >"$SHALLOW_ORIGIN/a.txt"
+git -C "$SHALLOW_ORIGIN" add a.txt
+git "${GIT_ID[@]}" -C "$SHALLOW_ORIGIN" commit -qm "base1"
+printf 'v2\n' >"$SHALLOW_ORIGIN/a.txt"
+git -C "$SHALLOW_ORIGIN" add a.txt
+git "${GIT_ID[@]}" -C "$SHALLOW_ORIGIN" commit -qm "base2"
+SHALLOW_BASE_SHA="$(git -C "$SHALLOW_ORIGIN" rev-parse HEAD)"
+git clone -q --depth=1 "file://$SHALLOW_ORIGIN" "$SHALLOW_CLONE"
+git -C "$SHALLOW_CLONE" push -q "$(url "$SHALLOW_TOK" acme/shallow)" HEAD:refs/heads/main 2>"$WORK/err" || fail "shallow push: $(cat "$WORK/err")"
+pass "pushed shallow clone (--depth=1) to gitd"
+expect_eq "commit on top of shallow main" 201 "$(status -H "authorization: Bearer $SHALLOW_TOK" -X POST "$BASE/v1/repos/acme/shallow/commits" -d '{"branch":"agent/sh1","from":"main","expected_head":null,"message":"edit on shallow","changes":[{"path":"a.txt","content":"v3\n"}]}')"
+expect_eq "compare against shallow main" 200 "$(status -H "authorization: Bearer $SHALLOW_TOK" "$BASE/v1/repos/acme/shallow/compare/main...agent/sh1")"
+expect_eq "shallow compare merge_base" "$SHALLOW_BASE_SHA" "$(json '["merge_base"]')"
+expect_eq "shallow compare ahead" 1 "$(json '["ahead"]')"
+expect_eq "shallow compare behind" 0 "$(json '["behind"]')"
+expect_eq "log on shallow branch" 200 "$(status -H "authorization: Bearer $SHALLOW_TOK" "$BASE/v1/repos/acme/shallow/log?ref=agent/sh1&limit=10")"
+expect_eq "shallow log count" 2 "$(json '["commits"].__len__()')"
+expect_eq "path-filtered log on shallow branch" 200 "$(status -H "authorization: Bearer $SHALLOW_TOK" "$BASE/v1/repos/acme/shallow/log?ref=agent/sh1&path=a.txt&limit=10")"
+expect_eq "merges/check on shallow branch" 200 "$(status -H "authorization: Bearer $SHALLOW_TOK" -X POST "$BASE/v1/repos/acme/shallow/merges/check" -d '{"base":"main","heads":["agent/sh1"]}')"
+expect_eq "merge on shallow branch" 201 "$(admin -X POST "$BASE/v1/repos/acme/shallow/merges" -d '{"base":"main","head":"agent/sh1","delete_head":true}')"
+expect_eq "delete shallow repo" 204 "$(admin -X DELETE "$BASE/v1/repos/acme/shallow")"
+pass "shallow-pushed repo compare, log, and merge verified end to end"
+
 # Stop while a slow clone is mid-transfer: gitd must still exit promptly and
 # take its git processes with it.
 head -c 4000000 /dev/urandom >"$SRC/big2.bin"

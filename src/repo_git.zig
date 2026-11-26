@@ -595,11 +595,15 @@ pub const Repo = struct {
             _ = git2.git_revwalk_sorting(walk.?, git2.sort_topological | git2.sort_time);
             if (git2.git_revwalk_push(walk.?, git2.git_commit_id(tip)) != git2.ok) return error.GitFailed;
 
+            var hit_shallow_err = false;
             while (metas.items.len < limit) {
                 var cur_oid: git2.Oid = .{};
                 const rc = git2.git_revwalk_next(&cur_oid, walk.?);
                 if (rc == git2.err_iter_over) break;
-                if (rc != git2.ok) return error.GitFailed;
+                if (rc != git2.ok) {
+                    hit_shallow_err = true;
+                    break;
+                }
 
                 var cur: ?*git2.Commit = null;
                 if (git2.git_commit_lookup(&cur, repo, &cur_oid) != git2.ok) return error.GitFailed;
@@ -609,6 +613,14 @@ pub const Repo = struct {
                     if (!(try commitTouchesPath(cur.?, pz))) continue;
                 }
                 try appendCommitMeta(r.gpa, &metas, &raw_buf, cur.?);
+            }
+            if (hit_shallow_err) {
+                // libgit2's revwalk aborts when it hits a shallow boundary commit
+                // whose parent object is absent from the ODB; fall back to a
+                // bounded walk that stops at missing parents.
+                metas.clearRetainingCapacity();
+                raw_buf.clearRetainingCapacity();
+                try logShallow(r.gpa, repo, git2.git_commit_id(tip).*, limit, path_z, &metas, &raw_buf);
             }
         }
 
@@ -1191,9 +1203,16 @@ pub const Repo = struct {
         const pcount = git2.git_commit_parentcount(commit);
         if (pcount == 0) return c_info != null;
 
+        var checked_parent = false;
         for (0..pcount) |pi| {
             var parent: ?*git2.Commit = null;
-            if (git2.git_commit_parent(&parent, commit, @intCast(pi)) != git2.ok) return error.GitFailed;
+            const rc = git2.git_commit_parent(&parent, commit, @intCast(pi));
+            if (rc == git2.err_not_found) {
+                // Shallow boundary: missing parent object cannot be diffed.
+                continue;
+            }
+            if (rc != git2.ok) return error.GitFailed;
+            checked_parent = true;
             defer git2.git_commit_free(parent.?);
 
             var p_tree: ?*git2.Tree = null;
@@ -1207,7 +1226,204 @@ pub const Repo = struct {
                 p_info == null;
             if (same) return false;
         }
+        if (!checked_parent) return c_info != null;
         return true;
+    }
+
+    const max_shallow_walk_commits: usize = 100_000;
+
+    fn collectShallowAncestors(
+        gpa: std.mem.Allocator,
+        repo: *git2.Repository,
+        start: git2.Oid,
+        out: *std.array_hash_map.Auto([20]u8, i64),
+    ) git_cmd.Error!void {
+        var start_commit: ?*git2.Commit = null;
+        if (git2.git_commit_lookup(&start_commit, repo, &start) != git2.ok) return error.GitFailed;
+        const start_time = git2.git_commit_time(start_commit.?);
+        git2.git_commit_free(start_commit.?);
+
+        try out.put(gpa, start.id, start_time);
+        var queue: std.ArrayList(git2.Oid) = .empty;
+        defer queue.deinit(gpa);
+        try queue.append(gpa, start);
+
+        var head: usize = 0;
+        while (head < queue.items.len) {
+            const cur_oid = queue.items[head];
+            head += 1;
+            var cur: ?*git2.Commit = null;
+            if (git2.git_commit_lookup(&cur, repo, &cur_oid) != git2.ok) return error.GitFailed;
+            defer git2.git_commit_free(cur.?);
+
+            const pcount = git2.git_commit_parentcount(cur.?);
+            for (0..pcount) |pi| {
+                const p_oid = git2.git_commit_parent_id(cur.?, @intCast(pi)) orelse continue;
+                if (out.contains(p_oid.id)) continue;
+                var parent: ?*git2.Commit = null;
+                const rc = git2.git_commit_lookup(&parent, repo, p_oid);
+                if (rc == git2.err_not_found) continue; // Shallow boundary.
+                if (rc != git2.ok) return error.GitFailed;
+                const p_time = git2.git_commit_time(parent.?);
+                git2.git_commit_free(parent.?);
+                if (out.count() >= max_shallow_walk_commits) return error.GitFailed;
+                try out.put(gpa, p_oid.id, p_time);
+                try queue.append(gpa, p_oid.*);
+            }
+        }
+    }
+
+    fn logShallow(
+        gpa: std.mem.Allocator,
+        repo: *git2.Repository,
+        tip: git2.Oid,
+        limit: usize,
+        path_z: ?[:0]const u8,
+        metas: *std.ArrayList(CommitMeta),
+        raw_buf: *std.ArrayList(u8),
+    ) git_cmd.Error!void {
+        var reachable: std.array_hash_map.Auto([20]u8, i64) = .empty;
+        defer reachable.deinit(gpa);
+        try collectShallowAncestors(gpa, repo, tip, &reachable);
+
+        const WalkEntry = struct { id: [20]u8, time: i64, order: usize };
+        var entries = try gpa.alloc(WalkEntry, reachable.count());
+        defer gpa.free(entries);
+        for (reachable.keys(), reachable.values(), 0..) |k, v, idx| {
+            entries[idx] = .{ .id = k, .time = v, .order = idx };
+        }
+        std.mem.sort(WalkEntry, entries, {}, struct {
+            fn lessThan(_: void, a: WalkEntry, b: WalkEntry) bool {
+                if (a.time != b.time) return a.time > b.time;
+                return a.order < b.order;
+            }
+        }.lessThan);
+
+        for (entries) |entry| {
+            if (metas.items.len >= limit) break;
+            const oid: git2.Oid = .{ .id = entry.id };
+            var cur: ?*git2.Commit = null;
+            if (git2.git_commit_lookup(&cur, repo, &oid) != git2.ok) return error.GitFailed;
+            defer git2.git_commit_free(cur.?);
+
+            if (path_z) |pz| {
+                if (!(try commitTouchesPath(cur.?, pz))) continue;
+            }
+            try appendCommitMeta(gpa, metas, raw_buf, cur.?);
+        }
+    }
+
+    fn isDescendantShallow(
+        gpa: std.mem.Allocator,
+        repo: *git2.Repository,
+        desc_id: git2.Oid,
+        anc_id: git2.Oid,
+    ) git_cmd.Error!bool {
+        if (std.mem.eql(u8, &desc_id.id, &anc_id.id)) return true;
+        var visited: std.array_hash_map.Auto([20]u8, void) = .empty;
+        defer visited.deinit(gpa);
+        try visited.put(gpa, desc_id.id, {});
+        var queue: std.ArrayList(git2.Oid) = .empty;
+        defer queue.deinit(gpa);
+        try queue.append(gpa, desc_id);
+
+        var head: usize = 0;
+        while (head < queue.items.len) {
+            const cur_oid = queue.items[head];
+            head += 1;
+            var cur: ?*git2.Commit = null;
+            if (git2.git_commit_lookup(&cur, repo, &cur_oid) != git2.ok) return error.GitFailed;
+            defer git2.git_commit_free(cur.?);
+
+            const pcount = git2.git_commit_parentcount(cur.?);
+            for (0..pcount) |pi| {
+                const p_oid = git2.git_commit_parent_id(cur.?, @intCast(pi)) orelse continue;
+                if (std.mem.eql(u8, &p_oid.id, &anc_id.id)) return true;
+                if (visited.contains(p_oid.id)) continue;
+                var parent: ?*git2.Commit = null;
+                const rc = git2.git_commit_lookup(&parent, repo, p_oid);
+                if (rc == git2.err_not_found) continue; // Shallow boundary.
+                if (rc != git2.ok) return error.GitFailed;
+                git2.git_commit_free(parent.?);
+                if (visited.count() >= max_shallow_walk_commits) return error.GitFailed;
+                try visited.put(gpa, p_oid.id, {});
+                try queue.append(gpa, p_oid.*);
+            }
+        }
+        return false;
+    }
+
+    fn mergeBaseShallow(
+        gpa: std.mem.Allocator,
+        repo: *git2.Repository,
+        oid_a: git2.Oid,
+        oid_b: git2.Oid,
+    ) git_cmd.Error!?git2.Oid {
+        if (std.mem.eql(u8, &oid_a.id, &oid_b.id)) return oid_a;
+        var anc_a: std.array_hash_map.Auto([20]u8, i64) = .empty;
+        defer anc_a.deinit(gpa);
+        try collectShallowAncestors(gpa, repo, oid_a, &anc_a);
+
+        const Candidate = struct { oid: git2.Oid, time: i64 };
+        var candidates: std.ArrayList(Candidate) = .empty;
+        defer candidates.deinit(gpa);
+        var visited_b: std.array_hash_map.Auto([20]u8, void) = .empty;
+        defer visited_b.deinit(gpa);
+        var queue: std.ArrayList(git2.Oid) = .empty;
+        defer queue.deinit(gpa);
+
+        try visited_b.put(gpa, oid_b.id, {});
+        try queue.append(gpa, oid_b);
+
+        var head: usize = 0;
+        while (head < queue.items.len) {
+            const cur_oid = queue.items[head];
+            head += 1;
+            if (anc_a.get(cur_oid.id)) |t| {
+                try candidates.append(gpa, .{ .oid = cur_oid, .time = t });
+                continue;
+            }
+            var cur: ?*git2.Commit = null;
+            if (git2.git_commit_lookup(&cur, repo, &cur_oid) != git2.ok) return error.GitFailed;
+            defer git2.git_commit_free(cur.?);
+
+            const pcount = git2.git_commit_parentcount(cur.?);
+            for (0..pcount) |pi| {
+                const p_oid = git2.git_commit_parent_id(cur.?, @intCast(pi)) orelse continue;
+                if (visited_b.contains(p_oid.id)) continue;
+                var parent: ?*git2.Commit = null;
+                const rc = git2.git_commit_lookup(&parent, repo, p_oid);
+                if (rc == git2.err_not_found) continue; // Shallow boundary.
+                if (rc != git2.ok) return error.GitFailed;
+                git2.git_commit_free(parent.?);
+                if (visited_b.count() >= max_shallow_walk_commits) return error.GitFailed;
+                try visited_b.put(gpa, p_oid.id, {});
+                try queue.append(gpa, p_oid.*);
+            }
+        }
+
+        if (candidates.items.len == 0) return null;
+        var best = candidates.items[0];
+        for (candidates.items[1..]) |cand| {
+            if (cand.time > best.time) best = cand;
+        }
+        return best.oid;
+    }
+
+    /// Shallow-safe reachability check (`anc_id` is an ancestor of or equal to `desc_id`).
+    pub fn isDescendantOf(
+        gpa: std.mem.Allocator,
+        repo: *git2.Repository,
+        desc_id: *const git2.Oid,
+        anc_id: *const git2.Oid,
+    ) git_cmd.Error!bool {
+        if (std.mem.eql(u8, &anc_id.id, &desc_id.id)) return true;
+        const rc = git2.git_graph_descendant_of(repo, desc_id, anc_id);
+        return switch (rc) {
+            1 => true,
+            0 => false,
+            else => isDescendantShallow(gpa, repo, desc_id.*, anc_id.*),
+        };
     }
 
     /// The best common ancestor of two commits, or null if they share none.
@@ -1218,14 +1434,21 @@ pub const Repo = struct {
         defer git2.git_commit_free(ca);
         const cb = lookupCommit(repo, b) orelse return null;
         defer git2.git_commit_free(cb);
+        const id_a = git2.git_commit_id(ca);
+        const id_b = git2.git_commit_id(cb);
+        if (std.mem.eql(u8, &id_a.id, &id_b.id)) return formatOidOut(id_a, out);
         var base_oid: git2.Oid = .{};
-        const rc = git2.git_merge_base(&base_oid, repo, git2.git_commit_id(ca), git2.git_commit_id(cb));
+        const rc = git2.git_merge_base(&base_oid, repo, id_a, id_b);
+        if (rc == git2.ok) return formatOidOut(&base_oid, out);
         if (rc == git2.err_not_found) return null;
-        if (rc != git2.ok) {
+        // libgit2 fails with a generic error when walking across a shallow boundary
+        // whose parent commit is absent; fall back to a shallow-aware LCA walk.
+        const fallback = mergeBaseShallow(r.gpa, repo, id_a.*, id_b.*) catch |err| {
             std.log.err("git2 merge_base: {s}", .{git2.lastErrorMessage()});
-            return error.GitFailed;
-        }
-        return formatOidOut(&base_oid, out);
+            return err;
+        };
+        const mb = fallback orelse return null;
+        return formatOidOut(&mb, out);
     }
 
     /// Whether `ancestor` is reachable from `descendant` (or equal to it).
@@ -1236,17 +1459,9 @@ pub const Repo = struct {
         defer git2.git_commit_free(ca);
         const cd = lookupCommit(repo, descendant) orelse return error.GitFailed;
         defer git2.git_commit_free(cd);
-        const anc_id = git2.git_commit_id(ca);
-        const desc_id = git2.git_commit_id(cd);
-        if (std.mem.eql(u8, &anc_id.id, &desc_id.id)) return true;
-        const rc = git2.git_graph_descendant_of(repo, desc_id, anc_id);
-        return switch (rc) {
-            1 => true,
-            0 => false,
-            else => blk: {
-                std.log.err("git2 descendant_of: {s}", .{git2.lastErrorMessage()});
-                break :blk error.GitFailed;
-            },
+        return isDescendantOf(r.gpa, repo, git2.git_commit_id(cd), git2.git_commit_id(ca)) catch |err| {
+            std.log.err("git2 descendant_of: {s}", .{git2.lastErrorMessage()});
+            return err;
         };
     }
 
@@ -1258,13 +1473,125 @@ pub const Repo = struct {
         defer git2.git_commit_free(cb);
         const ch = lookupCommit(repo, head) orelse return error.GitFailed;
         defer git2.git_commit_free(ch);
+        const id_b = git2.git_commit_id(cb);
+        const id_h = git2.git_commit_id(ch);
+        if (std.mem.eql(u8, &id_b.id, &id_h.id)) return .{ .ahead = 0, .behind = 0 };
         var ahead: usize = 0;
         var behind: usize = 0;
-        if (git2.git_graph_ahead_behind(&ahead, &behind, repo, git2.git_commit_id(ch), git2.git_commit_id(cb)) != git2.ok) {
-            std.log.err("git2 ahead_behind: {s}", .{git2.lastErrorMessage()});
-            return error.GitFailed;
+        if (git2.git_graph_ahead_behind(&ahead, &behind, repo, id_h, id_b) == git2.ok) {
+            return .{ .ahead = ahead, .behind = behind };
         }
-        return .{ .ahead = ahead, .behind = behind };
+        // Shallow boundary fallback: count reachable commits in each set.
+        var anc_b: std.array_hash_map.Auto([20]u8, i64) = .empty;
+        defer anc_b.deinit(r.gpa);
+        var anc_h: std.array_hash_map.Auto([20]u8, i64) = .empty;
+        defer anc_h.deinit(r.gpa);
+        collectShallowAncestors(r.gpa, repo, id_b.*, &anc_b) catch |err| {
+            std.log.err("git2 ahead_behind: {s}", .{git2.lastErrorMessage()});
+            return err;
+        };
+        collectShallowAncestors(r.gpa, repo, id_h.*, &anc_h) catch |err| {
+            std.log.err("git2 ahead_behind: {s}", .{git2.lastErrorMessage()});
+            return err;
+        };
+        var a_count: u64 = 0;
+        for (anc_h.keys()) |k| {
+            if (!anc_b.contains(k)) a_count += 1;
+        }
+        var b_count: u64 = 0;
+        for (anc_b.keys()) |k| {
+            if (!anc_h.contains(k)) b_count += 1;
+        }
+        return .{ .ahead = a_count, .behind = b_count };
+    }
+
+    /// Persists shallow boundary commits (commits in the ODB with at least one
+    /// missing parent) into `<git_dir>/shallow` so git plumbing commands such as
+    /// `git merge-tree` and `git gc` respect the shallow boundary (R2.3, R3.3).
+    pub fn recordShallows(r: *const Repo, candidate_oids: []const [40]u8) git_cmd.Error!void {
+        if (candidate_oids.len == 0) return;
+        const repo = try r.openBare();
+        defer git2.git_repository_free(repo);
+        var odb: ?*git2.Odb = null;
+        if (git2.git_repository_odb(&odb, repo) != git2.ok) return error.GitFailed;
+        defer git2.git_odb_free(odb.?);
+
+        var set: std.array_hash_map.Auto([20]u8, void) = .empty;
+        defer set.deinit(r.gpa);
+
+        const cwd = Io.Dir.cwd();
+        var path_buf: [store_mod.Store.max_path_len + 32]u8 = undefined;
+        const shallow_path = std.mem.print(&path_buf, "{s}/shallow", .{r.gitDir()}) catch return error.GitFailed;
+
+        if (cwd.readFileAlloc(r.io, shallow_path, r.gpa, .limited(4 * 1024 * 1024))) |existing| {
+            defer r.gpa.free(existing);
+            var lines = std.mem.splitScalar(u8, existing, '\n');
+            while (lines.next()) |line| {
+                const trimmed = std.mem.trim(u8, line, " \r\t");
+                if (git2.parseOid(trimmed)) |oid| {
+                    try set.put(r.gpa, oid.id, {});
+                }
+            }
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            error.Canceled => return error.Canceled,
+            else => return error.GitFailed,
+        }
+
+        for (candidate_oids) |hex| {
+            if (git2.parseOid(&hex)) |oid| {
+                try set.put(r.gpa, oid.id, {});
+            }
+        }
+
+        // Keep only commits present in this repo that actually have a missing parent.
+        var out_buf: std.ArrayList(u8) = .empty;
+        defer out_buf.deinit(r.gpa);
+        for (set.keys()) |id| {
+            const oid: git2.Oid = .{ .id = id };
+            var commit: ?*git2.Commit = null;
+            if (git2.git_commit_lookup(&commit, repo, &oid) != git2.ok) continue;
+            defer git2.git_commit_free(commit.?);
+
+            var has_missing_parent = false;
+            const pcount = git2.git_commit_parentcount(commit.?);
+            for (0..pcount) |pi| {
+                const p_oid = git2.git_commit_parent_id(commit.?, @intCast(pi)) orelse continue;
+                if (git2.git_odb_exists(odb.?, p_oid) != 1) {
+                    has_missing_parent = true;
+                    break;
+                }
+            }
+            if (!has_missing_parent) continue;
+
+            var hex: [git2.oid_hex_len]u8 = undefined;
+            _ = git2.formatOid(&oid, &hex);
+            try out_buf.appendSlice(r.gpa, &hex);
+            try out_buf.append(r.gpa, '\n');
+        }
+
+        if (out_buf.items.len == 0) {
+            // Safe to ignore FileNotFound when no shallow file existed previously.
+            cwd.deleteFile(r.io, shallow_path) catch {};
+            return;
+        }
+
+        var rand_bytes: [8]u8 = undefined;
+        r.io.random(&rand_bytes);
+        var tmp_buf: [store_mod.Store.max_path_len + 64]u8 = undefined;
+        const tmp_path = std.mem.print(&tmp_buf, "{s}/shallow.tmp.{x}", .{ r.gitDir(), rand_bytes }) catch return error.GitFailed;
+        cwd.writeFile(r.io, .{ .sub_path = tmp_path, .data = out_buf.items }) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return error.GitFailed,
+        };
+        cwd.rename(tmp_path, cwd, shallow_path, r.io) catch |err| {
+            // Best-effort cleanup of the temporary shallow file on rename failure.
+            cwd.deleteFile(r.io, tmp_path) catch {};
+            return switch (err) {
+                error.Canceled => error.Canceled,
+                else => error.GitFailed,
+            };
+        };
     }
 
     pub const IndexPackError = error{ InvalidPack, PackTooManyObjects, GitFailed, OutOfMemory } || Io.Cancelable;
@@ -1970,4 +2297,92 @@ test "indexPackSlice accepts valid pack containing a 160000 submodule gitlink" {
 
     try dst_repo.indexPackSlice(pack_bytes);
     try std.testing.expect(try dst_repo.verifyPushedTarget(c_sha, true));
+}
+
+test "shallow-pushed commits support mergeBase, isAncestor, aheadBehind, and log (R5.1)" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "repos");
+    try tmp.dir.createDirPath(io, "tmp");
+    const base = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(base);
+    const repos_dir = try std.mem.concat(gpa, u8, &.{ base, "/repos" });
+    defer gpa.free(repos_dir);
+    const tmp_dir = try std.mem.concat(gpa, u8, &.{ base, "/tmp" });
+    defer gpa.free(tmp_dir);
+
+    const store: store_mod.Store = .{
+        .root = repos_dir,
+        .tmp = tmp_dir,
+        .path_env = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+    };
+    const src_name = try repo_name.parse("acme/sh-src");
+    const dst_name = try repo_name.parse("acme/sh-dst");
+    try store.create(io, gpa, src_name);
+    try store.create(io, gpa, dst_name);
+    const src_repo = try Repo.open(io, gpa, &store, src_name);
+    const dst_repo = try Repo.open(io, gpa, &store, dst_name);
+
+    const author: Repo.Author = .{ .name = "Agent", .email = "agent@example.com" };
+    var c1_buf: [64]u8 = undefined;
+    const c1 = try src_repo.buildCommit(null, &.{.{ .path = "a.txt", .content = "v1\n" }}, "c1", author, &c1_buf);
+    var c2_buf: [64]u8 = undefined;
+    const c2 = try src_repo.buildCommit(c1, &.{.{ .path = "a.txt", .content = "v2\n" }}, "c2 shallow boundary", author, &c2_buf);
+
+    // Pack only c2 + its tree + its blob, omitting parent c1 (shallow push).
+    var tree_spec_buf: [64]u8 = undefined;
+    const tree_spec = std.mem.print(&tree_spec_buf, "{s}^{{tree}}", .{c2}) catch unreachable;
+    const t2_raw = try src_repo.gitOutput(&.{ "rev-parse", "--verify", tree_spec }, .{});
+    defer gpa.free(t2_raw);
+    const t2 = std.mem.trimEnd(u8, t2_raw, "\n");
+    const c2_entries = try src_repo.lsTree(c2, "a.txt", true);
+    defer c2_entries.deinit(gpa);
+    const b2 = c2_entries.items[0].oid;
+
+    var stdin_buf: [256]u8 = undefined;
+    const pack_in = std.mem.print(&stdin_buf, "{s}\n{s}\n{s}\n", .{ c2, t2, b2 }) catch unreachable;
+    const pack_bytes = try src_repo.gitOutput(&.{ "pack-objects", "--stdout", "--quiet" }, .{ .stdin = pack_in });
+    defer gpa.free(pack_bytes);
+
+    try dst_repo.indexPackSlice(pack_bytes);
+    try std.testing.expectEqual(Repo.RefUpdate.updated, try dst_repo.updateRef("refs/heads/main", c2, null));
+
+    // Create two child commits c3 and c4 on top of the shallow boundary c2.
+    var c3_buf: [64]u8 = undefined;
+    const c3 = try dst_repo.buildCommit(c2, &.{.{ .path = "a.txt", .content = "v3\n" }}, "c3 on branch a", author, &c3_buf);
+    var c4_buf: [64]u8 = undefined;
+    const c4 = try dst_repo.buildCommit(c2, &.{.{ .path = "b.txt", .content = "other\n" }}, "c4 on branch b", author, &c4_buf);
+
+    var mb_buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(c2, (try dst_repo.mergeBase(c2, c3, &mb_buf)).?);
+    try std.testing.expectEqualStrings(c2, (try dst_repo.mergeBase(c3, c4, &mb_buf)).?);
+
+    try std.testing.expect(try dst_repo.isAncestor(c2, c3));
+    try std.testing.expect(!(try dst_repo.isAncestor(c3, c2)));
+    try std.testing.expect(!(try dst_repo.isAncestor(c3, c4)));
+
+    const ab1 = try dst_repo.aheadBehind(c2, c3);
+    try std.testing.expectEqual(@as(u64, 1), ab1.ahead);
+    try std.testing.expectEqual(@as(u64, 0), ab1.behind);
+
+    const ab2 = try dst_repo.aheadBehind(c3, c4);
+    try std.testing.expectEqual(@as(u64, 1), ab2.ahead);
+    try std.testing.expectEqual(@as(u64, 1), ab2.behind);
+
+    const log_all = try dst_repo.log(c3, 10, null, false);
+    defer log_all.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), log_all.items.len);
+    try std.testing.expectEqualStrings(c3, log_all.items[0].sha);
+    try std.testing.expectEqualStrings(c2, log_all.items[1].sha);
+
+    const log_a = try dst_repo.log(c3, 10, "a.txt", false);
+    defer log_a.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), log_a.items.len);
+
+    const log_missing = try dst_repo.log(c3, 10, "nonexistent.txt", false);
+    defer log_missing.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), log_missing.items.len);
 }
