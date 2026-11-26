@@ -44,7 +44,7 @@ pub fn serveInfoRefs(
     defer out.deinit();
 
     if (service == .upload_pack and pktline.hasProtocolV2(git_protocol)) {
-        writeUploadPackV2Advertisement(&out.writer) catch return api.internal(request);
+        writeUploadPackV2Advertisement(&out.writer, !claims.isReadRefRestricted()) catch return api.internal(request);
     } else {
         const repo = repo_git.Repo.open(app.io, app.gpa, app.store, name) catch return api.internal(request);
         const refs = repo.listRefs(service == .upload_pack) catch |err| return switch (err) {
@@ -69,13 +69,13 @@ pub fn serveInfoRefs(
     return .ok;
 }
 
-pub fn writeUploadPackV2Advertisement(w: *std.Io.Writer) std.Io.Writer.Error!void {
+pub fn writeUploadPackV2Advertisement(w: *std.Io.Writer, allow_filter: bool) std.Io.Writer.Error!void {
     try pktline.writeLine(w, "# service=git-upload-pack");
     try pktline.writeFlush(w);
     try pktline.writeLine(w, "version 2");
     try pktline.writeLine(w, "agent=gitd");
     try pktline.writeLine(w, "ls-refs=unborn");
-    try pktline.writeLine(w, "fetch=shallow wait-for-done");
+    try pktline.writeLine(w, if (allow_filter) "fetch=shallow filter wait-for-done" else "fetch=shallow wait-for-done");
     try pktline.writeLine(w, "object-format=sha1");
     try pktline.writeFlush(w);
 }
@@ -198,11 +198,16 @@ pub const V2LsRefsArgs = struct {
     }
 };
 
+pub const FilterSpec = enum {
+    blob_none,
+};
+
 pub const V2FetchArgs = struct {
     wants: std.ArrayList([40]u8) = .empty,
     haves: std.ArrayList([40]u8) = .empty,
     shallows: std.ArrayList([40]u8) = .empty,
     deepen: ?u32 = null,
+    filter: ?FilterSpec = null,
     done: bool = false,
     wait_for_done: bool = false,
     include_tag: bool = false,
@@ -397,6 +402,13 @@ pub fn parseV2Request(gpa: std.mem.Allocator, bytes: []const u8) ParseError!V2Re
                                 const n = std.fmt.parseInt(u32, line["deepen ".len..], 10) catch return error.InvalidRequest;
                                 if (n == 0) return error.InvalidRequest;
                                 args.deepen = n;
+                            } else if (std.mem.startsWith(u8, line, "filter ")) {
+                                const spec = line["filter ".len..];
+                                if (std.mem.eql(u8, spec, "blob:none")) {
+                                    args.filter = .blob_none;
+                                } else {
+                                    return error.InvalidRequest;
+                                }
                             } else if (std.mem.eql(u8, line, "done")) {
                                 args.done = true;
                             } else if (std.mem.eql(u8, line, "wait-for-done")) {
@@ -575,6 +587,10 @@ fn handleV2Fetch(
     args: *const V2FetchArgs,
     claims: *const auth.Claims,
 ) api.HandleError!http.Status {
+    if (args.filter != null and claims.isReadRefRestricted()) {
+        return respondUploadErr(app, request, "filter not allowed with read_refs");
+    }
+
     const git2_repo = git2.openBare(repo.gitDir()) orelse return api.internal(request);
     defer git2.git_repository_free(git2_repo);
 
@@ -666,6 +682,7 @@ fn handleV2Fetch(
         args.shallows.items,
         if (args.deepen != null) shallow_info.included.items else null,
         shallow_info.boundaries.items,
+        args.filter,
         args.include_tag,
         args.ofs_delta,
         args.thin_pack,
@@ -815,6 +832,7 @@ fn serveV1(
         req.shallows.items,
         if (req.deepen != null) shallow_info.included.items else null,
         shallow_info.boundaries.items,
+        null,
         include_tag,
         ofs_delta,
         thin_pack,
@@ -1148,6 +1166,7 @@ fn streamGitPackObjects(
     common_haves: []const git2.Oid,
     client_shallows: []const [40]u8,
     shallow_boundaries: []const git2.Oid,
+    filter: ?FilterSpec,
     include_tag: bool,
     ofs_delta: bool,
     thin_pack: bool,
@@ -1206,7 +1225,7 @@ fn streamGitPackObjects(
     var env = try store_mod.gitEnv(gpa, repo.store.path_env);
     defer env.deinit();
 
-    var argv: [12][]const u8 = undefined;
+    var argv: [14][]const u8 = undefined;
     var argc: usize = 0;
     argv[argc] = "git";
     argc += 1;
@@ -1222,6 +1241,12 @@ fn streamGitPackObjects(
     argc += 1;
     argv[argc] = "-q";
     argc += 1;
+    if (filter) |f| switch (f) {
+        .blob_none => {
+            argv[argc] = "--filter=blob:none";
+            argc += 1;
+        },
+    };
     if (has_shallow) {
         argv[argc] = "--shallow";
         argc += 1;
@@ -1285,6 +1310,7 @@ fn streamPack(
     client_shallows: []const [40]u8,
     shallow_commits: ?[]const git2.Oid,
     shallow_boundaries: []const git2.Oid,
+    filter: ?FilterSpec,
     include_tag: bool,
     ofs_delta: bool,
     thin_pack: bool,
@@ -1294,7 +1320,7 @@ fn streamPack(
 ) error{ PackFailed, OutOfMemory }!void {
     const pack_info = inspectPackDir(repo.io, repo.gitDir());
 
-    if (ofs_delta and !claims.isReadRefRestricted() and common_haves.len == 0 and
+    if (filter == null and ofs_delta and !claims.isReadRefRestricted() and common_haves.len == 0 and
         client_shallows.len == 0 and shallow_commits == null and !pack_info.has_loose)
     {
         if (pack_info.singlePackName()) |pack_name| {
@@ -1304,7 +1330,7 @@ fn streamPack(
         }
     }
 
-    if (pack_info.total_pack_bytes > pack_reuse_threshold or (shallow_commits != null and common_haves.len > 0)) {
+    if (filter != null or pack_info.total_pack_bytes > pack_reuse_threshold or (shallow_commits != null and common_haves.len > 0)) {
         return streamGitPackObjects(
             gpa,
             repo,
@@ -1312,6 +1338,7 @@ fn streamPack(
             common_haves,
             client_shallows,
             shallow_boundaries,
+            filter,
             include_tag,
             ofs_delta,
             thin_pack,
@@ -1425,7 +1452,7 @@ const testing = std.testing;
 test "v2 upload-pack advertisement format" {
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try writeUploadPackV2Advertisement(&out.writer);
+    try writeUploadPackV2Advertisement(&out.writer, true);
 
     var r = pktline.Reader.init(out.written());
     try testing.expectEqualStrings("# service=git-upload-pack\n", (try r.next()).?.data);
@@ -1433,10 +1460,17 @@ test "v2 upload-pack advertisement format" {
     try testing.expectEqualStrings("version 2\n", (try r.next()).?.data);
     try testing.expectEqualStrings("agent=gitd\n", (try r.next()).?.data);
     try testing.expectEqualStrings("ls-refs=unborn\n", (try r.next()).?.data);
-    try testing.expectEqualStrings("fetch=shallow wait-for-done\n", (try r.next()).?.data);
+    try testing.expectEqualStrings("fetch=shallow filter wait-for-done\n", (try r.next()).?.data);
     try testing.expectEqualStrings("object-format=sha1\n", (try r.next()).?.data);
     try testing.expectEqual(pktline.Packet.flush, (try r.next()).?);
     try testing.expect((try r.next()) == null);
+
+    var restricted: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer restricted.deinit();
+    try writeUploadPackV2Advertisement(&restricted.writer, false);
+    var rr = pktline.Reader.init(restricted.written());
+    for (0..5) |_| _ = try rr.next();
+    try testing.expectEqualStrings("fetch=shallow wait-for-done\n", (try rr.next()).?.data);
 }
 
 test "v1 upload-pack and receive-pack advertisements respect empty repos, tags, and read_refs" {
@@ -1652,7 +1686,7 @@ test "Tier 1 direct single-pack streaming and Tier 3 git pack-objects shallow re
     const c2_oid = git2.parseOid(c2).?;
     var t3_out: std.Io.Writer.Allocating = .init(gpa);
     defer t3_out.deinit();
-    try streamGitPackObjects(gpa, &repo, &.{c2_hex}, &.{}, &.{}, &.{c2_oid}, false, true, false, &claims, &t3_out.writer, 0);
+    try streamGitPackObjects(gpa, &repo, &.{c2_hex}, &.{}, &.{}, &.{c2_oid}, null, false, true, false, &claims, &t3_out.writer, 0);
 
     const shallow_dst_name = try repo_name.parse("acme/shallowdst");
     try store.create(io, gpa, shallow_dst_name);
@@ -1680,6 +1714,41 @@ test "Tier 1 direct single-pack streaming and Tier 3 git pack-objects shallow re
     const c4_oid = git2.parseOid(c4).?;
     var delta_out: std.Io.Writer.Allocating = .init(gpa);
     defer delta_out.deinit();
-    try streamGitPackObjects(gpa, &repo, &.{c4_hex}, &.{c3_oid}, &.{}, &.{c4_oid}, false, true, true, &claims, &delta_out.writer, 0);
+    try streamGitPackObjects(gpa, &repo, &.{c4_hex}, &.{c3_oid}, &.{}, &.{c4_oid}, null, false, true, true, &claims, &delta_out.writer, 0);
     try testing.expect(delta_out.written().len > 32 and delta_out.written().len < 4096);
+
+    // Blobless partial clone (--filter=blob:none) omits big.bin while keeping commits/trees.
+    var blobless_out: std.Io.Writer.Allocating = .init(gpa);
+    defer blobless_out.deinit();
+    try streamGitPackObjects(gpa, &repo, &.{c4_hex}, &.{}, &.{}, &.{}, .blob_none, false, true, false, &claims, &blobless_out.writer, 0);
+    try testing.expect(blobless_out.written().len > 32 and blobless_out.written().len < 4096);
+}
+
+test "parseV2Request parses filter blob:none and rejects unsupported filters" {
+    const gpa = testing.allocator;
+    const oid_a = "1111111111111111111111111111111111111111";
+
+    var ok_buf: std.Io.Writer.Allocating = .init(gpa);
+    defer ok_buf.deinit();
+    try pktline.writeLine(&ok_buf.writer, "command=fetch");
+    try pktline.writeDelim(&ok_buf.writer);
+    try pktline.writeLine(&ok_buf.writer, "want " ++ oid_a);
+    try pktline.writeLine(&ok_buf.writer, "filter blob:none");
+    try pktline.writeLine(&ok_buf.writer, "done");
+    try pktline.writeFlush(&ok_buf.writer);
+
+    var req = try parseV2Request(gpa, ok_buf.written());
+    defer req.deinit(gpa);
+    try testing.expectEqual(@as(?FilterSpec, .blob_none), req.fetch.filter);
+
+    var bad_buf: std.Io.Writer.Allocating = .init(gpa);
+    defer bad_buf.deinit();
+    try pktline.writeLine(&bad_buf.writer, "command=fetch");
+    try pktline.writeDelim(&bad_buf.writer);
+    try pktline.writeLine(&bad_buf.writer, "want " ++ oid_a);
+    try pktline.writeLine(&bad_buf.writer, "filter blob:limit=1k");
+    try pktline.writeLine(&bad_buf.writer, "done");
+    try pktline.writeFlush(&bad_buf.writer);
+
+    try testing.expectError(error.InvalidRequest, parseV2Request(gpa, bad_buf.written()));
 }
