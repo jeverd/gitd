@@ -24,7 +24,7 @@ RUN arch="$(uname -m)" \
 WORKDIR /src
 COPY build.zig build.zig.zon ./
 COPY src ./src
-RUN /opt/zig/zig build -Doptimize=ReleaseSafe
+RUN /opt/zig/zig build -Doptimize=ReleaseSafe -Dcpu=baseline
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends git libsqlite3-0 libgit2-1.5 ca-certificates \
