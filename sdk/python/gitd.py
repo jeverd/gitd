@@ -527,12 +527,15 @@ class GitdClient:
         ref: str | None = None,
         format: str = "tar.gz",
         path: str | None = None,
+        paths: list[str] | None = None,
     ) -> bytes:
         params: dict[str, str] = {"format": format}
         if ref is not None:
             params["ref"] = ref
         if path is not None:
             params["path"] = path
+        if paths is not None and len(paths) > 0:
+            params["paths"] = ",".join(paths)
         return self._request("GET", f"/v1/repos/{repo}/archive?{urllib.parse.urlencode(params)}")
 
     def sync(

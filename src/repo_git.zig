@@ -1934,12 +1934,25 @@ pub const Repo = struct {
         }
     };
 
-    /// Produces an archive of `commit` (or `path` within it). Caller frees the bytes.
-    pub fn archive(r: *const Repo, commit: []const u8, format: ArchiveFormat, path: ?[]const u8, max: usize) git_cmd.Error![]u8 {
-        if (path) |p| {
-            return r.gitOutput(&.{ "archive", format.formatFlag(), commit, "--", p }, .{ .max_output = max });
+    pub const max_archive_paths: usize = 64;
+
+    /// Produces an archive of `commit` (or `paths` within it). Caller frees the bytes.
+    pub fn archive(r: *const Repo, commit: []const u8, format: ArchiveFormat, paths: []const []const u8, max: usize) git_cmd.Error![]u8 {
+        if (paths.len > max_archive_paths) return error.PathRejected;
+        var argv: [4 + max_archive_paths][]const u8 = undefined;
+        argv[0] = "archive";
+        argv[1] = format.formatFlag();
+        argv[2] = commit;
+        var argc: usize = 3;
+        if (paths.len > 0) {
+            argv[argc] = "--";
+            argc += 1;
+            for (paths) |p| {
+                argv[argc] = p;
+                argc += 1;
+            }
         }
-        return r.gitOutput(&.{ "archive", format.formatFlag(), commit }, .{ .max_output = max });
+        return r.gitOutput(argv[0..argc], .{ .max_output = max });
     }
 
     pub const ObjectStats = struct {

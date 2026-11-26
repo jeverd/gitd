@@ -551,9 +551,19 @@ fn readArchive(app: *server.App, request: *http.Server.Request, repo: *const rep
             return api.respondError(request, .bad_request, "invalid_format", "format must be tar.gz, tar, or zip");
     } else .@"tar.gz";
 
+    const has_path = std.mem.find(u8, query, "path=") != null;
+    const has_paths = std.mem.find(u8, query, "paths=") != null;
+    if (has_path and has_paths) {
+        return api.respondError(request, .bad_request, "invalid_path", "use either path or paths, not both");
+    }
+
     var path_buf: [repo_path.max_len]u8 = undefined;
-    var path: ?[]const u8 = null;
-    if (std.mem.find(u8, query, "path=") != null) {
+    var paths_raw_buf: ?[]u8 = null;
+    defer if (paths_raw_buf) |b| app.gpa.free(b);
+    var archive_paths: std.ArrayList([]const u8) = .empty;
+    defer archive_paths.deinit(app.gpa);
+
+    if (has_path) {
         const p = api.queryValue(&path_buf, query, "path") orelse
             return api.respondError(request, .bad_request, "invalid_path", "the path is not valid");
         repo_path.validate(p) catch
@@ -561,20 +571,40 @@ fn readArchive(app: *server.App, request: *http.Server.Request, repo: *const rep
         if (access.isPathRestricted() and !access.canAccessPath(p) and !access.coversWholeDir(p)) {
             return api.respondError(request, .forbidden, "forbidden", "this token may not archive that path");
         }
-        path = p;
+        archive_paths.append(app.gpa, p) catch return api.internal(request);
+    } else if (has_paths) {
+        const raw_buf = app.gpa.alloc(u8, 16 * 1024) catch return api.internal(request);
+        paths_raw_buf = raw_buf;
+        const raw_paths = api.queryValue(raw_buf, query, "paths") orelse
+            return api.respondError(request, .bad_request, "invalid_path", "paths is empty or too long");
+        if (raw_paths.len == 0) {
+            return api.respondError(request, .bad_request, "invalid_path", "paths must not be empty");
+        }
+        var it = std.mem.splitScalar(u8, raw_paths, ',');
+        while (it.next()) |p| {
+            if (archive_paths.items.len >= repo_git.Repo.max_archive_paths) {
+                return api.respondError(request, .bad_request, "invalid_path", "too many paths for archive");
+            }
+            repo_path.validate(p) catch
+                return api.respondError(request, .bad_request, "invalid_path", "the path is not valid");
+            if (access.isPathRestricted() and !access.canAccessPath(p) and !access.coversWholeDir(p)) {
+                return api.respondError(request, .forbidden, "forbidden", "this token may not archive that path");
+            }
+            archive_paths.append(app.gpa, p) catch return api.internal(request);
+        }
     } else if (access.isPathRestricted()) {
         return api.respondError(request, .forbidden, "forbidden", "path-scoped tokens must specify an allowed path for archive");
     }
     var oid_buf: [64]u8 = undefined;
     const commit = (try commitFromQuery(app, request, repo, query, access, &oid_buf)) orelse return .not_found;
-    if (path) |p| {
+    for (archive_paths.items) |p| {
         const entries = repo.lsTree(commit, p, true) catch |err| return gitError(request, err);
         defer entries.deinit(app.gpa);
         if (entries.items.len == 0) {
             return api.respondError(request, .not_found, "not_found", "no such path at that ref");
         }
     }
-    const data = repo.archive(commit, format, path, max_archive_bytes) catch |err| return gitError(request, err);
+    const data = repo.archive(commit, format, archive_paths.items, max_archive_bytes) catch |err| return gitError(request, err);
     defer app.gpa.free(data);
 
     var disp_buf: [160]u8 = undefined;

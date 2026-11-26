@@ -310,6 +310,7 @@ export interface ArchiveOptions {
   ref?: string;
   format?: "tar.gz" | "tar" | "zip";
   path?: string;
+  paths?: string[];
 }
 
 export interface SyncOptions {
@@ -816,6 +817,7 @@ export class GitdClient {
     if (opts.ref) params.set("ref", opts.ref);
     if (opts.format) params.set("format", opts.format);
     if (opts.path) params.set("path", opts.path);
+    if (opts.paths && opts.paths.length > 0) params.set("paths", opts.paths.join(","));
     const qs = params.toString();
     const resp = await this.#request("GET", `/v1/repos/${repo}/archive${qs ? `?${qs}` : ""}`);
     return new Uint8Array(await resp.arrayBuffer());

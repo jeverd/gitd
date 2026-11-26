@@ -118,7 +118,7 @@ All `/v1` routes need `Authorization: Bearer <admin key>`. Per-repo routes (`/v1
 | `DELETE /v1/repos/{ns}/{repo}/branches/{name}/lock` | Unlock a locked branch (admin key only) |
 | `GET /v1/repos/{ns}/{repo}/compare/{base}...{head}` | Ahead/behind, changed files, and the patch (up to 1 MiB) |
 | `GET /v1/repos/{ns}/{repo}/grep?q=&ref=&path=&fixed=&ignore_case=&limit=` | Search text files at `ref` without cloning (returns matching paths, line numbers, lines) |
-| `GET /v1/repos/{ns}/{repo}/archive?ref=&format=&path=` | Download a `tar.gz` (default), `tar`, or `zip` archive of `ref` (or `path` within it) |
+| `GET /v1/repos/{ns}/{repo}/archive?ref=&format=&path=&paths=` | Download a `tar.gz` (default), `tar`, or `zip` archive of `ref`, a single `path`, or comma-separated `paths` (up to 64) |
 | `POST /v1/repos/{ns}/{repo}/sync` `{"direction","url","branch","remote_branch","token","force"}` | Fetch a branch from or push a branch back to an upstream Git remote (admin key only; per-request token, never stored or logged) |
 | `POST /v1/repos/{ns}/{repo}/merges` `{"base","head","strategy","dry_run","delete_head"}` | Merge `head` into `base`: fast-forward when possible, else a merge commit (`merge`) or one squashed commit (`squash`). With `dry_run: true`, checks lock/rule/conflict status with only `git:read` and mutates nothing; with `delete_head: true`, deletes the merged head branch atomically after `base` moves |
 | `POST /v1/repos/{ns}/{repo}/merges/check` `{"base","heads","include_file_overlaps"}` | Multi-branch conflict radar & wave merge planner: checks up to 16 heads vs `base` and pairwise in memory and returns `clean_heads`, `conflict_clusters`, and `blocked_heads` (`git:read`) |

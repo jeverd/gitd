@@ -1663,6 +1663,43 @@ expect_eq "merge on shallow branch" 201 "$(admin -X POST "$BASE/v1/repos/acme/sh
 expect_eq "delete shallow repo" 204 "$(admin -X DELETE "$BASE/v1/repos/acme/shallow")"
 pass "shallow-pushed repo compare, log, and merge verified end to end"
 
+echo "== multi-path archive and blobless partial clone (--filter=blob:none)"
+expect_eq "create partial repo" 201 "$(admin -X POST "$BASE/v1/repos" -d '{"name":"acme/partial"}')"
+PARTIAL_TOK="$(mint acme/partial '["git:read","git:write"]')"
+expect_eq "seed partial repo" 201 "$(status -H "authorization: Bearer $PARTIAL_TOK" -X POST "$BASE/v1/repos/acme/partial/commits" -d '{"branch":"main","expected_head":null,"message":"seed","changes":[{"path":"root.json","content":"{\"ok\":true}\n"},{"path":"pkg-a/a.txt","content":"alpha\n"},{"path":"pkg-b/b.txt","content":"beta\n"},{"path":"pkg-c/c.txt","content":"gamma\n"}]}')"
+
+# Multi-path archive (?paths=...)
+expect_eq "archive with multiple paths" 200 "$(status -H "authorization: Bearer $PARTIAL_TOK" "$BASE/v1/repos/acme/partial/archive?ref=main&format=tar.gz&paths=root.json,pkg-a,pkg-b")"
+python3 - "$WORK/body" <<'PY' || fail "multi-path archive contents mismatch"
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "r:gz") as tf:
+    names = set(tf.getnames())
+assert "root.json" in names, names
+assert "pkg-a/a.txt" in names, names
+assert "pkg-b/b.txt" in names, names
+assert "pkg-c/c.txt" not in names, names
+PY
+pass "GET /archive?paths= returns only requested paths"
+expect_eq "archive rejects both path and paths" 400 "$(status -H "authorization: Bearer $PARTIAL_TOK" "$BASE/v1/repos/acme/partial/archive?ref=main&path=pkg-a&paths=pkg-b")"
+expect_eq "archive rejects missing path in paths" 404 "$(status -H "authorization: Bearer $PARTIAL_TOK" "$BASE/v1/repos/acme/partial/archive?ref=main&paths=pkg-a,does-not-exist")"
+[[ "$(admin -X POST "$BASE/v1/tokens" -d '{"repo":"acme/partial","scopes":["git:read"],"paths":["pkg-a/*"],"ttl_seconds":300}')" == 201 ]] || fail "mint path-scoped token"
+PATH_SCOPED_TOK="$(json '["token"]')"
+expect_eq "path-scoped token denied forbidden path in paths" 403 "$(status -H "authorization: Bearer $PATH_SCOPED_TOK" "$BASE/v1/repos/acme/partial/archive?ref=main&paths=pkg-a,pkg-b")"
+expect_eq "path-scoped token allowed permitted path in paths" 200 "$(status -H "authorization: Bearer $PATH_SCOPED_TOK" "$BASE/v1/repos/acme/partial/archive?ref=main&paths=pkg-a")"
+
+# Real git blobless partial clone + sparse-checkout
+PARTIAL_DIR="$WORK/partial-clone"
+git clone -q --filter=blob:none --sparse "$(url "$PARTIAL_TOK" acme/partial)" "$PARTIAL_DIR" 2>"$WORK/err" || fail "partial clone: $(cat "$WORK/err")"
+expect_eq "partial clone sets promisor remote" "true" "$(git -C "$PARTIAL_DIR" config --get remote.origin.promisor)"
+expect_eq "partial clone sets blob:none filter" "blob:none" "$(git -C "$PARTIAL_DIR" config --get remote.origin.partialclonefilter)"
+[[ -f "$PARTIAL_DIR/root.json" ]] || fail "partial clone missing root.json"
+[[ ! -f "$PARTIAL_DIR/pkg-b/b.txt" ]] || fail "sparse partial clone should not materialize pkg-b/b.txt yet"
+git -C "$PARTIAL_DIR" sparse-checkout set pkg-b 2>"$WORK/err" || fail "sparse-checkout set pkg-b: $(cat "$WORK/err")"
+expect_eq "lazy blob fetch materialized pkg-b/b.txt" "beta" "$(cat "$PARTIAL_DIR/pkg-b/b.txt")"
+[[ ! -f "$PARTIAL_DIR/pkg-c/c.txt" ]] || fail "pkg-c/c.txt should remain unmaterialized"
+expect_eq "delete partial repo" 204 "$(admin -X DELETE "$BASE/v1/repos/acme/partial")"
+pass "multi-path archive and blobless partial clone verified end to end"
+
 # Stop while a slow clone is mid-transfer: gitd must still exit promptly and
 # take its git processes with it.
 head -c 4000000 /dev/urandom >"$SRC/big2.bin"
