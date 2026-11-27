@@ -62,6 +62,10 @@ export interface TokenOptions {
   read_refs?: string[];
   paths?: string[];
   branch_ttl_seconds?: number;
+  /** Who holds the token, recorded on the events it causes. */
+  principal?: string;
+  /** Whom the holder acts for, recorded on the events it causes. */
+  on_behalf_of?: string;
 }
 
 export interface TokenResponse {
@@ -198,6 +202,8 @@ export interface BatchMergeOptions {
   expected_base_head?: string;
   message?: string;
   author?: { name: string; email: string };
+  /** Speculative prepare: write the result to this ref; base and heads stay. */
+  target_ref?: string;
 }
 
 export interface BatchMergeResult {
@@ -205,6 +211,39 @@ export interface BatchMergeResult {
   sha: string;
   merged_heads: string[];
   deleted_heads: string[];
+}
+
+export interface SpeculativeMergeResult {
+  base: string;
+  base_sha: string;
+  target_ref: string;
+  sha: string;
+  result: "merged" | "squashed" | "up_to_date";
+  merged: string[];
+}
+
+export interface BranchFence {
+  repo: string;
+  branch: string;
+  paused: boolean;
+  policy_epoch: number;
+  reason: string | null;
+}
+
+export interface PromoteOptions {
+  target: string;
+  candidate_sha: string;
+  expected_base_sha: string;
+  expected_policy_epoch: number;
+  operation_id: string;
+}
+
+export interface PromoteResult {
+  target: string;
+  base_sha: string;
+  sha: string;
+  policy_epoch: number;
+  operation_id: string;
 }
 
 export interface DryRunMergeResult {
@@ -646,6 +685,32 @@ export class GitdClient {
 
   batchMerge(repo: string, opts: BatchMergeOptions): Promise<BatchMergeResult> {
     return this.#json("POST", `/v1/repos/${repo}/merges/batch`, opts);
+  }
+
+  /** Batch-merges `heads` onto `target_ref` without moving `base` or deleting heads. */
+  prepareBatchMerge(
+    repo: string,
+    opts: Omit<BatchMergeOptions, "target_ref" | "dry_run"> & { target_ref: string },
+  ): Promise<SpeculativeMergeResult> {
+    return this.#json("POST", `/v1/repos/${repo}/merges/batch`, opts);
+  }
+
+  getFence(repo: string, branch: string): Promise<BranchFence> {
+    return this.#json("GET", `/v1/repos/${repo}/branches/${encodePath(branch)}/fence`);
+  }
+
+  /** Admin key only. Changing `paused` or `bump_epoch: true` raises the epoch. */
+  updateFence(
+    repo: string,
+    branch: string,
+    opts: { paused?: boolean; bump_epoch?: boolean; reason?: string },
+  ): Promise<BranchFence> {
+    return this.#json("POST", `/v1/repos/${repo}/branches/${encodePath(branch)}/fence`, opts);
+  }
+
+  /** Compare-and-swap promote; 409 on fence_paused, policy_epoch_mismatch, or base_sha_mismatch. */
+  promote(repo: string, opts: PromoteOptions): Promise<PromoteResult> {
+    return this.#json("POST", `/v1/repos/${repo}/refs/promote`, opts);
   }
 
   async waitForChecks(

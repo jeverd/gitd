@@ -327,6 +327,26 @@ class GitdSdkTest(unittest.TestCase):
         self.assertIsNone(cleared["expires_at"])
         admin.delete_branch(repo, "agent/py/ttl")
 
+        # Speculative prepare, fence, and compare-and-swap promote
+        main_sha = admin.log(repo, ref="main", limit=1)[0]["sha"]
+        admin.commit(repo, branch="agent/py/spec", expected_head=None, from_ref="main", message="spec",
+                     changes=[{"path": "spec.txt", "content": "spec\n"}])
+        prep = admin.batch_merge(repo, base="main", heads=["agent/py/spec"], delete_heads=True, target_ref="refs/gitd/spec/py")
+        self.assertEqual(prep["target_ref"], "refs/gitd/spec/py")
+        self.assertEqual(prep["base_sha"], main_sha)
+        fence = admin.update_fence(repo, "main", paused=True, reason="hold")
+        self.assertEqual((fence["paused"], fence["policy_epoch"], fence["reason"]), (True, 1, "hold"))
+        with self.assertRaises(ConflictError) as cm:
+            admin.promote(repo, target="main", candidate_sha=prep["sha"], expected_base_sha=main_sha,
+                          expected_policy_epoch=1, operation_id="py-op")
+        self.assertEqual(cm.exception.code, "fence_paused")
+        fence = admin.update_fence(repo, "main", paused=False)
+        self.assertEqual(admin.get_fence(repo, "main"), fence)
+        receipt = admin.promote(repo, target="main", candidate_sha=prep["sha"], expected_base_sha=main_sha,
+                                expected_policy_epoch=fence["policy_epoch"], operation_id="py-op")
+        self.assertEqual(receipt["sha"], prep["sha"])
+        self.assertEqual(admin.log(repo, ref="main", limit=1)[0]["sha"], prep["sha"])
+
         admin.delete_repo(mirror)
         admin.delete_repo(repo)
 

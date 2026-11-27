@@ -140,6 +140,25 @@ const schema =
     \\  last_gc_at INTEGER NOT NULL DEFAULT 0,
     \\  expired_since_gc INTEGER NOT NULL DEFAULT 0
     \\) STRICT;
+    \\CREATE TABLE IF NOT EXISTS branch_fences (
+    \\  repo TEXT NOT NULL,
+    \\  ref TEXT NOT NULL,
+    \\  paused INTEGER NOT NULL DEFAULT 0,
+    \\  policy_epoch INTEGER NOT NULL DEFAULT 0,
+    \\  reason TEXT NOT NULL DEFAULT '',
+    \\  updated_at INTEGER NOT NULL,
+    \\  PRIMARY KEY (repo, ref)
+    \\) STRICT;
+    \\CREATE TABLE IF NOT EXISTS promote_receipts (
+    \\  repo TEXT NOT NULL,
+    \\  operation_id TEXT NOT NULL,
+    \\  target TEXT NOT NULL,
+    \\  base_sha TEXT NOT NULL,
+    \\  sha TEXT NOT NULL,
+    \\  policy_epoch INTEGER NOT NULL,
+    \\  created_at INTEGER NOT NULL,
+    \\  PRIMARY KEY (repo, operation_id)
+    \\) STRICT;
 ;
 
 pub const Db = struct {
@@ -165,26 +184,33 @@ pub const Db = struct {
             std.log.err("sqlite schema: {s}", .{errmsg orelse "unknown error"});
             return error.DatabaseError;
         }
-        try db.ensureBranchRuleColumns();
+        try db.addMissingColumns();
         return db;
     }
 
-    fn ensureBranchRuleColumns(db: *Db) Error!void {
-        const stmt = try db.prepare("PRAGMA table_info(branch_rules)");
+    /// Columns added after a table first shipped: databases made by an
+    /// older gitd get them here.
+    fn addMissingColumns(db: *Db) Error!void {
+        try db.ensureColumn("branch_rules", "required_checks", "ALTER TABLE branch_rules ADD COLUMN required_checks TEXT NOT NULL DEFAULT ''");
+        try db.ensureColumn("events", "principal", "ALTER TABLE events ADD COLUMN principal TEXT NOT NULL DEFAULT ''");
+        try db.ensureColumn("events", "on_behalf_of", "ALTER TABLE events ADD COLUMN on_behalf_of TEXT NOT NULL DEFAULT ''");
+    }
+
+    /// Runs `add_sql` when `table` has no column named `column`.
+    fn ensureColumn(db: *Db, comptime table: []const u8, column: []const u8, add_sql: [:0]const u8) Error!void {
+        const stmt = try db.prepare("PRAGMA table_info(" ++ table ++ ")");
         defer _ = sqlite3_finalize(stmt);
-        var has_required_checks = false;
+        var has_column = false;
         while (true) switch (sqlite3_step(stmt)) {
             SQLITE_ROW => {
                 const len: usize = @intCast(sqlite3_column_bytes(stmt, 1));
                 const ptr = sqlite3_column_text(stmt, 1) orelse continue;
-                if (std.mem.eql(u8, ptr[0..len], "required_checks")) has_required_checks = true;
+                if (std.mem.eql(u8, ptr[0..len], column)) has_column = true;
             },
             SQLITE_DONE => break,
-            else => return db.fail("inspect branch_rules columns"),
+            else => return db.fail("inspect " ++ table ++ " columns"),
         };
-        if (!has_required_checks) {
-            try db.exec("ALTER TABLE branch_rules ADD COLUMN required_checks TEXT NOT NULL DEFAULT ''");
-        }
+        if (!has_column) try db.exec(add_sql);
     }
 
     pub fn close(db: *Db) void {
@@ -313,9 +339,13 @@ pub const Db = struct {
         new: []const u8 = "",
         detail: []const u8 = "",
         created_at: i64,
+        /// The token's principal and on_behalf_of claims; empty for the
+        /// admin key, the server itself, and tokens without them.
+        principal: []const u8 = "",
+        on_behalf_of: []const u8 = "",
 
         pub fn deinit(e: Event, gpa: std.mem.Allocator) void {
-            for ([_][]const u8{ e.repo, e.kind, e.ref, e.old, e.new, e.detail }) |text| gpa.free(text);
+            for ([_][]const u8{ e.repo, e.kind, e.ref, e.old, e.new, e.detail, e.principal, e.on_behalf_of }) |text| gpa.free(text);
         }
     };
 
@@ -326,12 +356,14 @@ pub const Db = struct {
         defer db.mutex.unlock(io);
         try db.exec("BEGIN IMMEDIATE");
         errdefer db.exec("ROLLBACK") catch {}; // the original error is what matters
-        const stmt = try db.prepare("INSERT INTO events (repo, kind, ref, old, new, detail, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)");
+        const stmt = try db.prepare("INSERT INTO events (repo, kind, ref, old, new, detail, created_at, principal, on_behalf_of) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)");
         defer _ = sqlite3_finalize(stmt);
         for ([_][]const u8{ event.repo, event.kind, event.ref, event.old, event.new, event.detail }, 1..) |text, i| {
             try db.bindText(stmt, @intCast(i), text);
         }
         try db.check(sqlite3_bind_int64(stmt, 7, event.created_at));
+        try db.bindText(stmt, 8, event.principal);
+        try db.bindText(stmt, 9, event.on_behalf_of);
         if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("insert event");
         const id = sqlite3_last_insert_rowid(db.handle);
 
@@ -445,7 +477,7 @@ pub const Db = struct {
 
     const delivery_columns =
         \\d.id, d.webhook_id, d.status, d.attempts, d.last_status, d.last_error, d.updated_at, w.url,
-        \\e.id, e.repo, e.kind, e.ref, e.old, e.new, e.detail, e.created_at
+        \\e.id, e.repo, e.kind, e.ref, e.old, e.new, e.detail, e.created_at, e.principal, e.on_behalf_of
     ;
 
     /// Pending deliveries whose next attempt is due at `now_ms`, with the
@@ -528,7 +560,9 @@ pub const Db = struct {
         event_new = 13,
         event_detail = 14,
         event_created_at = 15,
-        secret = 16,
+        event_principal = 16,
+        event_on_behalf_of = 17,
+        secret = 18,
     };
 
     fn readDelivery(stmt: *sqlite3_stmt, gpa: std.mem.Allocator) Error!Delivery {
@@ -550,6 +584,10 @@ pub const Db = struct {
         errdefer gpa.free(event_new);
         const event_detail = try columnText(stmt, @backingInt(DeliveryCol.event_detail), gpa);
         errdefer gpa.free(event_detail);
+        const event_principal = try columnText(stmt, @backingInt(DeliveryCol.event_principal), gpa);
+        errdefer gpa.free(event_principal);
+        const event_on_behalf_of = try columnText(stmt, @backingInt(DeliveryCol.event_on_behalf_of), gpa);
+        errdefer gpa.free(event_on_behalf_of);
         const secret = try columnText(stmt, @backingInt(DeliveryCol.secret), gpa);
         errdefer gpa.free(secret);
         return .{
@@ -570,6 +608,8 @@ pub const Db = struct {
                 .new = event_new,
                 .detail = event_detail,
                 .created_at = sqlite3_column_int64(stmt, @backingInt(DeliveryCol.event_created_at)),
+                .principal = event_principal,
+                .on_behalf_of = event_on_behalf_of,
             },
             .secret = secret,
         };
@@ -602,7 +642,7 @@ pub const Db = struct {
         db.mutex.lockUncancelable(io);
         defer db.mutex.unlock(io);
         const stmt = try db.prepare(
-            \\SELECT id, repo, kind, ref, old, new, detail, created_at FROM events
+            \\SELECT id, repo, kind, ref, old, new, detail, created_at, principal, on_behalf_of FROM events
             \\WHERE id > ?1 AND (?2 = '' OR repo = ?2) ORDER BY id LIMIT ?3
         );
         defer _ = sqlite3_finalize(stmt);
@@ -648,7 +688,7 @@ pub const Db = struct {
         db.mutex.lockUncancelable(io);
         defer db.mutex.unlock(io);
         const stmt = try db.prepare(
-            \\SELECT id, repo, kind, ref, old, new, detail, created_at FROM events
+            \\SELECT id, repo, kind, ref, old, new, detail, created_at, principal, on_behalf_of FROM events
             \\WHERE repo = ?1 AND id > ?2 AND (?3 = '' OR kind = ?3) AND (?4 = '' OR ref = ?4)
             \\ORDER BY id LIMIT ?5
         );
@@ -1233,6 +1273,162 @@ pub const Db = struct {
         if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("delete repo maint");
     }
 
+    /// A branch's promote fence. With no stored row, a branch is unpaused
+    /// at epoch 0 with no reason.
+    pub const Fence = struct {
+        paused: bool = false,
+        policy_epoch: u64 = 0,
+        /// Owned; empty means no reason.
+        reason: []const u8 = "",
+
+        pub fn deinit(f: Fence, gpa: std.mem.Allocator) void {
+            gpa.free(f.reason);
+        }
+    };
+
+    pub const FenceUpdate = struct {
+        paused: ?bool = null,
+        bump_epoch: bool = false,
+        /// Replaces the reason; empty clears it. Null keeps it, except that
+        /// unpausing clears it.
+        reason: ?[]const u8 = null,
+    };
+
+    /// Free with `Fence.deinit`.
+    pub fn getFence(db: *Db, io: Io, gpa: std.mem.Allocator, repo: []const u8, ref: []const u8) Error!Fence {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        return db.readFenceLocked(gpa, repo, ref);
+    }
+
+    fn readFenceLocked(db: *Db, gpa: std.mem.Allocator, repo: []const u8, ref: []const u8) Error!Fence {
+        const stmt = try db.prepare("SELECT paused, policy_epoch, reason FROM branch_fences WHERE repo = ?1 AND ref = ?2");
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        try db.bindText(stmt, 2, ref);
+        return switch (sqlite3_step(stmt)) {
+            SQLITE_ROW => .{
+                .paused = sqlite3_column_int64(stmt, 0) != 0,
+                .policy_epoch = std.math.cast(u64, sqlite3_column_int64(stmt, 1)) orelse return error.DatabaseError,
+                .reason = try columnText(stmt, 2, gpa),
+            },
+            SQLITE_DONE => .{ .reason = try gpa.dupe(u8, "") },
+            else => db.fail("get fence"),
+        };
+    }
+
+    /// Applies `update` in one transaction and returns the new fence. The
+    /// epoch goes up by one when `bump_epoch` is set or `paused` changes,
+    /// so a promote that read the old epoch fails. Free with `Fence.deinit`.
+    pub fn updateFence(db: *Db, io: Io, gpa: std.mem.Allocator, repo: []const u8, ref: []const u8, update: FenceUpdate, now: i64) Error!Fence {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        try db.exec("BEGIN IMMEDIATE");
+        errdefer db.exec("ROLLBACK") catch {}; // the original error is what matters
+        const old = try db.readFenceLocked(gpa, repo, ref);
+        defer old.deinit(gpa);
+
+        const paused = update.paused orelse old.paused;
+        const bump = update.bump_epoch or paused != old.paused;
+        // Stored as INTEGER, so the epoch stays within i64.
+        if (bump and old.policy_epoch >= std.math.maxInt(i64)) return error.DatabaseError;
+        const epoch = if (bump) old.policy_epoch + 1 else old.policy_epoch;
+        const reason = update.reason orelse if (old.paused and !paused) "" else old.reason;
+
+        const stmt = try db.prepare(
+            \\INSERT INTO branch_fences (repo, ref, paused, policy_epoch, reason, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            \\ON CONFLICT (repo, ref) DO UPDATE SET paused = excluded.paused, policy_epoch = excluded.policy_epoch,
+            \\  reason = excluded.reason, updated_at = excluded.updated_at
+        );
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        try db.bindText(stmt, 2, ref);
+        try db.check(sqlite3_bind_int64(stmt, 3, @intFromBool(paused)));
+        try db.check(sqlite3_bind_int64(stmt, 4, @intCast(epoch)));
+        try db.bindText(stmt, 5, reason);
+        try db.check(sqlite3_bind_int64(stmt, 6, now));
+        if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("update fence");
+        const reason_owned = try gpa.dupe(u8, reason);
+        errdefer gpa.free(reason_owned);
+        try db.exec("COMMIT");
+        return .{ .paused = paused, .policy_epoch = epoch, .reason = reason_owned };
+    }
+
+    /// What a successful promote did, kept so a retry with the same
+    /// operation id gets the same answer.
+    pub const PromoteReceipt = struct {
+        target: []const u8,
+        base_sha: []const u8,
+        sha: []const u8,
+        policy_epoch: u64,
+
+        pub fn deinit(r: PromoteReceipt, gpa: std.mem.Allocator) void {
+            gpa.free(r.target);
+            gpa.free(r.base_sha);
+            gpa.free(r.sha);
+        }
+    };
+
+    /// Free with `PromoteReceipt.deinit`.
+    pub fn getPromoteReceipt(db: *Db, io: Io, gpa: std.mem.Allocator, repo: []const u8, operation_id: []const u8) Error!?PromoteReceipt {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare("SELECT target, base_sha, sha, policy_epoch FROM promote_receipts WHERE repo = ?1 AND operation_id = ?2");
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        try db.bindText(stmt, 2, operation_id);
+        switch (sqlite3_step(stmt)) {
+            SQLITE_ROW => {},
+            SQLITE_DONE => return null,
+            else => return db.fail("get promote receipt"),
+        }
+        const target = try columnText(stmt, 0, gpa);
+        errdefer gpa.free(target);
+        const base_sha = try columnText(stmt, 1, gpa);
+        errdefer gpa.free(base_sha);
+        const sha = try columnText(stmt, 2, gpa);
+        errdefer gpa.free(sha);
+        return .{
+            .target = target,
+            .base_sha = base_sha,
+            .sha = sha,
+            .policy_epoch = std.math.cast(u64, sqlite3_column_int64(stmt, 3)) orelse return error.DatabaseError,
+        };
+    }
+
+    /// Fails with AlreadyExists when `operation_id` already has a receipt.
+    pub fn insertPromoteReceipt(db: *Db, io: Io, repo: []const u8, operation_id: []const u8, receipt: PromoteReceipt, now: i64) (Error || error{AlreadyExists})!void {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        const stmt = try db.prepare("INSERT INTO promote_receipts (repo, operation_id, target, base_sha, sha, policy_epoch, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)");
+        defer _ = sqlite3_finalize(stmt);
+        try db.bindText(stmt, 1, repo);
+        try db.bindText(stmt, 2, operation_id);
+        try db.bindText(stmt, 3, receipt.target);
+        try db.bindText(stmt, 4, receipt.base_sha);
+        try db.bindText(stmt, 5, receipt.sha);
+        const epoch = std.math.cast(i64, receipt.policy_epoch) orelse return error.DatabaseError;
+        try db.check(sqlite3_bind_int64(stmt, 6, epoch));
+        try db.check(sqlite3_bind_int64(stmt, 7, now));
+        switch (sqlite3_step(stmt)) {
+            SQLITE_DONE => {},
+            SQLITE_CONSTRAINT => return error.AlreadyExists,
+            else => return db.fail("insert promote receipt"),
+        }
+    }
+
+    /// Forgets every fence and promote receipt of `repo`.
+    pub fn deleteRepoFences(db: *Db, io: Io, repo: []const u8) Error!void {
+        db.mutex.lockUncancelable(io);
+        defer db.mutex.unlock(io);
+        for ([_][]const u8{ "DELETE FROM branch_fences WHERE repo = ?1", "DELETE FROM promote_receipts WHERE repo = ?1" }) |sql| {
+            const stmt = try db.prepare(sql);
+            defer _ = sqlite3_finalize(stmt);
+            try db.bindText(stmt, 1, repo);
+            if (sqlite3_step(stmt) != SQLITE_DONE) return db.fail("delete repo fences");
+        }
+    }
+
     pub const BranchTtl = struct {
         repo: []const u8,
         repo_id: []const u8,
@@ -1287,11 +1483,14 @@ pub const Db = struct {
         gpa.free(ttls);
     }
 
+    /// Reads the columns `id, repo, kind, ref, old, new, detail,
+    /// created_at, principal, on_behalf_of`, in that order.
     fn readEvent(stmt: *sqlite3_stmt, gpa: std.mem.Allocator) Error!Event {
-        var texts: [6][]const u8 = undefined;
+        var texts: [8][]const u8 = undefined;
         var done: usize = 0;
         errdefer for (texts[0..done]) |t| gpa.free(t);
-        while (done < texts.len) : (done += 1) texts[done] = try columnText(stmt, @intCast(done + 1), gpa);
+        while (done < 6) : (done += 1) texts[done] = try columnText(stmt, @intCast(done + 1), gpa);
+        while (done < texts.len) : (done += 1) texts[done] = try columnText(stmt, @intCast(done + 2), gpa);
         return .{
             .id = sqlite3_column_int64(stmt, 0),
             .repo = texts[0],
@@ -1301,6 +1500,8 @@ pub const Db = struct {
             .new = texts[4],
             .detail = texts[5],
             .created_at = sqlite3_column_int64(stmt, 7),
+            .principal = texts[6],
+            .on_behalf_of = texts[7],
         };
     }
 
@@ -1615,7 +1816,7 @@ test "commit checks round-trip and branch_rules schema upgrade" {
     defer Db.freeCommitChecks(gpa, cleared);
     try std.testing.expectEqual(@as(usize, 0), cleared.len);
 
-    try db.ensureBranchRuleColumns();
+    try db.addMissingColumns();
 }
 
 fn listChecksAndFree(gpa: std.mem.Allocator, db: *Db, io: Io) !void {
@@ -1648,4 +1849,83 @@ test "filtered repo events round-trip" {
 
 fn listFilteredEventsAndFree(gpa: std.mem.Allocator, db: *Db, io: Io) !void {
     Db.freeEvents(gpa, try db.listRepoEventsFiltered(io, gpa, "a/b", 0, "", "", 10));
+}
+
+test "fences default, update atomically, and bump the epoch" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var db: Db = try .open(":memory:");
+    defer db.close();
+
+    const start = try db.getFence(io, gpa, "a/b", "refs/heads/main");
+    defer start.deinit(gpa);
+    try std.testing.expect(!start.paused);
+    try std.testing.expectEqual(@as(u64, 0), start.policy_epoch);
+    try std.testing.expectEqualStrings("", start.reason);
+
+    const paused = try db.updateFence(io, gpa, "a/b", "refs/heads/main", .{ .paused = true, .reason = "incident" }, 1);
+    defer paused.deinit(gpa);
+    try std.testing.expect(paused.paused);
+    try std.testing.expectEqual(@as(u64, 1), paused.policy_epoch);
+    try std.testing.expectEqualStrings("incident", paused.reason);
+
+    // Same paused value, no bump: nothing moves, the reason stays.
+    const same = try db.updateFence(io, gpa, "a/b", "refs/heads/main", .{ .paused = true }, 2);
+    defer same.deinit(gpa);
+    try std.testing.expectEqual(@as(u64, 1), same.policy_epoch);
+    try std.testing.expectEqualStrings("incident", same.reason);
+
+    const bumped = try db.updateFence(io, gpa, "a/b", "refs/heads/main", .{ .bump_epoch = true }, 3);
+    defer bumped.deinit(gpa);
+    try std.testing.expectEqual(@as(u64, 2), bumped.policy_epoch);
+
+    // Unpausing clears the reason and bumps once.
+    const resumed = try db.updateFence(io, gpa, "a/b", "refs/heads/main", .{ .paused = false }, 4);
+    defer resumed.deinit(gpa);
+    try std.testing.expect(!resumed.paused);
+    try std.testing.expectEqual(@as(u64, 3), resumed.policy_epoch);
+    try std.testing.expectEqualStrings("", resumed.reason);
+
+    const other = try db.getFence(io, gpa, "a/b", "refs/heads/dev");
+    defer other.deinit(gpa);
+    try std.testing.expectEqual(@as(u64, 0), other.policy_epoch);
+
+    try std.testing.expectEqual(null, try db.getPromoteReceipt(io, gpa, "a/b", "op-1"));
+    try db.insertPromoteReceipt(io, "a/b", "op-1", .{ .target = "main", .base_sha = "b", .sha = "c", .policy_epoch = 3 }, 5);
+    try std.testing.expectError(error.AlreadyExists, db.insertPromoteReceipt(io, "a/b", "op-1", .{ .target = "main", .base_sha = "b", .sha = "d", .policy_epoch = 3 }, 6));
+    const receipt = (try db.getPromoteReceipt(io, gpa, "a/b", "op-1")).?;
+    defer receipt.deinit(gpa);
+    try std.testing.expectEqualStrings("c", receipt.sha);
+    try std.testing.expectEqual(@as(u64, 3), receipt.policy_epoch);
+
+    try db.deleteRepoFences(io, "a/b");
+    try std.testing.expectEqual(null, try db.getPromoteReceipt(io, gpa, "a/b", "op-1"));
+    const cleared = try db.getFence(io, gpa, "a/b", "refs/heads/main");
+    defer cleared.deinit(gpa);
+    try std.testing.expectEqual(@as(u64, 0), cleared.policy_epoch);
+}
+
+test "events keep principal and on_behalf_of, and old event tables gain the columns" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var db: Db = try .open(":memory:");
+    defer db.close();
+    _ = try db.insertEvent(io, .{ .repo = "a/b", .kind = "push", .ref = "refs/heads/x", .created_at = 1, .principal = "agent:7", .on_behalf_of = "user:alice" });
+    _ = try db.insertEvent(io, .{ .repo = "a/b", .kind = "push", .ref = "refs/heads/y", .created_at = 2 });
+    const list = try db.listEvents(io, gpa, "a/b", 0, 10);
+    defer Db.freeEvents(gpa, list);
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+    try std.testing.expectEqualStrings("agent:7", list[0].principal);
+    try std.testing.expectEqualStrings("user:alice", list[0].on_behalf_of);
+    try std.testing.expectEqualStrings("", list[1].principal);
+
+    // A database from before the columns existed gains them.
+    try db.exec("DROP TABLE events");
+    try db.exec("CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL DEFAULT '', old TEXT NOT NULL DEFAULT '', new TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL) STRICT");
+    try db.exec("INSERT INTO events (repo, kind, created_at) VALUES ('a/b', 'push', 1)");
+    try db.addMissingColumns();
+    const rows = try db.listEvents(io, gpa, "a/b", 0, 10);
+    defer Db.freeEvents(gpa, rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("", rows[0].principal);
 }

@@ -1549,6 +1549,116 @@ PY
 expect_eq "delete temporary batch repo" 204 "$(admin -X DELETE "$BASE/v1/repos/acme/batch")"
 pass "atomic POST /merges/batch and delete_head verified end to end"
 
+echo "== principal claims, refs/changes scopes, speculative prepare, fences, and promote"
+expect_eq "create fence repo" 201 "$(admin -X POST "$BASE/v1/repos" -d '{"name":"acme/fence"}')"
+FB="$BASE/v1/repos/acme/fence"
+expect_eq "seed fence main" 201 "$(admin -X POST "$FB/commits" \
+  -d '{"branch":"main","expected_head":null,"message":"seed","changes":[{"path":"base.txt","content":"base\n"}]}')"
+F_MAIN="$(json '["sha"]')"
+
+expect_eq "invalid principal rejected" 400 "$(admin -X POST "$BASE/v1/tokens" \
+  -d '{"repo":"acme/fence","scopes":["git:write"],"principal":"has space"}')"
+expect_eq "invalid principal code" invalid_principal "$(json '["error"]["code"]')"
+expect_eq "mint token with principal" 201 "$(admin -X POST "$BASE/v1/tokens" \
+  -d '{"repo":"acme/fence","scopes":["git:read","git:write"],"refs":["refs/heads/agent/p/*","refs/changes/101/*","refs/gitd/spec/*"],"principal":"agent:builder-7","on_behalf_of":"user:alice"}')"
+P_TOK="$(json '["token"]')"
+ptok() { status -H "authorization: Bearer $P_TOK" "$@"; }
+expect_eq "principal token commits" 201 "$(ptok -X POST "$FB/commits" \
+  -d '{"branch":"agent/p/one","expected_head":null,"from":"main","message":"one","changes":[{"path":"one.txt","content":"1\n"}]}')"
+F_ONE="$(json '["sha"]')"
+expect_eq "commit event has principal" 1 "$(count_events kind=commit ref=refs/heads/agent/p/one principal=agent:builder-7 on_behalf_of=user:alice)"
+expect_eq "admin commit event has no principal" 1 "$(count_events kind=commit repo=acme/fence ref=refs/heads/main principal=)"
+
+CH_CLONE="$WORK/changes-clone"
+git clone -q "$(url "$P_TOK" acme/fence)" "$CH_CLONE" 2>"$WORK/err" || fail "clone with principal token: $(cat "$WORK/err")"
+echo change >"$CH_CLONE/change.txt"
+git -C "$CH_CLONE" add change.txt
+git "${GIT_ID[@]}" -C "$CH_CLONE" commit -qm change
+git -C "$CH_CLONE" push -q origin HEAD:refs/changes/101/1 2>"$WORK/err" || fail "push to refs/changes/101/1: $(cat "$WORK/err")"
+pass "refs/changes/101/* token pushes refs/changes/101/1"
+if git -C "$CH_CLONE" push -q origin HEAD:refs/changes/102/1 2>/dev/null; then fail "push to refs/changes/102/1 succeeded"; fi
+pass "refs/changes/101/* token cannot push refs/changes/102/1"
+if git -C "$CH_CLONE" push -q origin HEAD:main 2>/dev/null; then fail "refs/changes token pushed main"; fi
+pass "refs/changes/101/* token cannot push main"
+expect_eq "push event has principal" 1 "$(count_events kind=push ref=refs/changes/101/1 principal=agent:builder-7 on_behalf_of=user:alice)"
+
+expect_eq "second head" 201 "$(admin -X POST "$FB/commits" \
+  -d '{"branch":"agent/p/two","expected_head":null,"from":"main","message":"two","changes":[{"path":"two.txt","content":"2\n"}]}')"
+expect_eq "token cannot batch merge into main" 403 "$(ptok -X POST "$FB/merges/batch" \
+  -d '{"base":"main","heads":["agent/p/one","agent/p/two"]}')"
+expect_eq "target_ref outside token refs" 403 "$(ptok -X POST "$FB/merges/batch" \
+  -d '{"base":"main","heads":["agent/p/one"],"target_ref":"refs/gitd/other/1"}')"
+expect_eq "target_ref must not be base" 400 "$(admin -X POST "$FB/merges/batch" \
+  -d '{"base":"main","heads":["agent/p/one"],"target_ref":"refs/heads/main"}')"
+expect_eq "speculative prepare" 201 "$(ptok -X POST "$FB/merges/batch" \
+  -d '{"base":"main","heads":["agent/p/one","agent/p/two"],"delete_heads":true,"target_ref":"refs/gitd/spec/1"}')"
+SPEC_SHA="$(python3 - "$WORK/body" "$F_MAIN" <<'PY'
+import json, re, sys
+d = json.load(open(sys.argv[1]))
+assert d["base"] == "main" and d["base_sha"] == sys.argv[2], d
+assert d["target_ref"] == "refs/gitd/spec/1", d
+assert d["merged"] == ["agent/p/one", "agent/p/two"], d
+assert re.fullmatch("[0-9a-f]{40}", d["sha"]) and d["sha"] != sys.argv[2], d
+print(d["sha"])
+PY
+)" || fail "speculative prepare response mismatch"
+pass "speculative prepare returns base, base_sha, target_ref, sha, merged"
+expect_eq "main untouched by prepare" 200 "$(admin "$FB/log?ref=main&limit=1")"
+expect_eq "main sha after prepare" "$F_MAIN" "$(json '["commits"][0]["sha"]')"
+expect_eq "heads kept despite delete_heads" 200 "$(admin "$FB/branches")"
+python3 - "$WORK/body" <<'PY' || fail "speculative prepare deleted a head"
+import json, sys
+names = {b["name"] for b in json.load(open(sys.argv[1]))["branches"]}
+assert {"agent/p/one", "agent/p/two"} <= names, names
+PY
+pass "speculative prepare keeps source heads"
+expect_eq "spec ref has both heads" "200 200" "$(admin "$FB/files/one.txt?ref=refs/gitd/spec/1") $(admin "$FB/files/two.txt?ref=refs/gitd/spec/1")"
+expect_eq "prepare event has principal" 1 "$(count_events kind=merge_prepared ref=refs/gitd/spec/1 principal=agent:builder-7)"
+
+expect_eq "fence default" 200 "$(ptok "$FB/branches/main/fence")"
+python3 - "$WORK/body" <<'PY' || fail "default fence mismatch"
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d == {"repo": "acme/fence", "branch": "main", "paused": False, "policy_epoch": 0, "reason": None}, d
+PY
+pass "fence defaults to unpaused at epoch 0"
+expect_eq "fence update needs admin" 403 "$(ptok -X POST "$FB/branches/main/fence" -d '{"paused":true}')"
+expect_eq "pause fence" 200 "$(admin -X POST "$FB/branches/main/fence" -d '{"paused":true,"reason":"incident 7"}')"
+expect_eq "paused fence" "True 1 incident 7" "$(python3 -c "import json; d=json.load(open('$WORK/body')); print(d['paused'], d['policy_epoch'], d['reason'])")"
+promote() { # auth candidate expected_base epoch operation_id
+  status -H "authorization: Bearer $1" -X POST "$FB/refs/promote" \
+    -d "{\"target\":\"main\",\"candidate_sha\":\"$2\",\"expected_base_sha\":\"$3\",\"expected_policy_epoch\":$4,\"operation_id\":\"$5\"}"
+}
+expect_eq "promote while paused" 409 "$(promote "$KEY" "$SPEC_SHA" "$F_MAIN" 1 op-1)"
+expect_eq "fence_paused code" fence_paused "$(json '["error"]["code"]')"
+expect_eq "unpause fence" 200 "$(admin -X POST "$FB/branches/main/fence" -d '{"paused":false}')"
+expect_eq "unpaused fence" "False 2 None" "$(python3 -c "import json; d=json.load(open('$WORK/body')); print(d['paused'], d['policy_epoch'], d['reason'])")"
+expect_eq "promote with old epoch" 409 "$(promote "$KEY" "$SPEC_SHA" "$F_MAIN" 1 op-1)"
+expect_eq "policy_epoch_mismatch code" "policy_epoch_mismatch 2" "$(python3 -c "import json; d=json.load(open('$WORK/body')); print(d['error']['code'], d['policy_epoch'])")"
+expect_eq "bump epoch" 200 "$(admin -X POST "$FB/branches/main/fence" -d '{"bump_epoch":true}')"
+expect_eq "bumped epoch" 3 "$(json '["policy_epoch"]')"
+expect_eq "promote with wrong base" 409 "$(promote "$KEY" "$SPEC_SHA" "$F_ONE" 3 op-1)"
+expect_eq "base_sha_mismatch code" "base_sha_mismatch $F_MAIN" "$(python3 -c "import json; d=json.load(open('$WORK/body')); print(d['error']['code'], d['current_base_sha'])")"
+expect_eq "promote needs write on target" 403 "$(promote "$P_TOK" "$SPEC_SHA" "$F_MAIN" 3 op-1)"
+expect_eq "promote" 200 "$(promote "$KEY" "$SPEC_SHA" "$F_MAIN" 3 op-1)"
+cp "$WORK/body" "$WORK/promote1"
+python3 - "$WORK/body" "$F_MAIN" "$SPEC_SHA" <<'PY' || fail "promote response mismatch"
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d == {"target": "main", "base_sha": sys.argv[2], "sha": sys.argv[3], "policy_epoch": 3, "operation_id": "op-1"}, d
+PY
+pass "promote returns target, base_sha, sha, policy_epoch, operation_id"
+expect_eq "main at candidate" 200 "$(admin "$FB/log?ref=main&limit=1")"
+expect_eq "main sha after promote" "$SPEC_SHA" "$(json '["commits"][0]["sha"]')"
+expect_eq "promote retry" 200 "$(promote "$KEY" "$SPEC_SHA" "$F_MAIN" 3 op-1)"
+cmp -s "$WORK/body" "$WORK/promote1" || fail "promote retry returned a different receipt"
+pass "promote retry returns the stored receipt"
+expect_eq "operation_id reused for another commit" 409 "$(promote "$KEY" "$F_ONE" "$F_MAIN" 3 op-1)"
+expect_eq "operation_id_conflict code" operation_id_conflict "$(json '["error"]["code"]')"
+expect_eq "invalid operation_id" 400 "$(promote "$KEY" "$SPEC_SHA" "$F_MAIN" 3 'bad id')"
+expect_eq "promote event" 1 "$(count_events kind=promote repo=acme/fence ref=refs/heads/main new=$SPEC_SHA)"
+expect_eq "delete fence repo" 204 "$(admin -X DELETE "$BASE/v1/repos/acme/fence")"
+
 echo "== branch TTL update (extend, CAS, clear, lock/rule/scope gates)"
 expect_eq "create ttl repo" 201 "$(admin -X POST "$BASE/v1/repos" -d '{"name":"acme/ttltest"}')"
 expect_eq "seed ttl main" 201 "$(admin -X POST "$BASE/v1/repos/acme/ttltest/commits" \

@@ -6,7 +6,7 @@
 //!   GET    /v1/repos                                             admin key
 //!   GET    /v1/repos/{ns}/{repo}                                 admin key
 //!   DELETE /v1/repos/{ns}/{repo}                                 admin key
-//!   POST   /v1/tokens              {"repo", "scopes", "ttl_seconds"}  admin key
+//!   POST   /v1/tokens              {"repo", "scopes", "ttl_seconds", "principal", "on_behalf_of", ...}  admin key
 //!   GET    /{ns}/{repo}.git/info/refs?service=...                repo token
 //!   POST   /{ns}/{repo}.git/git-upload-pack | git-receive-pack   repo token
 
@@ -45,6 +45,9 @@ pub const App = struct {
     /// Serializes repo create and delete, so the database row and the
     /// directory on disk change together (R1.3). gitd runs one server.
     repo_lock: Io.Mutex = .init,
+    /// Serializes fence updates against promotes, so a promote's fence
+    /// check and its ref move are one step (see promote.zig).
+    promote_lock: Io.Mutex = .init,
     /// Each connection holds a slot, which caps threads and file
     /// descriptors. When all are taken, new clients wait in the kernel's
     /// accept queue.
@@ -376,6 +379,7 @@ fn deleteRepo(app: *App, request: *http.Server.Request, name: repo_name.Name) Ha
     app.db.deleteRepoChecks(io, name.full) catch |err| std.log.err("clearing checks of {s}: {t}", .{ name.full, err });
     app.db.deleteRepoQuota(io, name.full) catch |err| std.log.err("clearing quotas of {s}: {t}", .{ name.full, err });
     app.db.deleteRepoMaint(io, name.full) catch |err| std.log.err("clearing maintenance of {s}: {t}", .{ name.full, err });
+    app.db.deleteRepoFences(io, name.full) catch |err| std.log.err("clearing fences of {s}: {t}", .{ name.full, err });
     _ = app.db.deleteWebhooks(io, name.full, 0) catch |err| std.log.err("deleting webhooks of {s}: {t}", .{ name.full, err });
     app.store.delete(io, name) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
@@ -395,6 +399,8 @@ fn createToken(app: *App, request: *http.Server.Request) HandleError!http.Status
         read_refs: []const []const u8 = &.{},
         paths: []const []const u8 = &.{},
         branch_ttl_seconds: i64 = 0,
+        principal: ?[]const u8 = null,
+        on_behalf_of: ?[]const u8 = null,
     };
     var parsed = api.readJson(Body, app.gpa, request) catch |err| return api.respondBodyError(request, err);
     defer parsed.deinit();
@@ -434,6 +440,11 @@ fn createToken(app: *App, request: *http.Server.Request) HandleError!http.Status
         return respondError(request, .bad_request, "invalid_ttl", "branch_ttl_seconds must be 0-604800");
     }
     claims.branch_ttl = @intCast(body.branch_ttl_seconds);
+    const principal_help = "principal and on_behalf_of are 1-128 characters of A-Z a-z 0-9 . _ - : @ / + =";
+    if (body.principal) |text| claims.setPrincipal(text) catch
+        return respondError(request, .bad_request, "invalid_principal", principal_help);
+    if (body.on_behalf_of) |text| claims.setOnBehalfOf(text) catch
+        return respondError(request, .bad_request, "invalid_principal", principal_help);
     const jti = auth.newJti(app.io) catch return internal(request);
     claims.jti = jti;
     var token_buf: [auth.max_token_len]u8 = undefined;

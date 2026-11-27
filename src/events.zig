@@ -15,6 +15,7 @@ const ref_name = @import("ref_name.zig");
 const content = @import("content.zig");
 const http_util = @import("http_util.zig");
 const Db = @import("db.zig").Db;
+const auth = @import("auth.zig");
 
 pub const Event = Db.Event;
 
@@ -102,6 +103,17 @@ pub fn record(app: *server.App, event: Event) void {
         return;
     };
     app.event_hub.notify(app.io);
+}
+
+/// `event` with the token's principal and on_behalf_of claims. `claims`
+/// is null for the admin key. The strings borrow from `claims`.
+pub fn withActor(event: Event, claims: ?*const auth.Claims) Event {
+    var e = event;
+    if (claims) |c| {
+        e.principal = c.principal() orelse "";
+        e.on_behalf_of = c.onBehalfOf() orelse "";
+    }
+    return e;
 }
 
 fn validKind(kind: []const u8) bool {
