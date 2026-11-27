@@ -334,6 +334,42 @@ test("TypeScript SDK end-to-end", async () => {
     assert.equal(cleared.expires_at, null);
     await admin.deleteBranch(repoName, "agent/ts/ttl");
 
+    // Speculative prepare, fence, and compare-and-swap promote
+    const mainSha = (await admin.log(repoName, { ref: "main", limit: 1 }))[0].sha;
+    await admin.commit(repoName, {
+      branch: "agent/ts/spec",
+      expected_head: null,
+      from: "main",
+      message: "spec",
+      changes: [{ path: "spec.txt", content: "spec\n" }],
+    });
+    const prep = await admin.prepareBatchMerge(repoName, {
+      base: "main",
+      heads: ["agent/ts/spec"],
+      delete_heads: true,
+      target_ref: "refs/gitd/spec/ts",
+    });
+    assert.equal(prep.target_ref, "refs/gitd/spec/ts");
+    assert.equal(prep.base_sha, mainSha);
+    let fence = await admin.updateFence(repoName, "main", { paused: true, reason: "hold" });
+    assert.deepEqual([fence.paused, fence.policy_epoch, fence.reason], [true, 1, "hold"]);
+    const promoteOpts = {
+      target: "main",
+      candidate_sha: prep.sha,
+      expected_base_sha: mainSha,
+      expected_policy_epoch: 1,
+      operation_id: "ts-op",
+    };
+    await assert.rejects(
+      () => admin.promote(repoName, promoteOpts),
+      (err: unknown) => err instanceof ConflictError && err.code === "fence_paused",
+    );
+    fence = await admin.updateFence(repoName, "main", { paused: false });
+    assert.deepEqual(await admin.getFence(repoName, "main"), fence);
+    const receipt = await admin.promote(repoName, { ...promoteOpts, expected_policy_epoch: fence.policy_epoch });
+    assert.equal(receipt.sha, prep.sha);
+    assert.equal((await admin.log(repoName, { ref: "main", limit: 1 }))[0].sha, prep.sha);
+
     await admin.deleteRepo(mirrorName);
     await admin.deleteRepo(repoName);
   } finally {

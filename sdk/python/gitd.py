@@ -97,6 +97,8 @@ class GitdClient:
         read_refs: list[str] | None = None,
         paths: list[str] | None = None,
         branch_ttl_seconds: int | None = None,
+        principal: str | None = None,
+        on_behalf_of: str | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"repo": repo, "scopes": scopes}
         if ttl_seconds is not None:
@@ -109,6 +111,10 @@ class GitdClient:
             body["paths"] = paths
         if branch_ttl_seconds is not None:
             body["branch_ttl_seconds"] = branch_ttl_seconds
+        if principal is not None:
+            body["principal"] = principal
+        if on_behalf_of is not None:
+            body["on_behalf_of"] = on_behalf_of
         return self._json("POST", "/v1/tokens", body)
 
     def revoke_token(self, jti: str) -> None:
@@ -326,7 +332,10 @@ class GitdClient:
         expected_base_head: str | None = None,
         message: str | None = None,
         author: dict[str, str] | None = None,
+        target_ref: str | None = None,
     ) -> dict[str, Any]:
+        """With target_ref, a speculative prepare: the result goes to that
+        ref, and base and the heads are left alone."""
         body: dict[str, Any] = {"base": base, "heads": heads}
         if strategy is not None:
             body["strategy"] = strategy
@@ -340,7 +349,52 @@ class GitdClient:
             body["message"] = message
         if author is not None:
             body["author"] = author
+        if target_ref is not None:
+            body["target_ref"] = target_ref
         return self._json("POST", f"/v1/repos/{repo}/merges/batch", body)
+
+    def get_fence(self, repo: str, branch: str) -> dict[str, Any]:
+        return self._json("GET", f"/v1/repos/{repo}/branches/{_encode_path(branch)}/fence")
+
+    def update_fence(
+        self,
+        repo: str,
+        branch: str,
+        *,
+        paused: bool | None = None,
+        bump_epoch: bool = False,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Admin key only. Changing paused, or bump_epoch, raises the epoch."""
+        body: dict[str, Any] = {}
+        if paused is not None:
+            body["paused"] = paused
+        if bump_epoch:
+            body["bump_epoch"] = True
+        if reason is not None:
+            body["reason"] = reason
+        return self._json("POST", f"/v1/repos/{repo}/branches/{_encode_path(branch)}/fence", body)
+
+    def promote(
+        self,
+        repo: str,
+        *,
+        target: str,
+        candidate_sha: str,
+        expected_base_sha: str,
+        expected_policy_epoch: int,
+        operation_id: str,
+    ) -> dict[str, Any]:
+        """Compare-and-swap promote. 409 on fence_paused,
+        policy_epoch_mismatch, or base_sha_mismatch; a retry of a
+        succeeded operation_id returns its receipt."""
+        return self._json("POST", f"/v1/repos/{repo}/refs/promote", {
+            "target": target,
+            "candidate_sha": candidate_sha,
+            "expected_base_sha": expected_base_sha,
+            "expected_policy_epoch": expected_policy_epoch,
+            "operation_id": operation_id,
+        })
 
     def check_merge_conflicts(
         self,

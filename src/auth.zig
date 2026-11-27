@@ -17,6 +17,7 @@ pub const max_ref_patterns = 4;
 pub const max_ref_patterns_bytes = 600;
 pub const max_path_patterns = 4;
 pub const max_path_patterns_bytes = 600;
+pub const max_principal_len = 128;
 pub const max_ttl_seconds = 24 * 60 * 60;
 pub const default_ttl_seconds = 15 * 60;
 
@@ -101,6 +102,13 @@ pub const Claims = struct {
     /// Seconds a branch created by a push with this token lives before
     /// gitd deletes it. Zero means such branches do not expire.
     branch_ttl: u32 = 0,
+    /// Who holds the token (an agent or service id) and whom it acts for
+    /// (a user). gitd does not interpret them; it records them on events.
+    /// A zero length means unset.
+    principal_buf: [max_principal_len]u8 = undefined,
+    principal_len: usize = 0,
+    on_behalf_of_buf: [max_principal_len]u8 = undefined,
+    on_behalf_of_len: usize = 0,
 
     pub fn repo(c: *const Claims) []const u8 {
         return c.repo_buf[0..c.repo_len];
@@ -192,6 +200,26 @@ pub const Claims = struct {
         return false;
     }
 
+    pub fn principal(c: *const Claims) ?[]const u8 {
+        return if (c.principal_len == 0) null else c.principal_buf[0..c.principal_len];
+    }
+
+    pub fn onBehalfOf(c: *const Claims) ?[]const u8 {
+        return if (c.on_behalf_of_len == 0) null else c.on_behalf_of_buf[0..c.on_behalf_of_len];
+    }
+
+    pub fn setPrincipal(c: *Claims, text: []const u8) error{InvalidPrincipal}!void {
+        if (!validPrincipal(text)) return error.InvalidPrincipal;
+        @memcpy(c.principal_buf[0..text.len], text);
+        c.principal_len = text.len;
+    }
+
+    pub fn setOnBehalfOf(c: *Claims, text: []const u8) error{InvalidPrincipal}!void {
+        if (!validPrincipal(text)) return error.InvalidPrincipal;
+        @memcpy(c.on_behalf_of_buf[0..text.len], text);
+        c.on_behalf_of_len = text.len;
+    }
+
     pub fn init(name: []const u8, repo_id: []const u8, scopes: Scopes, expires_at: i64) error{InvalidRepoName}!Claims {
         _ = try repo_name.parse(name);
         if (!isRepoId(repo_id)) return error.InvalidRepoName;
@@ -201,6 +229,18 @@ pub const Claims = struct {
         return c;
     }
 };
+
+/// Whether `text` may be a principal or on_behalf_of claim: 1-128 bytes of
+/// `A-Z a-z 0-9 . _ - : @ / + =`. The set needs no JSON escaping, so the
+/// claims fit the token's fixed buffers, and it is safe to log.
+pub fn validPrincipal(text: []const u8) bool {
+    if (text.len == 0 or text.len > max_principal_len) return false;
+    for (text) |c| switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9', '.', '_', '-', ':', '@', '/', '+', '=' => {},
+        else => return false,
+    };
+    return true;
+}
 
 const Payload = struct {
     v: u8,
@@ -213,6 +253,10 @@ const Payload = struct {
     paths: []const []const u8 = &.{},
     jti: []const u8 = "",
     bttl: u32 = 0,
+    /// Optional, and left out of the JSON when unset, so tokens without
+    /// them are byte-for-byte what older gitd minted.
+    pr: ?[]const u8 = null,
+    obo: ?[]const u8 = null,
 };
 
 pub const VerifyError = error{ InvalidToken, ExpiredToken };
@@ -250,10 +294,12 @@ pub fn mint(secret: *const Secret, claims: *const Claims, out: *[max_token_len]u
         .paths = paths[0..claims.paths_count],
         .jti = if (claims.jti) |*j| j else "",
         .bttl = claims.branch_ttl,
+        .pr = claims.principal(),
+        .obo = claims.onBehalfOf(),
     };
 
     var json_buf: [2800]u8 = undefined;
-    const json = std.mem.print(&json_buf, "{f}", .{std.json.fmt(payload, .{})}) catch return error.TokenTooLong;
+    const json = std.mem.print(&json_buf, "{f}", .{std.json.fmt(payload, .{ .emit_null_optional_fields = false })}) catch return error.TokenTooLong;
 
     const encoded_len = b64.Encoder.calcSize(json.len);
     const signed_len = token_prefix.len + encoded_len;
@@ -312,6 +358,8 @@ pub fn verify(secret: *const Secret, token: []const u8, now: i64) VerifyError!Cl
         claims.jti = payload.jti[0..jti_len].*;
     }
     claims.branch_ttl = payload.bttl;
+    if (payload.pr) |text| claims.setPrincipal(text) catch return error.InvalidToken;
+    if (payload.obo) |text| claims.setOnBehalfOf(text) catch return error.InvalidToken;
     if (now >= claims.expires_at) return error.ExpiredToken;
     return claims;
 }
@@ -449,6 +497,8 @@ test "a validly signed payload with bad claims is rejected" {
         "{\"v\":1,\"repo\":\"a/b\",\"rid\":\"short\",\"scopes\":[],\"exp\":10}",
         "{\"v\":1,\"repo\":\"a/b\",\"rid\":\"0123456789ABCDEF0123456789ABCDEF\",\"scopes\":[],\"exp\":10}",
         "{\"v\":1,\"repo\":\"a/b\",\"scopes\":[],\"exp\":10}",
+        "{\"v\":1,\"repo\":\"a/b\"," ++ rid ++ ",\"scopes\":[],\"exp\":10,\"pr\":\"has space\"}",
+        "{\"v\":1,\"repo\":\"a/b\"," ++ rid ++ ",\"scopes\":[],\"exp\":10,\"obo\":\"\"}",
         "not json",
     };
     for (bad_payloads) |json| {
@@ -524,6 +574,66 @@ test "path patterns survive mint and verify, and limit access" {
     try std.testing.expect(!got.allowsPath("secrets/prod.env"));
     try std.testing.expect(got.allowsDir("docs"));
     try std.testing.expect(!got.allowsDir("secrets"));
+}
+
+test "principal and on_behalf_of survive mint and verify" {
+    var claims = try Claims.init("acme/web", test_rid, .{ .git_write = true }, 1000);
+    var buf: [max_token_len]u8 = undefined;
+    const plain = try verify(&test_secret, try mint(&test_secret, &claims, &buf), 0);
+    try std.testing.expectEqual(null, plain.principal());
+    try std.testing.expectEqual(null, plain.onBehalfOf());
+    // Unset claims are left out, so older verifiers see the same payload.
+    const plain_token = try mint(&test_secret, &claims, &buf);
+    var json_buf: [max_token_len]u8 = undefined;
+    const encoded = plain_token[token_prefix.len..std.mem.findScalarLast(u8, plain_token, '.').?];
+    const json = json_buf[0..try b64.Decoder.calcSizeForSlice(encoded)];
+    try b64.Decoder.decode(json, encoded);
+    try std.testing.expect(std.mem.find(u8, json, "\"pr\"") == null);
+    try std.testing.expect(std.mem.find(u8, json, "\"obo\"") == null);
+
+    try claims.setPrincipal("agent:builder-7");
+    try claims.setOnBehalfOf("user/alice@example.com");
+    const got = try verify(&test_secret, try mint(&test_secret, &claims, &buf), 0);
+    try std.testing.expectEqualStrings("agent:builder-7", got.principal().?);
+    try std.testing.expectEqualStrings("user/alice@example.com", got.onBehalfOf().?);
+
+    try std.testing.expectError(error.InvalidPrincipal, claims.setPrincipal(""));
+    try std.testing.expectError(error.InvalidPrincipal, claims.setPrincipal("has space"));
+    try std.testing.expectError(error.InvalidPrincipal, claims.setPrincipal("quote\""));
+    try std.testing.expectError(error.InvalidPrincipal, claims.setOnBehalfOf(&@as([max_principal_len + 1]u8, @splat('a'))));
+    try claims.setPrincipal(&@as([max_principal_len]u8, @splat('a')));
+}
+
+test "a token with every limit at its maximum still mints and verifies" {
+    var claims = try Claims.init("acme/web", test_rid, .{ .git_read = true, .git_write = true, .checks_write = true }, 1000);
+    const long_ref = "refs/heads/" ++ @as([139]u8, @splat('r'));
+    const long_path = "docs/" ++ @as([145]u8, @splat('p'));
+    for (0..max_ref_patterns) |_| {
+        try claims.addRefPattern(long_ref);
+        try claims.addReadRefPattern(long_ref);
+        try claims.addPathPattern(long_path);
+    }
+    claims.jti = @splat('a');
+    claims.branch_ttl = std.math.maxInt(u32);
+    try claims.setPrincipal(&@as([max_principal_len]u8, @splat('x')));
+    try claims.setOnBehalfOf(&@as([max_principal_len]u8, @splat('y')));
+    var buf: [max_token_len]u8 = undefined;
+    const got = try verify(&test_secret, try mint(&test_secret, &claims, &buf), 0);
+    try std.testing.expectEqual(@as(usize, max_principal_len), got.principal().?.len);
+    try std.testing.expectEqual(@as(usize, max_principal_len), got.onBehalfOf().?.len);
+    try std.testing.expectEqual(@as(usize, max_path_patterns), got.paths_count);
+}
+
+test "refs/changes patterns allow change refs and still block main" {
+    var claims = try Claims.init("acme/web", test_rid, .{ .git_write = true }, 1000);
+    try claims.addRefPattern("refs/changes/101/*");
+    var buf: [max_token_len]u8 = undefined;
+    const got = try verify(&test_secret, try mint(&test_secret, &claims, &buf), 0);
+    try std.testing.expect(got.allowsRef("refs/changes/101/1"));
+    try std.testing.expect(got.allowsRef("refs/changes/101/meta"));
+    try std.testing.expect(!got.allowsRef("refs/changes/101"));
+    try std.testing.expect(!got.allowsRef("refs/changes/102/1"));
+    try std.testing.expect(!got.allowsRef("refs/heads/main"));
 }
 
 test "checks:write scope survives mint and verify" {

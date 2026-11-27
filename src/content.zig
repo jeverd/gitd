@@ -18,6 +18,11 @@
 //!   PUT    branches/{name}/ttl  {"ttl_seconds", "expected"}
 //!   DELETE branches/{name}?expected=SHA
 //!   POST   merges               {"base", "head", "strategy", "expected_base_head", ...}
+//!   POST   merges/batch         {"base", "heads", ..., "target_ref"}  (target_ref: speculative, base stays)
+//!
+//! Fences and promote (see promote.zig):
+//!   GET|POST branches/{name}/fence
+//!   POST     refs/promote
 //!
 //! Every ref change is a compare-and-swap (R3.2): a commit names the head
 //! it was built on, and loses with 409 if the branch moved.
@@ -160,6 +165,14 @@ pub fn serve(
     if (std.mem.startsWith(u8, rest, "commits/") and std.mem.endsWith(u8, rest, "/checks")) {
         const raw_sha = rest["commits/".len .. rest.len - "/checks".len];
         return @import("checks.zig").serveApi(app, request, &repo, name, raw_sha, access);
+    }
+
+    if (std.mem.startsWith(u8, rest, "branches/") and std.mem.endsWith(u8, rest, "/fence")) {
+        const raw_branch = rest["branches/".len .. rest.len - "/fence".len];
+        return @import("promote.zig").serveFence(app, request, name, raw_branch, access);
+    }
+    if (std.mem.eql(u8, rest, "refs/promote")) {
+        return @import("promote.zig").servePromote(app, request, &repo, name, access);
     }
 
     if (method == .GET) {
@@ -828,7 +841,7 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
 
     setTtl(app, name, access.repo_id, ref, if (body.expected_head == null) access.branchTtl(body.ttl_seconds) else null);
     const subject = body.message[0 .. std.mem.findScalar(u8, body.message, '\n') orelse body.message.len];
-    events.record(app, .{
+    events.record(app, events.withActor(.{
         .repo = name.full,
         .kind = "commit",
         .ref = ref,
@@ -836,7 +849,7 @@ fn createCommit(app: *server.App, request: *http.Server.Request, repo: *const re
         .new = sha,
         .detail = truncateUtf8(subject, 200),
         .created_at = api.unixNow(app.io),
-    });
+    }, access.claims));
     return api.respondJson(app.gpa, request, .created, .{ .sha = sha, .branch = body.branch, .parent = parent });
 }
 
@@ -882,7 +895,7 @@ fn createBranch(app: *server.App, request: *http.Server.Request, repo: *const re
     const outcome = repo.updateRef(ref, commit, null) catch |err| return gitError(request, err);
     if (outcome == .stale) return api.respondError(request, .conflict, "already_exists", "that branch already exists");
     setTtl(app, name, access.repo_id, ref, access.branchTtl(parsed.value.ttl_seconds));
-    events.record(app, .{ .repo = name.full, .kind = "branch_created", .ref = ref, .new = commit, .created_at = api.unixNow(app.io) });
+    events.record(app, events.withActor(.{ .repo = name.full, .kind = "branch_created", .ref = ref, .new = commit, .created_at = api.unixNow(app.io) }, access.claims));
     return api.respondJson(app.gpa, request, .created, .{ .name = parsed.value.name, .commit = commit });
 }
 
@@ -905,7 +918,7 @@ fn deleteBranch(app: *server.App, request: *http.Server.Request, repo: *const re
     const outcome = repo.updateRef(ref, null, expected) catch |err| return gitError(request, err);
     if (outcome == .stale) return api.respondError(request, .conflict, "stale_head", "the branch is not at the expected commit");
     app.db.clearBranchTtl(app.io, name.full, ref) catch |err| std.log.err("clearing expiry of {s}: {t}", .{ ref, err });
-    events.record(app, .{ .repo = name.full, .kind = "branch_deleted", .ref = ref, .old = current, .created_at = api.unixNow(app.io) });
+    events.record(app, events.withActor(.{ .repo = name.full, .kind = "branch_deleted", .ref = ref, .old = current, .created_at = api.unixNow(app.io) }, access.claims));
     try request.respond("", .{ .status = .no_content, .keep_alive = http_util.keepAlive(request) });
     return .no_content;
 }
@@ -950,13 +963,13 @@ fn updateBranchTtl(
         const repo_rules = app.db.listBranchRules(app.io, app.gpa, name.full) catch return api.internal(request);
         defer Db.freeBranchRules(app.gpa, repo_rules);
         if (!rules.evaluate(repo_rules, ref).allow_delete) {
-            events.record(app, .{
+            events.record(app, events.withActor(.{
                 .repo = name.full,
                 .kind = "rule_rejected",
                 .ref = ref,
                 .detail = "branch ttl blocked by non-deletable branch rule",
                 .created_at = api.unixNow(app.io),
-            });
+            }, access.claims));
             return api.respondError(request, .forbidden, "rule_violation", "branch rule forbids setting an expiry on a non-deletable branch");
         }
     }
@@ -1019,14 +1032,14 @@ fn updateBranchTtl(
         (std.mem.print(&detail_buf, "expires_at={d}", .{exp}) catch "updated")
     else
         "cleared";
-    events.record(app, .{
+    events.record(app, events.withActor(.{
         .repo = name.full,
         .kind = "branch_ttl_updated",
         .ref = ref,
         .new = current,
         .detail = detail,
         .created_at = now,
-    });
+    }, access.claims));
     return api.respondJson(app.gpa, request, .ok, .{
         .branch = branch,
         .commit = current,
@@ -1235,13 +1248,13 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
     defer Db.freeBranchRules(app.gpa, repo_rules);
     if (!rules.mergeAllowed(rules.evaluate(repo_rules, base_ref), @tagName(body.strategy))) {
         if (body.dry_run) return respondDryRunMerge(app, request, false, null, "rule_violation", &.{}, &.{});
-        events.record(app, .{
+        events.record(app, events.withActor(.{
             .repo = name.full,
             .kind = "rule_rejected",
             .ref = base_ref,
             .detail = "merge strategy blocked by branch rule",
             .created_at = api.unixNow(app.io),
-        });
+        }, access.claims));
         return api.respondError(request, .forbidden, "rule_violation", "branch rule forbids this merge strategy");
     }
     const author: repo_git.Repo.Author = if (body.author) |a| blk: {
@@ -1291,14 +1304,14 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
                 miss_w.writeAll(m) catch break;
             }
             const detail = std.mem.print(&detail_buf, "missing required checks: {s}", .{miss_w.buffered()}) catch "missing required checks";
-            events.record(app, .{
+            events.record(app, events.withActor(.{
                 .repo = name.full,
                 .kind = "rule_rejected",
                 .ref = base_ref,
                 .new = head,
                 .detail = detail,
                 .created_at = now,
-            });
+            }, access.claims));
             const Err = struct { code: []const u8, message: []const u8 };
             return api.respondJson(app.gpa, request, .forbidden, .{
                 .@"error" = Err{ .code = "missing_required_check", .message = "head commit is missing passing required checks" },
@@ -1327,7 +1340,7 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
         const outcome = repo.updateRef(base_ref, head, base) catch |err| return gitError(request, err);
         if (outcome == .stale) return staleHead(app, request, repo, name, base_ref, base);
         const detail = std.mem.print(&detail_buf, "{s} into {s} (fast-forward)", .{ body.head, body.base }) catch "fast-forward";
-        events.record(app, .{ .repo = name.full, .kind = "merge", .ref = base_ref, .old = base, .new = head, .detail = detail, .created_at = now });
+        events.record(app, events.withActor(.{ .repo = name.full, .kind = "merge", .ref = base_ref, .old = base, .new = head, .detail = detail, .created_at = now }, access.claims));
         const head_deleted = if (head_ref_to_delete) |href| deleteMergedHead(app, repo, name, href, head, now) else false;
         return api.respondJson(app.gpa, request, .created, .{ .result = "fast_forward", .sha = head, .head_deleted = head_deleted });
     }
@@ -1346,7 +1359,7 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
                 list.writeAll(p) catch break;
             }
             const detail = std.mem.print(&detail_buf, "{s} into {s}: {s}", .{ body.head, body.base, list.buffered() }) catch "conflicts";
-            events.record(app, .{ .repo = name.full, .kind = "merge_conflict", .ref = base_ref, .old = base, .new = head, .detail = detail, .created_at = now });
+            events.record(app, events.withActor(.{ .repo = name.full, .kind = "merge_conflict", .ref = base_ref, .old = base, .new = head, .detail = detail, .created_at = now }, access.claims));
             const Err = struct { code: []const u8, message: []const u8 };
             return api.respondJson(app.gpa, request, .conflict, .{
                 .@"error" = Err{ .code = "merge_conflict", .message = "the branches change the same lines; resolve on head and retry" },
@@ -1374,7 +1387,7 @@ fn merge(app: *server.App, request: *http.Server.Request, repo: *const repo_git.
             if (outcome == .stale) return staleHead(app, request, repo, name, base_ref, base);
             const how = if (body.strategy == .squash) "squash" else "merge commit";
             const detail = std.mem.print(&detail_buf, "{s} into {s} ({s})", .{ body.head, body.base, how }) catch "merge";
-            events.record(app, .{ .repo = name.full, .kind = "merge", .ref = base_ref, .old = base, .new = sha, .detail = detail, .created_at = now });
+            events.record(app, events.withActor(.{ .repo = name.full, .kind = "merge", .ref = base_ref, .old = base, .new = sha, .detail = detail, .created_at = now }, access.claims));
             const head_deleted = if (head_ref_to_delete) |href| deleteMergedHead(app, repo, name, href, head, now) else false;
             return api.respondJson(app.gpa, request, .created, .{ .result = if (body.strategy == .squash) "squashed" else "merged", .sha = sha, .head_deleted = head_deleted });
         },
@@ -1392,6 +1405,9 @@ fn batchMerge(app: *server.App, request: *http.Server.Request, repo: *const repo
         expected_base_head: ?[]const u8 = null,
         message: ?[]const u8 = null,
         author: ?AuthorJson = null,
+        /// Speculative prepare: write the result here and leave `base`
+        /// and the heads alone.
+        target_ref: ?[]const u8 = null,
     };
     var parsed = api.readJson(Body, app.gpa, request) catch |err| return api.respondBodyError(request, err);
     defer parsed.deinit();
@@ -1412,13 +1428,27 @@ fn batchMerge(app: *server.App, request: *http.Server.Request, repo: *const repo
     var base_ref_buf: [ref_name.max_len]u8 = undefined;
     const base_ref = ref_name.validateBranch(body.base, &base_ref_buf) catch
         return api.respondError(request, .bad_request, "invalid_branch", "base must be a branch name");
+    const target_ref = body.target_ref;
+    if (target_ref) |t| {
+        ref_name.validate(t) catch
+            return api.respondError(request, .bad_request, "invalid_target_ref", "target_ref must be a full ref name, like refs/gitd/spec/42");
+        if (std.mem.eql(u8, t, base_ref)) {
+            return api.respondError(request, .bad_request, "invalid_target_ref", "target_ref must not be the base branch; omit it to merge into base");
+        }
+    }
 
-    if (body.dry_run) {
+    if (body.dry_run or target_ref != null) {
         if (!access.canRead()) return api.respondError(request, .forbidden, "forbidden", "this token lacks git:read");
         if (!try checkReadableRev(request, base_ref, access)) return .forbidden;
     } else if (!access.canWrite(base_ref)) {
         return forbiddenRef(request, base_ref);
     }
+    if (!body.dry_run) if (target_ref) |t| {
+        if (!access.canWrite(t)) return forbiddenRef(request, t);
+        if (std.mem.startsWith(u8, t, "refs/heads/")) {
+            if (try checkWriteGate(app, request, name, t, .direct_write)) |status| return status;
+        }
+    };
 
     if (app.db.isBranchLocked(app.io, name.full, base_ref) catch return api.internal(request)) {
         if (body.dry_run) return respondDryRunMerge(app, request, false, null, "branch_locked", &.{}, &.{});
@@ -1429,13 +1459,13 @@ fn batchMerge(app: *server.App, request: *http.Server.Request, repo: *const repo
     defer Db.freeBranchRules(app.gpa, repo_rules);
     if (!rules.mergeAllowed(rules.evaluate(repo_rules, base_ref), @tagName(body.strategy))) {
         if (body.dry_run) return respondDryRunMerge(app, request, false, null, "rule_violation", &.{}, &.{});
-        events.record(app, .{
+        events.record(app, events.withActor(.{
             .repo = name.full,
             .kind = "rule_rejected",
             .ref = base_ref,
             .detail = "batch merge strategy blocked by branch rule",
             .created_at = api.unixNow(app.io),
-        });
+        }, access.claims));
         return api.respondError(request, .forbidden, "rule_violation", "branch rule forbids this merge strategy");
     }
 
@@ -1455,7 +1485,9 @@ fn batchMerge(app: *server.App, request: *http.Server.Request, repo: *const repo
 
     const delete_refs = arena.alloc(?[]const u8, body.heads.len) catch return api.internal(request);
     @memset(delete_refs, null);
-    if (body.delete_heads and !body.dry_run) {
+    // A speculative prepare never deletes heads: they are still needed
+    // until the result is promoted.
+    if (body.delete_heads and !body.dry_run and target_ref == null) {
         for (body.heads, 0..) |head_name, i| {
             var href_buf: [ref_name.max_len]u8 = undefined;
             const href = ref_name.validateBranch(head_name, &href_buf) catch
@@ -1611,12 +1643,41 @@ fn batchMerge(app: *server.App, request: *http.Server.Request, repo: *const repo
         });
     }
 
+    if (target_ref) |t| {
+        // CAS against the target's current value (R3.2): two prepares
+        // racing for one target ref cannot both win.
+        var old_buf: [64]u8 = undefined;
+        const old_target = repo.refValue(t, &old_buf) catch |err| return gitError(request, err);
+        const old_owned: ?[]const u8 = if (old_target) |o| (arena.dupe(u8, o) catch return api.internal(request)) else null;
+        const outcome = repo.updateRef(t, cur_sha, old_owned) catch |err| return gitError(request, err);
+        if (outcome == .stale) return staleHead(app, request, repo, name, t, old_owned);
+        var detail_buf: [2 * ref_name.max_len + 64]u8 = undefined;
+        const detail = std.mem.print(&detail_buf, "prepared {d} branches on {s} from {s}", .{ merged_heads.items.len, t, body.base }) catch "speculative batch merge";
+        events.record(app, events.withActor(.{
+            .repo = name.full,
+            .kind = "merge_prepared",
+            .ref = t,
+            .old = base_sha_owned,
+            .new = cur_sha,
+            .detail = detail,
+            .created_at = now,
+        }, access.claims));
+        return api.respondJson(app.gpa, request, .created, .{
+            .base = body.base,
+            .base_sha = base_sha_owned,
+            .target_ref = t,
+            .sha = cur_sha,
+            .result = result_tag,
+            .merged = merged_heads.items,
+        });
+    }
+
     if (did_change) {
         const outcome = repo.updateRef(base_ref, cur_sha, base_sha_owned) catch |err| return gitError(request, err);
         if (outcome == .stale) return staleHead(app, request, repo, name, base_ref, base_sha_owned);
         var detail_buf: [ref_name.max_len + 64]u8 = undefined;
         const detail = std.mem.print(&detail_buf, "batch {d} branches into {s}", .{ merged_heads.items.len, body.base }) catch "batch merge";
-        events.record(app, .{
+        events.record(app, events.withActor(.{
             .repo = name.full,
             .kind = "merge",
             .ref = base_ref,
@@ -1624,7 +1685,7 @@ fn batchMerge(app: *server.App, request: *http.Server.Request, repo: *const repo
             .new = cur_sha,
             .detail = detail,
             .created_at = now,
-        });
+        }, access.claims));
     }
 
     var deleted_heads: std.ArrayList([]const u8) = .empty;

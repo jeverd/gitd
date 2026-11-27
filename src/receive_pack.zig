@@ -446,7 +446,7 @@ pub fn serveRpc(
                 if (!is_ff) {
                     results[i] = .{ .ng = "non-fast-forward" };
                     any_pre_error = true;
-                    events.record(app, .{
+                    events.record(app, events.withActor(.{
                         .repo = name.full,
                         .kind = "push_rejected",
                         .ref = cmd.ref,
@@ -454,7 +454,7 @@ pub fn serveRpc(
                         .new = cmd.new,
                         .detail = "branch rule forbids force push",
                         .created_at = now,
-                    });
+                    }, claims));
                     continue;
                 }
             }
@@ -520,7 +520,7 @@ pub fn serveRpc(
     for (commands, 0..) |cmd, i| {
         if (!applied[i]) continue;
         const detail = if (cmd.isCreate()) "created" else if (cmd.isDelete()) "deleted" else "updated";
-        events.record(app, .{
+        events.record(app, events.withActor(.{
             .repo = name.full,
             .kind = "push",
             .ref = cmd.ref,
@@ -528,7 +528,7 @@ pub fn serveRpc(
             .new = cmd.new,
             .detail = detail,
             .created_at = now,
-        });
+        }, claims));
         if (cmd.isDelete()) {
             app.db.clearBranchTtl(app.io, name.full, cmd.ref) catch |err|
                 std.log.err("clearing expiry of {s}: {t}", .{ cmd.ref, err });
@@ -615,7 +615,7 @@ fn rejectRefAcl(
     for (commands, 0..) |cmd, i| {
         const ok = claims.allowsRef(cmd.ref);
         results[i] = .{ .ng = if (ok) other else reason };
-        if (!ok) events.record(app, .{ .repo = name.full, .kind = "push_rejected", .ref = cmd.ref, .old = cmd.old, .new = cmd.new, .detail = reason, .created_at = now });
+        if (!ok) events.record(app, events.withActor(.{ .repo = name.full, .kind = "push_rejected", .ref = cmd.ref, .old = cmd.old, .new = cmd.new, .detail = reason, .created_at = now }, claims));
     }
     if (!wantsReportStatus(caps)) {
         return api.respondError(request, .forbidden, "forbidden", reason);

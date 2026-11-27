@@ -286,4 +286,5 @@ test {
     _ = @import("maintenance.zig");
     _ = @import("checks.zig");
     _ = @import("patch.zig");
+    _ = @import("promote.zig");
 }
